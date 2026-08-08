@@ -128,8 +128,15 @@ def initialize_firebase():
         firebase_initialized = True
         return db_firestore
 
+    except ModuleNotFoundError as e:
+        logger.warning(
+            "Firebase Admin SDK cannot be imported: %s. Install the 'firebase-admin' package and ensure the application is running in the correct Python environment.",
+            e,
+        )
+        firebase_initialized = False
+        return None
     except Exception as e:
-        logger.warning(f"Could not initialize Firebase Admin SDK: {e}. Ensure firebase_credentials.json is provided.")
+        logger.warning(f"Could not initialize Firebase Admin SDK: {e}. Ensure credentials are available and configured correctly.")
         firebase_initialized = False
         return None
 

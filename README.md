@@ -269,20 +269,20 @@ Plain dataclass entities are defined in `app/models`, but Firestore operations a
 
 ## Startup and Local Development
 
-1. Install dependencies:
+1. Install dependencies using the same Python interpreter that will run the application:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-2. Provide Firebase credentials either via `firebase_credentials.json` or by setting `GOOGLE_APPLICATION_CREDENTIALS` in environment variables.
+2. Provide Firebase credentials either via `firebase_credentials.json` or by setting `GOOGLE_APPLICATION_CREDENTIALS` in environment variables. The repository does not include service account credentials.
 
 3. Optionally configure settings in a `.env` file based on `.env.example`.
 
-4. Start the server:
+4. Start the server using the same Python interpreter that installed dependencies:
 
 ```bash
-uvicorn app.main:app --reload --port 8000
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
 5. Visit API docs:
