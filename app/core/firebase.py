@@ -251,7 +251,7 @@ def generate_id() -> int:
     return int(datetime.utcnow().timestamp() * 1000)
 
 
-def resolve_document(collection_service: FirestoreService, key: str | int) -> dict | None:
+def _resolve_document(collection_service: FirestoreService, key: str | int) -> dict | None:
     return collection_service.get_document(str(key)) if key is not None else None
 
 
