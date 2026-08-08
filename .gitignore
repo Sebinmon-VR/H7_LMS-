@@ -1,0 +1,31 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# Environment variables & secrets
+.env
+*.json
+!firebase_credentials.example.json
+service_account.json
+firebase_credentials.json
+
+# Database
+*.db
+*.sqlite3
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+
+# Local file uploads directory
+uploads/
