@@ -136,6 +136,59 @@ def root():
     }
 
 
+@app.get("/health/firestore", tags=["Health Check"])
+def firestore_health():
+    """
+    Whether the database is actually reachable, and which credentials got it there.
+
+    An unauthenticated Firestore client is not an error anywhere in this codebase: every
+    read short-circuits to an empty list, so a misconfigured deployment answers every
+    endpoint with `200 []` and looks like a database that was never populated. This
+    endpoint is the difference between those two states. It reports no secret material -
+    only the service account's address, which is what you would grant IAM roles to anyway.
+    """
+    import os
+
+    from app.core.firebase import initialize_firebase
+
+    database = initialize_firebase()
+    source = None
+    client_email = None
+
+    for label, path in (
+        ("FIREBASE_CREDENTIALS_PATH", settings.FIREBASE_CREDENTIALS_PATH),
+        ("GOOGLE_APPLICATION_CREDENTIALS", settings.GOOGLE_APPLICATION_CREDENTIALS),
+    ):
+        if path and os.path.exists(path):
+            source = f"{label}={path}"
+            try:
+                import json
+                with open(path, encoding="utf-8") as handle:
+                    client_email = json.load(handle).get("client_email")
+            except Exception:  # pragma: no cover - diagnostics must never raise
+                pass
+            break
+
+    probe = "not attempted"
+    if database is not None:
+        try:
+            # One trivial round trip. A client can construct successfully and still fail
+            # here when the key is valid but the project or IAM role is wrong.
+            next(iter(database.collection("users").limit(1).stream()), None)
+            probe = "ok"
+        except Exception as exc:
+            probe = f"failed: {exc}"
+
+    return {
+        "firestore_available": database is not None,
+        "read_probe": probe,
+        "project_id": settings.GCP_PROJECT_ID,
+        "credentials_source": source or "application default credentials (no key file found)",
+        "credentials_json_env_set": bool(settings.FIREBASE_CREDENTIALS_JSON),
+        "service_account": client_email,
+    }
+
+
 @app.get("/health/cache", tags=["Health Check"])
 def cache_health():
     """

@@ -260,7 +260,42 @@ Configuration is centralized in `app/core/config.py` and overridable via environ
 | `GCP_PROJECT_ID` | — | Firebase/Google Cloud project ID |
 | `FIREBASE_CREDENTIALS_PATH` | `./firebase_credentials.json` | Firebase Admin SDK credentials |
 | `GOOGLE_APPLICATION_CREDENTIALS` | `./service_account.json` | Service account JSON (falls back to the above) |
+| `FIREBASE_CREDENTIALS_JSON` | `""` | The key itself, for hosts with no key file. See [Credentials in a hosted deployment](#credentials-in-a-hosted-deployment) |
 | `USE_FIREBASE_DB` | `True` | Enables Firestore usage |
+
+### Credentials in a hosted deployment
+
+The deployment artifact is built from a repository checkout, and `.gitignore` excludes `.env`
+and `*.json`. Neither `.env` nor `firebase_credentials.json` ever reaches App Service, so
+`FIREBASE_CREDENTIALS_PATH` resolves to nothing there.
+
+This does not fail loudly. `initialize_firebase()` returns `None`, every `FirestoreService`
+method short-circuits on `is_available`, and the API answers `200` with an empty list on
+every collection — indistinguishable from a database nobody has populated yet.
+
+Supply the key through the environment instead. `FIREBASE_CREDENTIALS_JSON` accepts the
+contents of `firebase_credentials.json` as raw single-line JSON or base64-encoded, and the
+app writes it to a private temp file at startup that the path settings then point at. No
+secret is committed, and nothing changes locally: a key file that exists on disk always wins.
+
+```bash
+az webapp config appsettings set -g <rg> -n <app> --settings \
+  FIREBASE_CREDENTIALS_JSON="$(base64 -w0 firebase_credentials.json)"
+```
+
+`scripts/sync_azure_settings.ps1` does this along with the rest of `.env` in one call. Run it
+with `-WhatIf` first — it prints setting names only, never values:
+
+```powershell
+./scripts/sync_azure_settings.ps1 -WhatIf
+./scripts/sync_azure_settings.ps1
+```
+
+Verify with `GET /health/firestore`, which reports whether the database is reachable, which
+credential source was used, and the result of a live read probe. It returns no secret
+material. `firestore_available: true` with `read_probe: "ok"` means the wiring is correct;
+if data is still missing after that, the cause is elsewhere (CORS, auth, or an empty
+database).
 
 ### Performance
 

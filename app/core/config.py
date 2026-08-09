@@ -1,5 +1,14 @@
+import base64
+import binascii
+import json
+import logging
 import os
+import tempfile
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger("config")
 
 
 class Settings(BaseSettings):
@@ -70,6 +79,14 @@ class Settings(BaseSettings):
     GCP_BUCKET_NAME: str = "lms-study-materials-bucket"
     GOOGLE_APPLICATION_CREDENTIALS: str = "./service_account.json"
     FIREBASE_CREDENTIALS_PATH: str = "./firebase_credentials.json"
+    # The service account key as a *value* rather than a file, for hosts where there is no
+    # credentials file to point at. The deployment artifact is built from a repository
+    # checkout and the key files are gitignored, so on App Service the paths above resolve
+    # to nothing and every Firestore read silently returns empty. Set this application
+    # setting to the contents of firebase_credentials.json (raw JSON on one line, or the
+    # same bytes base64-encoded) and it is written to a private temp file at startup that
+    # the two path settings then point at.
+    FIREBASE_CREDENTIALS_JSON: str = ""
     USE_FIREBASE_DB: bool = True
     USE_LOCAL_STORAGE: bool = False
     LOCAL_STORAGE_DIR: str = "./uploads"
@@ -216,5 +233,114 @@ class Settings(BaseSettings):
     )
 
 
+def _decode_credentials_blob(raw: str) -> dict:
+    """
+    Parses FIREBASE_CREDENTIALS_JSON, which may arrive as raw JSON or base64-encoded JSON.
+
+    Both forms are accepted because a service account key pasted straight into a portal
+    field often picks up line breaks on the way, and base64 is the form that survives every
+    settings UI, secret store, and shell that sits between the key and this process.
+    """
+    text = raw.strip().strip('"').strip("'")
+    if not text:
+        raise ValueError("value is empty")
+
+    if not text.lstrip().startswith("{"):
+        try:
+            text = base64.b64decode(text, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError) as exc:
+            raise ValueError(
+                "value is neither JSON (it does not start with '{') nor valid base64"
+            ) from exc
+
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("decoded value is not a JSON object")
+
+    missing = [key for key in ("client_email", "private_key", "project_id") if not parsed.get(key)]
+    if missing:
+        raise ValueError(f"service account JSON is missing {', '.join(missing)}")
+
+    return parsed
+
+
+def _materialize_service_account(config: Settings) -> None:
+    """
+    Writes FIREBASE_CREDENTIALS_JSON to a file and repoints the credential path settings at it.
+
+    Every consumer in this codebase — the Firebase Admin SDK, the GCS client, Drive, and
+    Calendar — loads credentials from a path, so materializing once here keeps all of them
+    working unchanged instead of teaching each one a second way to authenticate. Runs before
+    anything imports those clients because they all import this module first.
+
+    A malformed value is logged and ignored rather than raised: a key that cannot be parsed
+    should degrade the deployment to the same state it is in today, not stop the API from
+    booting and take down the health endpoints that would explain why.
+    """
+    if not config.FIREBASE_CREDENTIALS_JSON:
+        return
+
+    # An existing key file on disk is the developer's local setup and outranks the env var.
+    if os.path.exists(config.FIREBASE_CREDENTIALS_PATH):
+        logger.info(
+            "FIREBASE_CREDENTIALS_JSON ignored: %s already exists on disk.",
+            config.FIREBASE_CREDENTIALS_PATH,
+        )
+        return
+
+    try:
+        service_account = _decode_credentials_blob(config.FIREBASE_CREDENTIALS_JSON)
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.error(
+            "FIREBASE_CREDENTIALS_JSON could not be read (%s). Firestore will be unavailable "
+            "and every collection will read as empty.",
+            exc,
+        )
+        return
+
+    target = Path(tempfile.gettempdir()) / "firebase_credentials.json"
+    try:
+        # 0600, and created before the key is written: the file lives in a world-readable
+        # temp directory, so it must never be readable in the window between the two.
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(service_account, handle)
+    except OSError as exc:
+        logger.error(
+            "Could not write the service account key to %s (%s). Firestore will be unavailable.",
+            target, exc,
+        )
+        return
+
+    path = str(target)
+    config.FIREBASE_CREDENTIALS_PATH = path
+    if not os.path.exists(config.GOOGLE_APPLICATION_CREDENTIALS):
+        config.GOOGLE_APPLICATION_CREDENTIALS = path
+    # Google's own libraries fall back to this variable when handed no explicit credentials.
+    # It is overwritten, not defaulted: the sample configuration ships a placeholder path,
+    # so a deployment that copied it has this variable set to a file that does not exist,
+    # and leaving that in place sends every ADC lookup to a dead path.
+    if not os.path.exists(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
+
+    # A project ID that disagrees with the key points the client at a project the key cannot
+    # read, which fails exactly like a missing key. The key is the authoritative one.
+    key_project = service_account["project_id"]
+    if "GCP_PROJECT_ID" not in config.model_fields_set:
+        config.GCP_PROJECT_ID = key_project
+    elif config.GCP_PROJECT_ID != key_project:
+        logger.warning(
+            "GCP_PROJECT_ID is '%s' but the service account key belongs to '%s'. "
+            "Firestore reads will be empty unless this is intentional.",
+            config.GCP_PROJECT_ID, key_project,
+        )
+
+    logger.info(
+        "Service account loaded from FIREBASE_CREDENTIALS_JSON (%s, project %s).",
+        service_account["client_email"], key_project,
+    )
+
+
 # Single shared settings instance across the application
 settings = Settings()
+_materialize_service_account(settings)
