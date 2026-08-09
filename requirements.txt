@@ -1,5 +1,8 @@
 fastapi>=0.110.0
 uvicorn[standard]>=0.28.0
+# Production process manager used by startup.sh on Azure App Service. Uvicorn alone has no
+# worker supervision, and the platform's own Python image cannot be relied on to provide it.
+gunicorn>=21.2.0
 pydantic>=2.6.0
 pydantic-settings>=2.2.0
 # python-jose validates legacy backend-issued JWTs only; removable once

@@ -1,0 +1,4 @@
+# Shell scripts run on Linux (Azure App Service). Checked out with CRLF on a Windows dev
+# machine they are committed with CRLF too, and bash then fails on the stray carriage
+# return with "$'\r': command not found" - a startup failure with no obvious cause.
+*.sh text eol=lf
