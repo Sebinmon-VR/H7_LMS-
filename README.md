@@ -707,7 +707,8 @@ It authenticates over the dev password endpoint, so it requires `FIREBASE_WEB_AP
 - Auto-populate `recording_url` from the Google Meet REST API (`conferenceRecords.recordings.list`), which requires `meet.googleapis.com`, the `meetings.space.created` scope, and a Workspace tier that includes Meet recording.
 - Add comprehensive unit and integration tests.
 - Add request logging, error-handling middleware, and rate limiting.
-- Tighten CORS beyond the current `allow_origins=["*"]` before production.
+- Pin `CORS_ALLOW_ORIGINS` to the exact frontend origins and clear `CORS_ALLOW_ORIGIN_REGEX`,
+  which currently accepts any `*.azurestaticapps.net` host so preview environments work.
 
 ---
 

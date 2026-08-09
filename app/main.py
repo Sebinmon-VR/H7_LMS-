@@ -63,15 +63,29 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Enable CORS for frontend applications (React, Next.js, Vue, Flutter, mobile apps).
+# CORS for browser frontends.
+#
+# Origins are listed rather than wildcarded: `allow_origins=["*"]` cannot be combined with
+# credentials, and a wildcard on an API that accepts bearer tokens lets any page on the web
+# drive it with a token it has stolen. `Authorization` is named explicitly in allow_headers
+# because it is not a CORS-safelisted header - without it every authenticated call fails at
+# the preflight, which reads in the browser as a generic "blocked by CORS" error.
 # `Server-Timing` is exposed so browser devtools and the frontend can read server duration.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
+    allow_origin_regex=settings.CORS_ALLOW_ORIGIN_REGEX or None,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
     expose_headers=["Server-Timing", "X-Response-Time-Ms"],
+    max_age=600,
+)
+
+logger.info(
+    "CORS allowed origins: %s (regex: %s)",
+    settings.cors_origins or "none",
+    settings.CORS_ALLOW_ORIGIN_REGEX or "none",
 )
 
 

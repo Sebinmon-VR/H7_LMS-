@@ -21,6 +21,30 @@ class Settings(BaseSettings):
     ALLOW_LEGACY_JWT_LOGIN: bool = True      # Transition flag; disable once all clients send Firebase ID tokens
     FIREBASE_WEB_API_KEY: str = ""           # Only used by the dev-only password login helper endpoints
 
+    # Browser origins allowed to call the API.
+    # The frontend sends `Authorization: Bearer <token>`, which makes every request
+    # preflighted, so an origin missing from here fails at the OPTIONS before any handler
+    # runs. Exact origins are comma-separated and scheme-qualified ("https://app.example.com").
+    # The regex is the fallback that keeps Static Web Apps preview environments working,
+    # since each pull request gets its own generated hostname.
+    CORS_ALLOW_ORIGINS: str = ""
+    CORS_ALLOW_ORIGIN_REGEX: str = (
+        r"https://([a-z0-9-]+\.)*azurestaticapps\.net"
+        r"|http://localhost(:\d+)?"
+        r"|http://127\.0\.0\.1(:\d+)?"
+    )
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """
+        Exact allowed origins.
+
+        A trailing slash is stripped because browsers send the origin without one, and
+        "https://app.example.com/" would silently never match.
+        """
+        raw = (self.CORS_ALLOW_ORIGINS or "").replace(",", " ").split()
+        return [origin.strip().rstrip("/") for origin in raw if origin.strip()]
+
     # Bootstrap administrator.
     # There is no public registration endpoint, so the system needs exactly one account to
     # exist before anyone can sign in and create the rest. This account is created at
