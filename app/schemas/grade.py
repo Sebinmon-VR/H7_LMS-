@@ -14,6 +14,14 @@ class GradeEntryCreate(BaseModel):
     remarks: str | None = None
 
 
+class GradeEntryUpdate(BaseModel):
+    """Partial update for an exam grade; omitted fields are left unchanged."""
+    exam_name: str | None = None
+    marks_obtained: float | None = None
+    max_marks: float | None = None
+    remarks: str | None = None
+
+
 class ExamGradeOut(BaseModel):
     id: int
     student_id: int

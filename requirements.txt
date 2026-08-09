@@ -2,12 +2,21 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.28.0
 pydantic>=2.6.0
 pydantic-settings>=2.2.0
-passlib[bcrypt]>=1.7.4
-bcrypt<4
+# python-jose validates legacy backend-issued JWTs only; removable once
+# ALLOW_LEGACY_JWT_LOGIN is permanently disabled. Passwords are owned by Firebase Auth,
+# so passlib/bcrypt are no longer required.
 python-jose[cryptography]>=3.3.0
 python-multipart>=0.0.9
 python-dotenv>=1.0.1
 httpx>=0.27.0
 google-cloud-storage>=2.14.0
 firebase-admin>=6.5.0
-# v2.0.0 of the firebase-admin package is not compatible with the current version of google-cloud-storage, so we are pinning it to v6.5.0 for now.  
+# v2.0.0 of the firebase-admin package is not compatible with the current version of google-cloud-storage, so we are pinning it to v6.5.0 for now.
+# Google Workspace APIs: Calendar (Google Meet link generation) and Drive (Shared Drive uploads)
+google-api-python-client>=2.120.0
+google-auth>=2.28.0
+google-auth-httplib2>=0.2.0
+# Timetable periods are wall-clock local times resolved through zoneinfo. Windows and slim
+# Linux images ship no IANA database, so SCHOOL_TIMEZONE would silently fall back to UTC and
+# every reminder would fire at the wrong hour without this.
+tzdata>=2024.1

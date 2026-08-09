@@ -13,6 +13,14 @@ class TopicCreate(BaseModel):
     completion_percentage: float = 100.0
 
 
+class TopicUpdate(BaseModel):
+    """Partial update for a logged topic; omitted fields are left unchanged."""
+    topic_title: str | None = None
+    description: str | None = None
+    date_covered: date | None = None
+    completion_percentage: float | None = None
+
+
 class TopicOut(BaseModel):
     id: int
     class_id: int

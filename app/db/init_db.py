@@ -1,158 +1,123 @@
+"""
+Startup bootstrap.
+
+Because there is no public registration endpoint, the system needs exactly one account to
+exist before anyone can sign in and create the rest. This module ensures that single
+administrator exists and does nothing else.
+
+No demo classes, subjects, teachers, or students are created. Everything beyond the
+bootstrap admin is entered through the API by a signed-in administrator, so the database
+starts genuinely empty. Set SEED_DEMO_DATA=True only if you want throwaway sample records
+for local experimentation.
+"""
+
 import logging
 from datetime import datetime
 
+from app.core.config import settings
+from app.core.enums import UserRole
 from app.core.firebase import (
     firestore_classes,
-    firestore_student_enrollments,
     firestore_subjects,
-    firestore_teacher_mappings,
     firestore_users,
     generate_id,
 )
-from app.core.security import hash_password
-from app.core.enums import UserRole
+from app.core.firebase_auth import (
+    create_auth_user,
+    get_auth_user_by_email,
+    is_available,
+    set_role_claims,
+)
 
 logger = logging.getLogger("init_db")
 
 
-def _get_user_by_email(email: str) -> dict | None:
-    return firestore_users.get_document_by_field("email", email)
+def ensure_bootstrap_admin() -> dict | None:
+    """
+    Creates the bootstrap administrator if it does not already exist.
+
+    Idempotent and non-destructive: an existing profile is never overwritten, and an
+    existing Firebase account is linked rather than replaced. Safe to run on every startup.
+    """
+    email = settings.BOOTSTRAP_ADMIN_EMAIL
+    if not email:
+        logger.warning("BOOTSTRAP_ADMIN_EMAIL is not set; skipping admin bootstrap.")
+        return None
+
+    existing = firestore_users.get_document_by_field("email", email)
+    if existing:
+        # Repair a profile whose Firebase link is missing, which otherwise blocks sign-in.
+        if not existing.get("firebase_uid") and is_available():
+            record = get_auth_user_by_email(email)
+            uid = record.uid if record else create_auth_user(
+                email, settings.BOOTSTRAP_ADMIN_PASSWORD, settings.BOOTSTRAP_ADMIN_NAME
+            )
+            if uid:
+                firestore_users.add_document(str(existing["id"]), {"firebase_uid": uid})
+                set_role_claims(uid, UserRole.ADMIN.value, int(existing["id"]))
+                logger.info("Linked bootstrap admin '%s' to Firebase uid %s.", email, uid)
+        return existing
+
+    if not is_available():
+        logger.warning(
+            "Firebase Auth unavailable; cannot bootstrap admin '%s'. "
+            "Run scripts/provision_auth_user.py once credentials are configured.", email
+        )
+        return None
+
+    firebase_uid = create_auth_user(
+        email, settings.BOOTSTRAP_ADMIN_PASSWORD, settings.BOOTSTRAP_ADMIN_NAME
+    )
+    if not firebase_uid:
+        logger.error("Could not create the Firebase account for bootstrap admin '%s'.", email)
+        return None
+
+    user_id = generate_id()
+    admin = {
+        "full_name": settings.BOOTSTRAP_ADMIN_NAME,
+        "email": email,
+        "firebase_uid": firebase_uid,
+        "role": UserRole.ADMIN.value,
+        "is_active": True,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    firestore_users.add_document(str(user_id), admin)
+    set_role_claims(firebase_uid, UserRole.ADMIN.value, user_id)
+
+    admin["id"] = user_id
+    logger.info("Created bootstrap administrator: %s", email)
+    return admin
 
 
-def _save_user(user_data: dict) -> dict:
-    if user_data.get("id") is None:
-        user_data["id"] = generate_id()
-    firestore_users.add_document(str(user_data["id"]), user_data)
-    return user_data
+def _seed_demo_data() -> None:
+    """Creates a couple of sample records. Opt-in via SEED_DEMO_DATA, off by default."""
+    if not any(c.get("code") == "CLASS-10A" for c in firestore_classes.list_all()):
+        class_id = generate_id()
+        firestore_classes.add_document(str(class_id), {
+            "name": "Grade 10 - Section A",
+            "code": "CLASS-10A",
+            "description": "Sample class",
+            "created_at": datetime.utcnow().isoformat(),
+        })
 
+    if not any(s.get("code") == "MATH101" for s in firestore_subjects.list_all()):
+        subject_id = generate_id()
+        firestore_subjects.add_document(str(subject_id), {
+            "name": "Mathematics",
+            "code": "MATH101",
+            "description": "Sample subject",
+            "created_at": datetime.utcnow().isoformat(),
+        })
 
-def _save_entity(entity_data: dict, service) -> dict:
-    if entity_data.get("id") is None:
-        entity_data["id"] = generate_id()
-    service.add_document(str(entity_data["id"]), entity_data)
-    return entity_data
+    logger.info("Demo data seeded.")
 
 
 def init_db() -> None:
-    """
-    Seeds initial default records into Firestore.
-    """
-    admin = _get_user_by_email("admin@lms.com")
-    if not admin:
-        admin = _save_user({
-            "full_name": "System Administrator",
-            "email": "admin@lms.com",
-            "hashed_password": hash_password("admin123"),
-            "role": UserRole.ADMIN.value,
-            "is_active": True,
-            "created_at": datetime.utcnow().isoformat(),
-        })
-        logger.info("Created default Admin account: admin@lms.com / admin123")
+    """Ensures the bootstrap administrator exists. Called from the application lifespan."""
+    ensure_bootstrap_admin()
 
-    teacher_math = _get_user_by_email("teacher.math@lms.com")
-    if not teacher_math:
-        teacher_math = _save_user({
-            "full_name": "Prof. Alan Math",
-            "email": "teacher.math@lms.com",
-            "hashed_password": hash_password("teacher123"),
-            "role": UserRole.TEACHER.value,
-            "is_active": True,
-            "created_at": datetime.utcnow().isoformat(),
-        })
-
-    student_alice = _get_user_by_email("student.alice@lms.com")
-    if not student_alice:
-        student_alice = _save_user({
-            "full_name": "Alice Johnson",
-            "email": "student.alice@lms.com",
-            "hashed_password": hash_password("student123"),
-            "role": UserRole.STUDENT.value,
-            "is_active": True,
-            "created_at": datetime.utcnow().isoformat(),
-        })
-
-    student_bob = _get_user_by_email("student.bob@lms.com")
-    if not student_bob:
-        student_bob = _save_user({
-            "full_name": "Bob Smith",
-            "email": "student.bob@lms.com",
-            "hashed_password": hash_password("student123"),
-            "role": UserRole.STUDENT.value,
-            "is_active": True,
-            "created_at": datetime.utcnow().isoformat(),
-        })
-
-    class_10a = next(
-        (c for c in firestore_classes.list_all() if c.get("code") == "CLASS-10A"),
-        None
-    )
-    if class_10a is None:
-        class_10a = _save_entity({
-            "name": "Grade 10 - Section A",
-            "code": "CLASS-10A",
-            "description": "High school 10th standard section A",
-            "created_at": datetime.utcnow().isoformat(),
-        }, firestore_classes)
-
-    subject_math = next(
-        (s for s in firestore_subjects.list_all() if s.get("code") == "MATH101"),
-        None
-    )
-    if subject_math is None:
-        subject_math = _save_entity({
-            "name": "Mathematics",
-            "code": "MATH101",
-            "description": "Algebra, Trigonometry, and Geometry",
-            "created_at": datetime.utcnow().isoformat(),
-        }, firestore_subjects)
-
-    if teacher_math and subject_math and class_10a:
-        existing_mapping = next(
-            (
-                m for m in firestore_teacher_mappings.query_documents("teacher_id", "==", teacher_math["id"])
-                if m.get("subject_id") == subject_math["id"] and m.get("class_id") == class_10a["id"]
-            ),
-            None
-        )
-        if existing_mapping is None:
-            _save_entity({
-                "teacher_id": teacher_math["id"],
-                "subject_id": subject_math["id"],
-                "class_id": class_10a["id"],
-                "created_at": datetime.utcnow().isoformat(),
-            }, firestore_teacher_mappings)
-
-    if student_alice and class_10a:
-        existing_enrollment = next(
-            (
-                e for e in firestore_student_enrollments.query_documents("student_id", "==", student_alice["id"])
-                if e.get("class_id") == class_10a["id"]
-            ),
-            None
-        )
-        if existing_enrollment is None:
-            _save_entity({
-                "student_id": student_alice["id"],
-                "class_id": class_10a["id"],
-                "enrolled_at": datetime.utcnow().isoformat(),
-            }, firestore_student_enrollments)
-
-    if student_bob and class_10a:
-        existing_enrollment = next(
-            (
-                e for e in firestore_student_enrollments.query_documents("student_id", "==", student_bob["id"])
-                if e.get("class_id") == class_10a["id"]
-            ),
-            None
-        )
-        if existing_enrollment is None:
-            _save_entity({
-                "student_id": student_bob["id"],
-                "class_id": class_10a["id"],
-                "enrolled_at": datetime.utcnow().isoformat(),
-            }, firestore_student_enrollments)
-
-    logger.info("Database seeding completed successfully.")
+    if settings.SEED_DEMO_DATA:
+        _seed_demo_data()
 
 
 if __name__ == "__main__":

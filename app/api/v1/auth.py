@@ -1,106 +1,92 @@
-from datetime import datetime
+"""
+Authentication routes.
+
+There is deliberately no public registration endpoint. Accounts are provisioned by an
+administrator through `POST /api/v1/admin/users`, or by the bootstrap/provisioning scripts.
+
+Self-service registration previously accepted a `role` field from an unauthenticated
+request body, which let any caller create themselves an ADMIN account. Account creation is
+now an administrative action only, and signing in with Google grants no role by itself: a
+Google account with no LMS profile is rejected with 403 rather than being given a default.
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 
-from app.core.security import hash_password, verify_password, create_access_token
+from app.api.v1.dependencies import get_current_user
+from app.core.config import settings
 from app.core.enums import UserRole
 from app.core.firebase import firestore_users
+from app.core.firebase_auth import sign_in_with_password
 from app.schemas.auth import Token, LoginRequest
-from app.schemas.user import UserCreate, UserOut
-from app.api.v1.dependencies import get_current_user
+from app.schemas.user import UserOut
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
-@router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-def register_user(user_in: UserCreate):
+def _issue_firebase_token(email: str, password: str) -> Token:
     """
-    Register a new user (Student, Teacher, or Admin) and sync to Firebase.
+    Exchanges an email and password for a Firebase ID token and pairs it with the LMS profile.
+
+    Shared by the two dev-only login routes. Real clients sign in with the Firebase SDK and
+    never send passwords here.
     """
-    existing_user = firestore_users.get_document_by_field("email", user_in.email)
-    if existing_user:
+    unauthorized = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Incorrect email or password",
+    )
+
+    if not settings.FIREBASE_WEB_API_KEY:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User with this email already exists"
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Password login is not configured on this server. "
+                   "Sign in with the Firebase SDK and send the ID token as a bearer token, "
+                   "or set FIREBASE_WEB_API_KEY to enable this helper.",
         )
 
-    user_id = firestore_users.get_next_numeric_id()
-    user_data = {
-        "full_name": user_in.full_name,
-        "email": user_in.email,
-        "hashed_password": hash_password(user_in.password),
-        "role": user_in.role.value,
-        "is_active": True,
-        "created_at": datetime.utcnow().isoformat()
-    }
-    stored_user = firestore_users.add_document(str(user_id), user_data)
-    stored_user["id"] = user_id
-    return UserOut(**stored_user)
+    sign_in = sign_in_with_password(email, password)
+    if not sign_in or not sign_in.get("idToken"):
+        raise unauthorized
 
-
-@router.post("/login", response_model=Token)
-def login(login_data: LoginRequest):
-    """
-    Authenticate user using Email and Password.
-    Returns JWT access token, user role, and user profile metadata upon success.
-    """
-    user_document = firestore_users.get_document_by_field("email", login_data.email)
-    if not user_document or not verify_password(login_data.password, user_document.get("hashed_password", "")):
+    user_document = firestore_users.get_document_by_field("email", email)
+    if not user_document:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No LMS profile exists for this account. Ask an administrator to create it.",
         )
 
     if not user_document.get("is_active", False):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Inactive user account"
+            detail="Inactive user account",
         )
 
-    role = UserRole(user_document["role"])
-    user_id = int(user_document["id"])
-    access_token = create_access_token(
-        subject=user_id,
-        role=role,
-        email=user_document["email"]
+    return Token(
+        access_token=sign_in["idToken"],
+        token_type="bearer",
+        role=UserRole(user_document["role"]),
+        user_id=int(user_document["id"]),
+        full_name=user_document["full_name"],
     )
 
-    return Token(
-        access_token=access_token,
-        token_type="bearer",
-        role=role,
-        user_id=user_id,
-        full_name=user_document["full_name"]
-    )
+
+@router.post("/login", response_model=Token)
+def login(login_data: LoginRequest):
+    """
+    Development helper: exchange email and password for a Firebase ID token.
+
+    Production clients should authenticate with the Firebase SDK (email/password or Google
+    sign-in) and send the resulting ID token as `Authorization: Bearer <idToken>`.
+    """
+    return _issue_firebase_token(login_data.email, login_data.password)
 
 
 @router.post("/token", response_model=Token, include_in_schema=False)
 def login_form(form_data: OAuth2PasswordRequestForm = Depends()):
     """
-    OAuth2 form login handler compatible with Swagger UI documentation authentication modal.
+    OAuth2 form login handler compatible with the Swagger UI authentication modal.
     """
-    user_document = firestore_users.get_document_by_field("email", form_data.username)
-    if not user_document or not verify_password(form_data.password, user_document.get("hashed_password", "")):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password"
-        )
-
-    role = UserRole(user_document["role"])
-    user_id = int(user_document["id"])
-    access_token = create_access_token(
-        subject=user_id,
-        role=role,
-        email=user_document["email"]
-    )
-
-    return Token(
-        access_token=access_token,
-        token_type="bearer",
-        role=role,
-        user_id=user_id,
-        full_name=user_document["full_name"]
-    )
+    return _issue_firebase_token(form_data.username, form_data.password)
 
 
 @router.get("/me", response_model=UserOut)

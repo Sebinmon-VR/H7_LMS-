@@ -8,6 +8,13 @@ class ClassRoomCreate(BaseModel):
     description: str | None = None
 
 
+class ClassRoomUpdate(BaseModel):
+    """Partial update payload for a class; omitted fields are left unchanged."""
+    name: str | None = None
+    code: str | None = None
+    description: str | None = None
+
+
 class ClassRoomOut(BaseModel):
     id: int
     name: str
@@ -20,6 +27,13 @@ class ClassRoomOut(BaseModel):
 class SubjectCreate(BaseModel):
     name: str
     code: str
+    description: str | None = None
+
+
+class SubjectUpdate(BaseModel):
+    """Partial update payload for a subject; omitted fields are left unchanged."""
+    name: str | None = None
+    code: str | None = None
     description: str | None = None
 
 

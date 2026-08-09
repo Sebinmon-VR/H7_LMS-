@@ -1,8 +1,9 @@
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -13,6 +14,7 @@ from app.api.v1.students import router as student_router
 from app.api.v1.storage import router as storage_router
 from app.core.config import settings
 from app.db.init_db import init_db
+from app.services.reminders import get_scheduler
 
 logger = logging.getLogger("lms_app")
 
@@ -21,12 +23,28 @@ logger = logging.getLogger("lms_app")
 async def lifespan(app: FastAPI):
     """
     Application lifespan manager.
+
+    Neither startup task may take the API down: seeding and the reminder scheduler are both
+    conveniences, and a school that cannot log in because a background thread failed to
+    start is strictly worse off than one whose reminders are late.
     """
     try:
         init_db()
     except Exception as exc:
         logger.warning("Initial Firestore seeding skipped: %s", exc)
+
+    scheduler = get_scheduler()
+    try:
+        scheduler.start()
+    except Exception as exc:
+        logger.warning("Class reminder scheduler could not start: %s", exc)
+
     yield
+
+    try:
+        scheduler.stop()
+    except Exception as exc:
+        logger.warning("Class reminder scheduler did not stop cleanly: %s", exc)
 
 
 app = FastAPI(
@@ -45,14 +63,38 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Enable CORS for frontend applications (React, Next.js, Vue, Flutter, mobile apps)
+# Enable CORS for frontend applications (React, Next.js, Vue, Flutter, mobile apps).
+# `Server-Timing` is exposed so browser devtools and the frontend can read server duration.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Server-Timing", "X-Response-Time-Ms"],
 )
+
+
+@app.middleware("http")
+async def add_timing_header(request: Request, call_next):
+    """
+    Stamps every response with its server-side duration.
+
+    Response time here is dominated by Firestore round trips, so having the number on each
+    response makes a regression visible immediately instead of being guessed at. Slow
+    requests are logged so they surface without needing a profiler attached.
+    """
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+
+    response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}"
+    response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.1f}"
+
+    if elapsed_ms > 1500:
+        logger.warning("Slow request: %s %s took %.0f ms",
+                       request.method, request.url.path, elapsed_ms)
+    return response
 
 # Serve uploaded study materials static files for local testing
 uploads_path = Path(settings.LOCAL_STORAGE_DIR)
@@ -77,4 +119,21 @@ def root():
         "project": settings.PROJECT_NAME,
         "documentation": "/docs",
         "api_v1": settings.API_V1_STR
+    }
+
+
+@app.get("/health/cache", tags=["Health Check"])
+def cache_health():
+    """
+    Reference-cache effectiveness.
+
+    A low hit rate under normal traffic means responses are making more Firestore round
+    trips than necessary, which is the main driver of latency in this deployment.
+    """
+    from app.core.firebase import document_cache
+
+    return {
+        "reference_cache": document_cache.stats(),
+        "ttl_seconds": settings.REFERENCE_CACHE_TTL_SECONDS,
+        "query_concurrency": settings.QUERY_CONCURRENCY,
     }

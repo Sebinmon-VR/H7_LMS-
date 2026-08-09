@@ -1,0 +1,698 @@
+<title>H7 LMS — Backend API Changes for Frontend</title>
+<style>
+  :root {
+    --ground: #ffffff;
+    --paper: #f5f6f8;
+    --ink: #131820;
+    --ink-soft: #59616f;
+    --rule: #dde0e6;
+    --rule-soft: #eaecf0;
+    --accent: #2a4b7c;
+    --accent-bg: #eaf0f8;
+    --new: #1a6b3c;
+    --new-bg: #e8f3ec;
+    --changed: #8a5a10;
+    --changed-bg: #f8f0e0;
+    --breaking: #9c2843;
+    --breaking-bg: #fbe9ed;
+    --code-bg: #f5f6f8;
+
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0e1116;
+      --paper: #161b22;
+      --ink: #e6e9ee;
+      --ink-soft: #99a3b1;
+      --rule: #262d38;
+      --rule-soft: #1c222b;
+      --accent: #85adde;
+      --accent-bg: #17233a;
+      --new: #5fd08a;
+      --new-bg: #12261a;
+      --changed: #e0b25f;
+      --changed-bg: #2a2110;
+      --breaking: #f08fa5;
+      --breaking-bg: #2c1219;
+      --code-bg: #161b22;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0e1116;
+    --paper: #161b22;
+    --ink: #e6e9ee;
+    --ink-soft: #99a3b1;
+    --rule: #262d38;
+    --rule-soft: #1c222b;
+    --accent: #85adde;
+    --accent-bg: #17233a;
+    --new: #5fd08a;
+    --new-bg: #12261a;
+    --changed: #e0b25f;
+    --changed-bg: #2a2110;
+    --breaking: #f08fa5;
+    --breaking-bg: #2c1219;
+    --code-bg: #161b22;
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0;
+    padding: 0 20px 96px;
+  }
+
+  .wrap { max-width: 940px; margin: 0 auto; }
+  .prose { max-width: 68ch; }
+
+  header {
+    border-bottom: 2px solid var(--ink);
+    padding: 48px 0 20px;
+    margin-bottom: 32px;
+  }
+  header h1 {
+    font-size: 1.9rem;
+    line-height: 1.2;
+    margin: 0 0 8px;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  header p { color: var(--ink-soft); margin: 0; max-width: 68ch; }
+  .meta {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--ink-soft);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 12px;
+  }
+
+  h2 {
+    font-size: 1.3rem;
+    margin: 56px 0 4px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    letter-spacing: -0.01em;
+  }
+  h3 { font-size: 1.02rem; margin: 32px 0 6px; }
+  h4 {
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--ink-soft);
+    margin: 24px 0 6px;
+  }
+  p { margin: 10px 0; }
+  ul { margin: 10px 0; padding-left: 22px; }
+  li { margin: 5px 0; }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.86em;
+    background: var(--code-bg);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: 1px 5px;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 0.84rem;
+    line-height: 1.55;
+    margin: 12px 0;
+  }
+  pre code { background: none; border: 0; padding: 0; font-size: 1em; }
+
+  .scroll { overflow-x: auto; margin: 14px 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.88rem;
+    min-width: 560px;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px 8px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+  }
+  th {
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--ink-soft);
+    border-bottom: 1px solid var(--rule);
+    font-weight: 600;
+  }
+  td code { white-space: nowrap; }
+
+  .chip {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 2px 7px;
+    border-radius: 3px;
+    vertical-align: 2px;
+  }
+  .chip.new { color: var(--new); background: var(--new-bg); }
+  .chip.changed { color: var(--changed); background: var(--changed-bg); }
+  .chip.breaking { color: var(--breaking); background: var(--breaking-bg); }
+
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-bg);
+    padding: 14px 18px;
+    border-radius: 0 5px 5px 0;
+    margin: 18px 0;
+  }
+  .callout.warn { border-left-color: var(--breaking); background: var(--breaking-bg); }
+  .callout p:first-child { margin-top: 0; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  nav.toc {
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    padding: 16px 20px;
+    margin: 24px 0 8px;
+  }
+  nav.toc ol { margin: 0; padding-left: 20px; }
+  nav.toc li { margin: 3px 0; }
+  a { color: var(--accent); }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .method {
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: 0.78rem;
+  }
+  .num { font-variant-numeric: tabular-nums; }
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="meta">Backend handoff &middot; 9 August 2026</div>
+  <h1>H7 LMS — API changes for the frontend</h1>
+  <p>Everything below is a change to the HTTP contract: new endpoints, new fields, and one
+  altered response shape. Live schema is always at <code>/docs</code> and
+  <code>/api/v1/openapi.json</code>.</p>
+</header>
+
+<nav class="toc" aria-label="Contents">
+  <ol>
+    <li><a href="#breaking">The one breaking change</a></li>
+    <li><a href="#profile">User profile fields</a></li>
+    <li><a href="#delete">User deletion</a></li>
+    <li><a href="#timetable">Timetable</a></li>
+    <li><a href="#reminders">Class reminders</a></li>
+    <li><a href="#previous">Drive &amp; Meet changes from the previous update</a></li>
+    <li><a href="#index">Full endpoint index</a></li>
+  </ol>
+</nav>
+
+<h2 id="breaking">1. The one breaking change</h2>
+
+<p><span class="chip breaking">Breaking</span> <code>DELETE /api/v1/admin/users/{user_id}</code>
+now returns <strong>200 with a JSON body</strong>. It previously returned
+<code>204 No Content</code>.</p>
+
+<p>Any client that branches on <code>status === 204</code> after deleting a user needs
+updating. The behaviour is unchanged by default — it still soft-deletes — only the response
+gained a body:</p>
+
+<pre><code>{
+  "user_id": 1786194521387,
+  "email": "aisha.khan@h7ed.com",
+  "full_name": "Aisha Khan",
+  "mode": "SOFT",
+  "firebase_auth_deleted": false,
+  "deleted_records": {},
+  "detail": "User deactivated. History is preserved and the Firebase account is disabled."
+}</code></pre>
+
+<p>Everything else in this document is additive. Existing requests and response fields are
+unchanged, so nothing else needs touching before you're ready.</p>
+
+<h2 id="profile">2. User profile fields</h2>
+
+<p><span class="chip new">New</span> <code>POST /api/v1/admin/users</code> and
+<code>PUT /api/v1/admin/users/{user_id}</code> accept the fields below, and every response
+carrying a user object returns them.</p>
+
+<p><strong>All of them are optional.</strong> The old minimal payload
+<code>{"full_name": "...", "role": "STUDENT"}</code> still works unchanged. Nothing is
+enforced per role — the backend does not reject a guardian contact on a teacher — so the
+form decides which sections to show based on <code>role</code>.</p>
+
+<div class="scroll">
+<table>
+  <thead>
+    <tr><th>Field</th><th>Type</th><th>Typically for</th><th>Notes</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>phone</code></td><td>string (32)</td><td>everyone</td><td>trimmed; <code>""</code> becomes null</td></tr>
+    <tr><td><code>alternate_phone</code></td><td>string (32)</td><td>everyone</td><td></td></tr>
+    <tr><td><code>date_of_birth</code></td><td>date</td><td>everyone</td><td><code>"2012-04-17"</code></td></tr>
+    <tr><td><code>gender</code></td><td>enum</td><td>everyone</td><td><code>MALE</code> · <code>FEMALE</code> · <code>OTHER</code> · <code>UNDISCLOSED</code></td></tr>
+    <tr><td><code>photo_url</code></td><td>string (2048)</td><td>everyone</td><td>you host the image; backend only stores the URL</td></tr>
+    <tr><td><code>address_line1</code></td><td>string (200)</td><td>everyone</td><td></td></tr>
+    <tr><td><code>address_line2</code></td><td>string (200)</td><td>everyone</td><td></td></tr>
+    <tr><td><code>city</code></td><td>string (100)</td><td>everyone</td><td></td></tr>
+    <tr><td><code>state</code></td><td>string (100)</td><td>everyone</td><td></td></tr>
+    <tr><td><code>postal_code</code></td><td>string (20)</td><td>everyone</td><td></td></tr>
+    <tr><td><code>country</code></td><td>string (100)</td><td>everyone</td><td></td></tr>
+    <tr><td><code>admission_number</code></td><td>string (50)</td><td>student</td><td><strong>must be unique</strong> — 400 on a duplicate</td></tr>
+    <tr><td><code>roll_number</code></td><td>string (50)</td><td>student</td><td>not enforced unique</td></tr>
+    <tr><td><code>admission_date</code></td><td>date</td><td>student</td><td></td></tr>
+    <tr><td><code>blood_group</code></td><td>string (8)</td><td>student</td><td>free text, e.g. <code>O+</code></td></tr>
+    <tr><td><code>guardian_name</code></td><td>string (150)</td><td>student</td><td></td></tr>
+    <tr><td><code>guardian_phone</code></td><td>string (32)</td><td>student</td><td></td></tr>
+    <tr><td><code>guardian_email</code></td><td>string (320)</td><td>student</td><td>lowercased by the backend</td></tr>
+    <tr><td><code>guardian_relation</code></td><td>string (50)</td><td>student</td><td>free text, e.g. <code>Father</code></td></tr>
+    <tr><td><code>employee_id</code></td><td>string (50)</td><td>teacher / admin</td><td><strong>must be unique</strong> — 400 on a duplicate</td></tr>
+    <tr><td><code>designation</code></td><td>string (100)</td><td>teacher / admin</td><td></td></tr>
+    <tr><td><code>qualification</code></td><td>string (200)</td><td>teacher</td><td></td></tr>
+    <tr><td><code>specialization</code></td><td>string (200)</td><td>teacher</td><td></td></tr>
+    <tr><td><code>date_of_joining</code></td><td>date</td><td>teacher / admin</td><td></td></tr>
+    <tr><td><code>experience_years</code></td><td>number 0–80</td><td>teacher</td><td>decimals allowed</td></tr>
+    <tr><td><code>notes</code></td><td>string (2000)</td><td>everyone</td><td>internal admin notes</td></tr>
+    <tr><td><code>reminder_opt_in</code></td><td>boolean</td><td>everyone</td><td>class reminder emails; defaults to <code>true</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><code>UserOut</code> also gained <code>updated_at</code> (nullable ISO datetime), set on
+every profile edit.</p>
+
+<h3>Update semantics — worth reading before building the edit form</h3>
+
+<div class="callout">
+  <p><strong>Omitted and <code>null</code> both mean "leave unchanged".</strong> There is no
+  way to clear a field back to empty by sending <code>null</code>.</p>
+  <p>This is deliberate: a form that sends every input on submit, defaulting untouched ones
+  to <code>null</code>, would otherwise wipe data the person editing never saw. To blank a
+  field, send an empty string — it is stored as null.</p>
+</div>
+
+<p>Validation to mirror in the form:</p>
+<ul>
+  <li>Phone, admission number, roll number and employee ID are trimmed; whitespace-only
+    becomes null, so two blank admission numbers don't collide.</li>
+  <li><code>admission_number</code> and <code>employee_id</code> return <code>400</code> when
+    already held by someone else. The <code>detail</code> names who:
+    <em>"The admission number 'ADM-2026-014' is already assigned to Sara Ahmed (id 1786…)."</em>
+    Surface it directly.</li>
+  <li>Changing <code>email</code> to one already in use returns <code>400</code>.</li>
+</ul>
+
+<h3><span class="chip new">New</span> Role changes via <code>PUT</code></h3>
+
+<p><code>PUT /api/v1/admin/users/{user_id}</code> now accepts <code>role</code>.</p>
+
+<div class="callout warn">
+  <p><strong>Changing a role signs that user out.</strong> The backend re-issues their
+  Firebase custom claims and revokes their existing tokens, because claims drive what the
+  frontend renders and a stale token would leave them on the wrong navigation until it
+  expired.</p>
+  <p>The affected user's next request returns <code>401</code> and they must sign in again.
+  Warn the admin in a confirmation step before submitting a role change.</p>
+</div>
+
+<h2 id="delete">3. User deletion</h2>
+
+<p><code>DELETE /api/v1/admin/users/{user_id}</code> now has two modes. Response is
+<code>200</code> with the <code>UserDeleted</code> body shown in section 1.</p>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Query</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>permanent</code></td><td><code>false</code></td><td><code>false</code> deactivates and disables the Firebase login (reversible). <code>true</code> erases the profile and the Firebase Auth account.</td></tr>
+    <tr><td><code>force</code></td><td><code>false</code></td><td>Only read when <code>permanent=true</code>. Also deletes every record referencing the user.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Soft delete — unchanged behaviour</h4>
+<p><code>DELETE /admin/users/{id}</code> → <code>200</code>, <code>mode: "SOFT"</code>.
+History keeps resolving to a name. Reverse with
+<code>POST /admin/users/{id}/reactivate</code>.</p>
+
+<h4>Permanent delete — two-step confirm</h4>
+<p><code>DELETE /admin/users/{id}?permanent=true</code> returns <code>409</code> while
+anything still references the user, with a <code>detail</code> listing what:</p>
+
+<pre><code>Cannot permanently delete this user because they are still referenced by:
+2 student enrollment(s), 14 attendance record(s) as student, 3 exam grade(s) as student.
+Retry with &amp;force=true to delete those records too, or use the default soft delete
+to keep the history.</code></pre>
+
+<p>The intended flow is: call without <code>force</code>, show the admin exactly what would
+be destroyed, then repeat with <code>&amp;force=true</code> on confirmation. The success
+response reports what actually went:</p>
+
+<pre><code>{
+  "user_id": 1786194521387,
+  "mode": "PERMANENT",
+  "firebase_auth_deleted": true,
+  "deleted_records": { "student enrollment(s)": 2, "exam grade(s) as student": 3 },
+  "detail": "User aisha.khan@h7ed.com permanently deleted. 5 referencing record(s) were removed."
+}</code></pre>
+
+<p>Watch <code>firebase_auth_deleted</code>: if it is <code>false</code> the login may still
+exist and <code>detail</code> says so — show that, it needs manual cleanup in the Firebase
+console.</p>
+
+<h4>Guards you should reflect in the UI</h4>
+<ul>
+  <li><code>400</code> — an admin cannot permanently delete the account they are signed in
+    with. Hide or disable the option on their own row.</li>
+  <li><code>409</code> — the last active admin cannot be removed by <em>either</em> mode.</li>
+</ul>
+
+<h2 id="timetable">4. Timetable</h2>
+
+<p><span class="chip new">New</span> A timetable entry is a <strong>recurring weekly rule</strong>,
+not one row per calendar day: <em>"Grade 7A does Maths with Mr Rahman on Tuesdays,
+09:00–09:45, Room 12, from 1 Sep to 20 Dec"</em>. A term's schedule is a few dozen rows.</p>
+
+<h3>Time and date formats</h3>
+<div class="callout">
+  <p><strong>Send <code>"09:00"</code>, receive <code>"09:00:00"</code>.</strong> Input
+  accepts either form; output is always <code>HH:MM:SS</code>. Normalise on the way in if you
+  round-trip an entry through an edit form.</p>
+  <p>Times are <strong>local school wall-clock</strong>, with no offset — a period is at
+  09:00 regardless of DST. Do not convert them to UTC. The school zone is server-side
+  (<code>SCHOOL_TIMEZONE</code>, currently <code>Asia/Dubai</code>) and is reported by
+  <code>GET /admin/reminders/status</code>.</p>
+</div>
+
+<h3>Admin endpoints</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Method</th><th>Path</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td class="method">POST</td><td><code>/api/v1/admin/timetable</code></td><td class="num">201</td></tr>
+    <tr><td class="method">POST</td><td><code>/api/v1/admin/timetable/bulk</code></td><td class="num">201</td></tr>
+    <tr><td class="method">GET</td><td><code>/api/v1/admin/timetable</code></td><td class="num">200</td></tr>
+    <tr><td class="method">PUT</td><td><code>/api/v1/admin/timetable/{entry_id}</code></td><td class="num">200</td></tr>
+    <tr><td class="method">DELETE</td><td><code>/api/v1/admin/timetable/{entry_id}</code></td><td class="num">204</td></tr>
+    <tr><td class="method">GET</td><td><code>/api/v1/admin/timetable/class/{class_id}/day</code></td><td class="num">200</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><code>GET /admin/timetable</code> filters: <code>class_id</code>, <code>teacher_id</code>,
+<code>subject_id</code>, <code>day_of_week</code>, <code>include_inactive</code>.
+Results are ordered weekday then start time — the order a printed timetable reads — so you
+can render the grid without re-sorting.</p>
+
+<h4>Create payload</h4>
+<pre><code>POST /api/v1/admin/timetable
+{
+  "class_id": 1786194521387,
+  "subject_id": 1786194533001,
+  "teacher_id": 1786194500912,   // optional — see below
+  "day_of_week": "MONDAY",       // MONDAY … SUNDAY
+  "start_time": "09:00",
+  "end_time": "09:45",
+  "room": "Room 12",             // optional
+  "period_label": "Period 1",    // optional, display only
+  "effective_from": "2026-09-01",// optional, defaults to today
+  "effective_to": "2026-12-20",  // optional, open-ended when omitted
+  "is_active": true
+}</code></pre>
+
+<p>Omit <code>teacher_id</code> and the backend uses whoever is already mapped to that
+subject and class (via <code>/admin/mappings/teacher-subject-class</code>). If there is no
+single mapping it stays <code>null</code> — the entry is still valid, it just has no teacher
+attached and no teacher reminder.</p>
+
+<h4>Response shape</h4>
+<p><code>TimetableEntryOut</code> returns hydrated <code>class_room</code>,
+<code>subject</code> and <code>teacher</code> objects alongside the raw IDs, so a timetable
+grid needs no follow-up lookups:</p>
+
+<pre><code>{
+  "id": 1786194600001,
+  "class_id": 1786194521387,
+  "class_room": { "id": …, "name": "Grade 7A", "code": "7A", "description": null },
+  "subject_id": 1786194533001,
+  "subject":    { "id": …, "name": "Mathematics", "code": "MATH", "description": null },
+  "teacher_id": 1786194500912,
+  "teacher":    { "id": …, "full_name": "Mr Rahman", "email": "…", "role": "TEACHER", … },
+  "day_of_week": "MONDAY",
+  "start_time": "09:00:00",
+  "end_time": "09:45:00",
+  "room": "Room 12",
+  "period_label": "Period 1",
+  "effective_from": "2026-09-01",
+  "effective_to": "2026-12-20",
+  "is_active": true,
+  "created_at": "2026-08-09T07:22:41.118000",
+  "updated_at": null
+}</code></pre>
+
+<h4>Clash handling — <code>409</code></h4>
+<p>Creating or editing a period is refused when it double-books <strong>the class</strong> or
+<strong>the teacher</strong>. Rooms are deliberately not checked. The <code>detail</code>
+names the offending entries:</p>
+
+<pre><code>This period clashes with the existing timetable: the class already has Physics on
+Monday 09:00-10:00 (entry 1786194600002). Fix the clash, or resend with
+?allow_conflicts=true to schedule it anyway.</code></pre>
+
+<p>Pass <code>?allow_conflicts=true</code> on <code>POST</code> or <code>PUT</code> to
+override. Suggested UX: show the clash, offer "Schedule anyway" as the secondary action.</p>
+
+<p>Two things that intentionally do <em>not</em> clash: back-to-back periods (09:00–10:00 and
+10:00–11:00 touch but don't overlap), and editing an entry into a slot it already partly
+occupies.</p>
+
+<h4>Bulk upload</h4>
+<pre><code>POST /api/v1/admin/timetable/bulk
+{
+  "replace_existing": true,   // wipe the current timetable for every class_id in `entries`
+  "entries": [ { …TimetableEntryCreate… }, … ]   // 1–500
+}</code></pre>
+
+<p>Rows that fail are reported rather than failing the request — one bad row does not cost
+you the other thirty-nine:</p>
+
+<pre><code>{
+  "created": [ …TimetableEntryOut… ],
+  "replaced": 12,
+  "skipped": [ { "index": 7, "reason": "This period clashes with … (entry 178…)" } ],
+  "detail": "24 period(s) created, 12 replaced, 1 skipped."
+}</code></pre>
+
+<p><code>replace_existing: true</code> makes re-uploading a corrected schedule idempotent
+instead of doubling it up. <code>skipped[].index</code> is the position in the array you
+sent, so you can highlight the offending row in the upload preview.</p>
+
+<h3>Teacher endpoints</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Method</th><th>Path</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td class="method">GET</td><td><code>/api/v1/teachers/timetable</code></td><td>their weekly grid — <code>TimetableEntryOut[]</code></td></tr>
+    <tr><td class="method">GET</td><td><code>/api/v1/teachers/timetable/day</code></td><td>one date — <code>ScheduledPeriod[]</code></td></tr>
+    <tr><td class="method">GET</td><td><code>/api/v1/teachers/timetable/upcoming</code></td><td>next periods — <code>ScheduledPeriod[]</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Student endpoints</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Method</th><th>Path</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td class="method">GET</td><td><code>/api/v1/students/timetable</code></td><td>their weekly grid — <code>TimetableEntryOut[]</code></td></tr>
+    <tr><td class="method">GET</td><td><code>/api/v1/students/timetable/day</code></td><td>one date — <code>ScheduledPeriod[]</code></td></tr>
+    <tr><td class="method">GET</td><td><code>/api/v1/students/timetable/upcoming</code></td><td>next classes — <code>ScheduledPeriod[]</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Both roles: <code>/timetable</code> takes an optional <code>day_of_week</code>;
+<code>/timetable/day</code> takes <code>on_date</code> (defaults to today in the school
+zone); <code>/timetable/upcoming</code> takes <code>days_ahead</code> (0–31, default 7) and
+<code>limit</code> (1–50, default 10). Students see every class they are enrolled in.</p>
+
+<h3><code>ScheduledPeriod</code> — the recurring rule resolved against a real date</h3>
+
+<p>This is what the "today" and "what's next" views should render. The backend has already
+done the weekday and timezone arithmetic:</p>
+
+<pre><code>{
+  "entry": { …TimetableEntryOut… },
+  "on_date": "2026-08-10",
+  "starts_at": "2026-08-10T09:00:00+04:00",   // ISO 8601, school UTC offset
+  "ends_at":   "2026-08-10T09:45:00+04:00",
+  "starts_in_minutes": 15,                     // negative once the period has begun
+  "is_current": false                          // true while it is happening
+}</code></pre>
+
+<ul>
+  <li><code>is_current</code> → highlight the period in progress.</li>
+  <li><code>starts_in_minutes</code> → "next class in 15 minutes". Goes negative, so use
+    <code>&gt; 0</code> for a countdown.</li>
+  <li><code>upcoming</code> looks forward across days, so a subject that only meets on
+    Thursdays still appears when asked on a Friday.</li>
+</ul>
+
+<h2 id="reminders">5. Class reminders</h2>
+
+<p><span class="chip new">New</span> The backend emails students (and teachers) before a
+timetabled period starts. This runs on a server-side schedule — <strong>there is nothing for
+the frontend to trigger or poll</strong> for reminders to work.</p>
+
+<p>What the frontend does own:</p>
+<ul>
+  <li><strong><code>reminder_opt_in</code> on the user profile</strong> — a toggle on the
+    profile form. Defaults to <code>true</code>. Only an explicit <code>false</code>
+    suppresses reminders.</li>
+  <li><strong>Admin monitoring screens</strong>, if you want them:</li>
+</ul>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td class="method">GET</td><td><code>/api/v1/admin/reminders/status</code></td><td>Is the scheduler running, offsets, last sweep, and <code>server_time_local</code></td></tr>
+    <tr><td class="method">GET</td><td><code>/api/v1/admin/reminders/preview</code></td><td>What the next sweep <em>would</em> send. Sends nothing — safe to call repeatedly</td></tr>
+    <tr><td class="method">POST</td><td><code>/api/v1/admin/reminders/run</code></td><td><code>202</code> + <code>{job_id, poll_url}</code> — poll <code>GET /admin/jobs/{job_id}</code></td></tr>
+    <tr><td class="method">GET</td><td><code>/api/v1/admin/reminders/log</code></td><td>Reminders actually delivered, newest first. <code>?limit=</code> (1–500), <code>?user_id=</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Both <code>status</code> and <code>preview</code> include <code>mail_configured</code>.
+When it is <code>false</code>, SMTP is not set up and no reminder can be delivered — surface
+that on the admin screen rather than showing a healthy-looking empty log.</p>
+
+<p>Running a sweep by hand cannot double-email anyone; already-sent reminders are skipped
+server-side.</p>
+
+<h2 id="previous">6. Drive &amp; Meet changes from the previous update</h2>
+
+<p>These shipped just before the timetable work and are also frontend-visible.</p>
+
+<h3><span class="chip changed">Changed</span> Meetings now explain a missing link</h3>
+<p><code>LiveMeetingOut</code> gained two fields, on both the teacher and admin endpoints:</p>
+<ul>
+  <li><code>meet_status</code> — <code>"CREATED"</code> · <code>"FAILED"</code> ·
+    <code>"MANUAL"</code> (a link was typed in) · <code>"SKIPPED"</code> (generation not
+    requested)</li>
+  <li><code>meet_error</code> — why generation failed, when it did</li>
+</ul>
+<p>A meeting is still saved with <code>201</code> when Meet generation fails, so check
+<code>meet_status</code> rather than assuming <code>meeting_link</code> is populated. On
+<code>FAILED</code>, show <code>meet_error</code> and offer the admin retry:
+<code>POST /api/v1/admin/meetings/{id}/regenerate-link</code>.</p>
+
+<h3><span class="chip changed">Changed</span> Uploads report where the file actually landed</h3>
+<p><code>StudyMaterialOut</code> gained <code>storage_warning</code> alongside the existing
+<code>storage_provider</code>. <code>POST /api/v1/storage/upload</code> gained
+<code>requested_provider</code> and <code>warning</code>.</p>
+<p>If <code>storage_provider</code> is <code>"LOCAL"</code> while Drive or Cloud Storage was
+configured, the cloud upload failed and the file is on the API server instead —
+<code>storage_warning</code> says why. Show it as a warning on an otherwise successful
+upload.</p>
+
+<h3><span class="chip new">New</span> Admin can manage materials and meetings</h3>
+<p>Admins were previously limited to their own records, because the teacher endpoints filter
+by the signed-in user. These are system-wide:</p>
+<div class="scroll">
+<table>
+  <thead><tr><th>Method</th><th>Path</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td class="method">POST</td><td><code>/api/v1/admin/materials</code></td><td>multipart; optional <code>teacher_id</code> form field to attribute the upload</td></tr>
+    <tr><td class="method">GET</td><td><code>/api/v1/admin/materials</code></td><td>filters: <code>class_id</code>, <code>subject_id</code>, <code>teacher_id</code></td></tr>
+    <tr><td class="method">PUT</td><td><code>/api/v1/admin/materials/{id}</code></td><td>rename / change type</td></tr>
+    <tr><td class="method">DELETE</td><td><code>/api/v1/admin/materials/{id}</code></td><td><code>204</code>; <code>?keep_file=true</code> keeps the stored file</td></tr>
+    <tr><td class="method">POST</td><td><code>/api/v1/admin/meetings</code></td><td>optional <code>teacher_id</code> in the JSON body</td></tr>
+    <tr><td class="method">GET</td><td><code>/api/v1/admin/meetings</code></td><td>filters: <code>class_id</code>, <code>subject_id</code>, <code>teacher_id</code></td></tr>
+    <tr><td class="method">PUT</td><td><code>/api/v1/admin/meetings/{id}</code></td><td>propagates to the Calendar event</td></tr>
+    <tr><td class="method">DELETE</td><td><code>/api/v1/admin/meetings/{id}</code></td><td><code>204</code>; also deletes the Calendar event</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3><span class="chip new">New</span> Integration health</h3>
+<ul>
+  <li><code>GET /api/v1/admin/integrations</code> — Drive, Cloud Storage, Meet and SMTP, each
+    with <code>ok</code> and a <code>detail</code> naming the exact misconfiguration.
+    <code>?probe=false</code> for a settings-only view that makes no network calls.</li>
+  <li><code>POST /api/v1/admin/integrations/storage/test-upload</code> — uploads a probe file
+    and deletes it.</li>
+  <li><code>GET /api/v1/storage/status</code> — the storage half, available to teachers.</li>
+</ul>
+
+<h2 id="index">7. Full endpoint index</h2>
+
+<p>Every route added or changed across both updates.</p>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Status</th><th>Method</th><th>Path</th><th>Code</th></tr></thead>
+  <tbody>
+    <tr><td><span class="chip breaking">Breaking</span></td><td class="method">DELETE</td><td><code>/api/v1/admin/users/{user_id}</code></td><td class="num">200 <em>(was 204)</em></td></tr>
+    <tr><td><span class="chip changed">Changed</span></td><td class="method">POST</td><td><code>/api/v1/admin/users</code></td><td class="num">201</td></tr>
+    <tr><td><span class="chip changed">Changed</span></td><td class="method">PUT</td><td><code>/api/v1/admin/users/{user_id}</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip changed">Changed</span></td><td class="method">POST</td><td><code>/api/v1/storage/upload</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip changed">Changed</span></td><td class="method">POST</td><td><code>/api/v1/teachers/meetings</code></td><td class="num">201</td></tr>
+    <tr><td><span class="chip changed">Changed</span></td><td class="method">POST</td><td><code>/api/v1/teachers/materials</code></td><td class="num">201</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">POST</td><td><code>/api/v1/admin/timetable</code></td><td class="num">201</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">POST</td><td><code>/api/v1/admin/timetable/bulk</code></td><td class="num">201</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/admin/timetable</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">PUT</td><td><code>/api/v1/admin/timetable/{entry_id}</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">DELETE</td><td><code>/api/v1/admin/timetable/{entry_id}</code></td><td class="num">204</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/admin/timetable/class/{class_id}/day</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/teachers/timetable</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/teachers/timetable/day</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/teachers/timetable/upcoming</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/students/timetable</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/students/timetable/day</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/students/timetable/upcoming</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/admin/reminders/status</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/admin/reminders/preview</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">POST</td><td><code>/api/v1/admin/reminders/run</code></td><td class="num">202</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/admin/reminders/log</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">POST</td><td><code>/api/v1/admin/materials</code></td><td class="num">201</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/admin/materials</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">PUT</td><td><code>/api/v1/admin/materials/{material_id}</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">DELETE</td><td><code>/api/v1/admin/materials/{material_id}</code></td><td class="num">204</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">POST</td><td><code>/api/v1/admin/meetings</code></td><td class="num">201</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/admin/meetings</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">PUT</td><td><code>/api/v1/admin/meetings/{meeting_id}</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">POST</td><td><code>/api/v1/admin/meetings/{meeting_id}/regenerate-link</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">DELETE</td><td><code>/api/v1/admin/meetings/{meeting_id}</code></td><td class="num">204</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/admin/integrations</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">POST</td><td><code>/api/v1/admin/integrations/storage/test-upload</code></td><td class="num">200</td></tr>
+    <tr><td><span class="chip new">New</span></td><td class="method">GET</td><td><code>/api/v1/storage/status</code></td><td class="num">200</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Auth is unchanged</h4>
+<p>Every endpoint above still takes <code>Authorization: Bearer &lt;Firebase ID token&gt;</code>.
+Admin routes require the <code>ADMIN</code> role; teacher routes accept
+<code>TEACHER</code> or <code>ADMIN</code>; student routes accept <code>STUDENT</code> or
+<code>ADMIN</code>.</p>
+
+</div>

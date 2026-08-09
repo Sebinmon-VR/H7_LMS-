@@ -1,3 +1,4 @@
+import datetime as dt
 from datetime import date, datetime
 from typing import List
 from pydantic import BaseModel, ConfigDict
@@ -17,6 +18,14 @@ class BatchAttendanceCreate(BaseModel):
     subject_id: int
     date: date
     attendance_list: List[StudentAttendanceItem]
+
+
+class AttendanceUpdate(BaseModel):
+    """Partial update for a single attendance record; omitted fields are left unchanged."""
+    status: AttendanceStatus | None = None
+    remarks: str | None = None
+    # Qualified via the module alias: the field name `date` shadows the imported type.
+    date: dt.date | None = None
 
 
 class AttendanceOut(BaseModel):
