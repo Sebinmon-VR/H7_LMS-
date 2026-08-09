@@ -16,6 +16,11 @@ logger = logging.getLogger("firebase_db")
 db_firestore = None
 firebase_initialized = False
 
+# Initialization is reached from request threads, the reminder scheduler, and import time
+# alike. Without this, two threads can both decide the SDK is uninitialized and both call
+# initialize_app(), and the loser poisons the state for everyone.
+_init_lock = threading.RLock()
+
 T = TypeVar("T")
 
 # Sentinel distinguishing "not cached" from "cached as None" (a known-missing document).
@@ -170,10 +175,40 @@ def _coerce_value(value: Any, annotation: Any) -> Any:
     return value
 
 
+def _create_default_app(firebase_admin, credentials):
+    """
+    Creates the default Firebase app from whichever credentials this deployment provides.
+
+    Callers must have established that no default app exists yet; creating a second one
+    raises.
+    """
+    cred_path = settings.FIREBASE_CREDENTIALS_PATH
+    gcp_cred_path = settings.GOOGLE_APPLICATION_CREDENTIALS
+
+    if os.path.exists(cred_path):
+        firebase_admin.initialize_app(credentials.Certificate(cred_path))
+        logger.info(f"Firebase Admin SDK initialized using certificate: {cred_path}")
+    elif os.path.exists(gcp_cred_path):
+        firebase_admin.initialize_app(credentials.Certificate(gcp_cred_path))
+        logger.info(f"Firebase Admin SDK initialized using GCP credentials: {gcp_cred_path}")
+    else:
+        firebase_admin.initialize_app(options={"projectId": settings.GCP_PROJECT_ID})
+        logger.info(f"Firebase Admin SDK initialized using Default Credentials for project: {settings.GCP_PROJECT_ID}")
+
+
 def initialize_firebase():
     """
     Initializes Firebase Admin SDK using service account JSON credentials certificate or Application Default Credentials.
     Provides Cloud Firestore DB client (`db_firestore`).
+
+    Safe to call repeatedly and from several threads. That matters because the default app
+    outlives a failure anywhere later in this function: if `firestore.client()` raised after
+    initialize_app() had already succeeded, every later attempt used to call initialize_app()
+    a second time, get "The default Firebase app already exists", and swallow it as a generic
+    failure. Firestore then stayed unavailable for the life of the process - every read
+    short-circuiting to an empty list and every token verification failing with 401 - long
+    after the original transient fault had passed. An existing default app is now adopted
+    instead of re-created.
     """
     global db_firestore, firebase_initialized
 
@@ -184,24 +219,20 @@ def initialize_firebase():
         import firebase_admin
         from firebase_admin import credentials, firestore
 
-        cred_path = settings.FIREBASE_CREDENTIALS_PATH
-        gcp_cred_path = settings.GOOGLE_APPLICATION_CREDENTIALS
+        with _init_lock:
+            # Another thread may have finished while this one waited for the lock.
+            if firebase_initialized:
+                return db_firestore
 
-        if os.path.exists(cred_path):
-            cred = credentials.Certificate(cred_path)
-            firebase_admin.initialize_app(cred)
-            logger.info(f"Firebase Admin SDK initialized using certificate: {cred_path}")
-        elif os.path.exists(gcp_cred_path):
-            cred = credentials.Certificate(gcp_cred_path)
-            firebase_admin.initialize_app(cred)
-            logger.info(f"Firebase Admin SDK initialized using GCP credentials: {gcp_cred_path}")
-        else:
-            firebase_admin.initialize_app(options={"projectId": settings.GCP_PROJECT_ID})
-            logger.info(f"Firebase Admin SDK initialized using Default Credentials for project: {settings.GCP_PROJECT_ID}")
+            try:
+                firebase_admin.get_app()
+            except ValueError:
+                # No default app yet - the only state in which creating one is legal.
+                _create_default_app(firebase_admin, credentials)
 
-        db_firestore = firestore.client()
-        firebase_initialized = True
-        return db_firestore
+            db_firestore = firestore.client()
+            firebase_initialized = True
+            return db_firestore
 
     except ModuleNotFoundError as e:
         logger.warning(
@@ -226,7 +257,20 @@ class FirestoreService:
         # Only reference collections are cached. Transactional records (attendance, grades)
         # must always read through so a client never sees its own write go missing.
         self.cacheable = cacheable
-        self._db = initialize_firebase()
+
+    @property
+    def _db(self):
+        """
+        Resolved per access rather than captured in __init__.
+
+        Every service below is a module-level singleton built while this module is being
+        imported, which is the least reliable moment in the process to reach a network
+        service. Binding the result then meant one unlucky import left all twelve of them
+        holding None for the life of the worker, and each endpoint answering `200 []`
+        forever - the failure that looks exactly like an empty database. initialize_firebase()
+        memoizes success, so on the normal path this is a global lookup and nothing more.
+        """
+        return initialize_firebase()
 
     @property
     def is_available(self) -> bool:
