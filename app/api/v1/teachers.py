@@ -9,9 +9,10 @@ from app.core.gcp_services import storage_service
 from app.core.firebase import (
     firestore_attendance, firestore_topics, firestore_meetings,
     firestore_materials, firestore_grades,
-    firestore_teacher_mappings, firestore_users,
+    firestore_teacher_mappings, firestore_class_teacher_mappings, firestore_users,
     hydrate_attendance, hydrate_topic, hydrate_live_meeting,
     hydrate_study_material, hydrate_exam_grade, hydrate_teacher_mapping,
+    hydrate_class_teacher_mapping,
     firestore_classes, firestore_subjects,
     require_document, assert_owner, prefetch_references, prefetch_academic
 )
@@ -20,7 +21,8 @@ from app.services.content import (
     active_students_in_class as _active_students_in_class,
     schedule_meeting, store_material,
 )
-from app.schemas.academic import TeacherMappingOut
+from app.services.permissions import visible_records
+from app.schemas.academic import ClassTeacherMappingOut, TeacherMappingOut
 from app.schemas.timetable import ScheduledPeriod, TimetableEntryOut
 from app.schemas.user import UserOut
 from app.schemas.attendance import BatchAttendanceCreate, AttendanceUpdate, AttendanceOut
@@ -47,6 +49,30 @@ def get_teacher_assigned_classes(
         ("class_id", firestore_classes),
     )
     return [TeacherMappingOut(**hydrate_teacher_mapping(m)) for m in mappings]
+
+
+@router.get("/my-led-classes", response_model=List[ClassTeacherMappingOut])
+def get_classes_led_as_class_teacher(
+    current_user: UserOut = Depends(require_teacher)
+):
+    """
+    [Teacher Only] The classes this teacher is the class teacher of.
+
+    Distinct from `/my-classes`, which lists the subject-and-class periods they teach. These
+    are the classes they answer for as a whole: within them, the attendance, topics, grades,
+    meetings and materials listed by the endpoints below include records filed by the *other*
+    teachers who take the class, and those records can be corrected here too.
+
+    An empty list means the teacher leads no class, which is the normal case for a subject
+    teacher and the reason the class-teacher screens should stay hidden for them.
+    """
+    mappings = firestore_class_teacher_mappings.query_documents("teacher_id", "==", current_user.id)
+    prefetch_references(
+        mappings,
+        ("teacher_id", firestore_users),
+        ("class_id", firestore_classes),
+    )
+    return [ClassTeacherMappingOut(**hydrate_class_teacher_mapping(m)) for m in mappings]
 
 
 @router.get("/classes/{class_id}/students", response_model=List[UserOut])
@@ -160,11 +186,14 @@ def get_teacher_attendance_records(
     current_user: UserOut = Depends(require_teacher)
 ):
     """
-    [Teacher Only] View attendance history logged by teacher.
+    [Teacher Only] View attendance history logged by this teacher.
+
+    A class teacher additionally sees every attendance record marked against the classes they
+    lead, whichever teacher marked it - that whole-class view is the point of the role. Pass
+    `class_id` to narrow to one class; a class they neither lead nor marked returns only
+    their own records within it.
     """
-    records = firestore_attendance.query_documents("teacher_id", "==", current_user.id)
-    if class_id is not None:
-        records = [r for r in records if r.get("class_id") == class_id]
+    records = visible_records(firestore_attendance, current_user, class_id)
     if subject_id is not None:
         records = [r for r in records if r.get("subject_id") == subject_id]
     prefetch_academic(records)
@@ -179,7 +208,9 @@ def update_attendance_record(
 ):
     """
     [Teacher Only] Correct a previously marked attendance record.
-    Teachers may only edit records they marked themselves; admins may edit any.
+
+    A subject teacher may only edit records they marked themselves. The class teacher of the
+    class may correct any of them, whoever marked it, and admins may edit any record at all.
     """
     record = require_document(firestore_attendance, record_id, "Attendance record")
     assert_owner(record, current_user, "attendance records")
@@ -245,10 +276,11 @@ def list_topics_covered(
 ):
     """
     [Teacher Only] Retrieve list of topics logged by this teacher.
+
+    A class teacher also sees the syllabus progress logged by every other teacher in the
+    classes they lead, which is what makes "how far has 9-A actually got?" answerable.
     """
-    topics = firestore_topics.query_documents("teacher_id", "==", current_user.id)
-    if class_id is not None:
-        topics = [t for t in topics if t.get("class_id") == class_id]
+    topics = visible_records(firestore_topics, current_user, class_id)
     if subject_id is not None:
         topics = [t for t in topics if t.get("subject_id") == subject_id]
     topics.sort(key=lambda t: t.get("date_covered"), reverse=True)
@@ -324,10 +356,11 @@ def list_meetings(
 ):
     """
     [Teacher Only] List scheduled meetings and recording links created by this teacher.
+
+    A class teacher also sees the sessions other teachers scheduled for the classes they lead,
+    so clashes in a class's day are visible to the person answerable for it.
     """
-    meetings = firestore_meetings.query_documents("teacher_id", "==", current_user.id)
-    if class_id is not None:
-        meetings = [m for m in meetings if m.get("class_id") == class_id]
+    meetings = visible_records(firestore_meetings, current_user, class_id)
     if subject_id is not None:
         meetings = [m for m in meetings if m.get("subject_id") == subject_id]
     meetings.sort(key=lambda m: m.get("scheduled_time"), reverse=True)
@@ -431,10 +464,10 @@ def list_uploaded_materials(
 ):
     """
     [Teacher Only] View study materials uploaded by this teacher.
+
+    A class teacher also sees everything issued to the classes they lead, whoever uploaded it.
     """
-    materials = firestore_materials.query_documents("teacher_id", "==", current_user.id)
-    if class_id is not None:
-        materials = [m for m in materials if m.get("class_id") == class_id]
+    materials = visible_records(firestore_materials, current_user, class_id)
     if subject_id is not None:
         materials = [m for m in materials if m.get("subject_id") == subject_id]
     prefetch_academic(materials)
@@ -519,10 +552,11 @@ def list_submitted_grades(
 ):
     """
     [Teacher Only] View exam grades entered by this teacher.
+
+    A class teacher also sees marks entered by every other teacher for the classes they lead,
+    which is what lets them compile a whole-class result rather than one subject's column.
     """
-    grades = firestore_grades.query_documents("teacher_id", "==", current_user.id)
-    if class_id is not None:
-        grades = [g for g in grades if g.get("class_id") == class_id]
+    grades = visible_records(firestore_grades, current_user, class_id)
     if subject_id is not None:
         grades = [g for g in grades if g.get("subject_id") == subject_id]
     prefetch_academic(grades)

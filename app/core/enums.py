@@ -4,8 +4,25 @@ import enum
 class UserRole(str, enum.Enum):
     """User Role Enumeration for Role-Based Access Control (RBAC)."""
     ADMIN = "ADMIN"
+    CLASS_TEACHER = "CLASS_TEACHER"
     TEACHER = "TEACHER"
     STUDENT = "STUDENT"
+
+
+# A class teacher is a teacher first. They take periods, mark attendance, own subject
+# mappings, and appear on the timetable exactly like a TEACHER, so every check that asks
+# "may this user own a teaching record?" has to accept both or a promoted teacher silently
+# loses the job they were already doing.
+#
+# The role is only the label. The authority that makes the role worth having - seeing and
+# correcting other teachers' records - is scoped to specific classes by the
+# `class_teacher_mappings` collection, never by the role on its own. `app.services.permissions`
+# is the single place that resolves it.
+TEACHING_ROLES = frozenset({UserRole.TEACHER, UserRole.CLASS_TEACHER})
+TEACHING_ROLE_VALUES = frozenset(role.value for role in TEACHING_ROLES)
+
+# The same set plus ADMIN, for the checks that let an admin stand in for a teacher.
+TEACHING_OR_ADMIN_VALUES = TEACHING_ROLE_VALUES | {UserRole.ADMIN.value}
 
 
 class AttendanceStatus(str, enum.Enum):

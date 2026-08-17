@@ -13,7 +13,7 @@ from datetime import datetime
 from fastapi import HTTPException, UploadFile
 
 from app.core import google_meet
-from app.core.enums import UserRole
+from app.core.enums import TEACHING_OR_ADMIN_VALUES
 from app.core.gcp_services import StorageError, storage_service
 from app.core.firebase import (
     firestore_classes, firestore_materials, firestore_meetings, firestore_subjects,
@@ -58,7 +58,7 @@ def resolve_teacher(teacher_id: int) -> dict:
     if not teacher:
         raise HTTPException(status_code=404, detail="Teacher not found")
 
-    if teacher.get("role") not in (UserRole.TEACHER.value, UserRole.ADMIN.value):
+    if teacher.get("role") not in TEACHING_OR_ADMIN_VALUES:
         raise HTTPException(
             status_code=400,
             detail=f"User {teacher_id} is not a teacher and cannot own this record.",

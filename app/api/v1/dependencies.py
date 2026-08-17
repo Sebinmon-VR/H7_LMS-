@@ -110,6 +110,12 @@ def require_roles(allowed_roles: List[UserRole]) -> Callable:
 
 # Role guards
 require_admin = require_roles([UserRole.ADMIN])
-require_teacher = require_roles([UserRole.TEACHER, UserRole.ADMIN])
+# A class teacher is a teacher too, so every ordinary teaching endpoint admits them. What
+# they may additionally reach is decided per class by app.services.permissions, not here -
+# a role guard cannot express "the class they lead".
+require_teacher = require_roles([UserRole.TEACHER, UserRole.CLASS_TEACHER, UserRole.ADMIN])
+require_class_teacher = require_roles([UserRole.CLASS_TEACHER, UserRole.ADMIN])
 require_student = require_roles([UserRole.STUDENT, UserRole.ADMIN])
-require_any_authenticated = require_roles([UserRole.ADMIN, UserRole.TEACHER, UserRole.STUDENT])
+require_any_authenticated = require_roles(
+    [UserRole.ADMIN, UserRole.CLASS_TEACHER, UserRole.TEACHER, UserRole.STUDENT]
+)

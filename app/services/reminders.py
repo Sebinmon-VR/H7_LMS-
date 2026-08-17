@@ -26,7 +26,7 @@ from datetime import date, datetime, timedelta
 from typing import Callable
 
 from app.core.config import settings
-from app.core.enums import UserRole
+from app.core.enums import TEACHING_OR_ADMIN_VALUES
 from app.core.firebase import (
     firestore_classes, firestore_meetings, firestore_reminder_log,
     firestore_student_enrollments, firestore_subjects, firestore_timetable, firestore_users,
@@ -146,7 +146,7 @@ def _recipients(entry: dict, context: _SweepContext) -> list[dict]:
             teacher.get("email")
             and teacher.get("is_active", False)
             and _wants_reminders(teacher)
-            and teacher.get("role") in (UserRole.TEACHER.value, UserRole.ADMIN.value)
+            and teacher.get("role") in TEACHING_OR_ADMIN_VALUES
         ):
             people.append(teacher)
 

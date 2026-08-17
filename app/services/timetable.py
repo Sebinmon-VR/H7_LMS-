@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import HTTPException
 
 from app.core.config import settings
-from app.core.enums import DayOfWeek, UserRole
+from app.core.enums import TEACHING_OR_ADMIN_VALUES, DayOfWeek
 from app.core.firebase import (
     firestore_classes, firestore_student_enrollments, firestore_subjects,
     firestore_teacher_mappings, firestore_timetable, firestore_users,
@@ -288,7 +288,7 @@ def build_entry_document(payload, *, resolve_teacher: bool = True) -> dict:
         teacher = firestore_users.get_document(str(teacher_id))
         if not teacher:
             raise HTTPException(status_code=404, detail=f"Teacher {teacher_id} not found")
-        if teacher.get("role") not in (UserRole.TEACHER.value, UserRole.ADMIN.value):
+        if teacher.get("role") not in TEACHING_OR_ADMIN_VALUES:
             raise HTTPException(
                 status_code=400,
                 detail=f"User {teacher_id} is not a teacher and cannot be assigned a period.",

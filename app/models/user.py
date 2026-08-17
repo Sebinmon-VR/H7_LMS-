@@ -1,15 +1,10 @@
-import enum
 from dataclasses import dataclass, field
 from datetime import datetime
 
-
-class UserRole(str, enum.Enum):
-    """
-    User Role Enumeration for Role-Based Access Control (RBAC).
-    """
-    ADMIN = "ADMIN"
-    TEACHER = "TEACHER"
-    STUDENT = "STUDENT"
+# Re-exported rather than redefined. This module used to carry its own copy of UserRole,
+# which meant adding a role in one file left the other silently three-valued and any
+# `isinstance`/equality check across the two enums failing for no visible reason.
+from app.core.enums import UserRole  # noqa: F401  (part of this module's public surface)
 
 
 @dataclass(slots=True)

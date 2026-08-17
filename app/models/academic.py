@@ -36,6 +36,21 @@ class TeacherSubjectClassMapping:
 
 
 @dataclass(slots=True)
+class ClassTeacherMapping:
+    """
+    Mapping naming the teacher responsible for a class as a whole.
+
+    Deliberately has no `subject_id`: a class teacher's remit is the class, not one period of
+    it. That is the difference from TeacherSubjectClassMapping, and it is what lets a class
+    teacher see and correct records filed by the other teachers who take the same class.
+    """
+    teacher_id: int
+    class_id: int
+    assigned_at: datetime = field(default_factory=datetime.utcnow)
+    id: int | None = None
+
+
+@dataclass(slots=True)
 class StudentEnrollment:
     """
     Enrollment mapping students to the class they belong to.

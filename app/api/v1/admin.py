@@ -7,7 +7,10 @@ from app.api.v1.dependencies import require_admin
 from app.core import google_drive, google_meet
 from app.core.concurrency import run_parallel
 from app.core.config import settings
-from app.core.enums import UserRole, AttendanceStatus, DayOfWeek
+from app.core.enums import (
+    UserRole, AttendanceStatus, DayOfWeek,
+    TEACHING_ROLE_VALUES, TEACHING_OR_ADMIN_VALUES,
+)
 from app.core.gcp_services import storage_service
 from app.core.jobs import job_registry, report_cache
 from app.core.credentials import generate_email, generate_password
@@ -18,10 +21,11 @@ from app.core.firebase_auth import (
 )
 from app.core.firebase import (
     firestore_users, firestore_classes, firestore_subjects,
-    firestore_teacher_mappings, firestore_student_enrollments,
+    firestore_teacher_mappings, firestore_class_teacher_mappings,
+    firestore_student_enrollments,
     firestore_attendance, firestore_topics, firestore_meetings,
     firestore_materials, firestore_grades, firestore_timetable, firestore_reminder_log,
-    hydrate_teacher_mapping, hydrate_student_enrollment,
+    hydrate_teacher_mapping, hydrate_class_teacher_mapping, hydrate_student_enrollment,
     hydrate_live_meeting, hydrate_study_material, hydrate_timetable_entry,
     require_document, delete_with_dependencies, prefetch_references, prefetch_academic
 )
@@ -44,6 +48,7 @@ from app.schemas.academic import (
     ClassRoomCreate, ClassRoomUpdate, ClassRoomOut,
     SubjectCreate, SubjectUpdate, SubjectOut,
     TeacherMappingCreate, TeacherMappingOut,
+    ClassTeacherMappingCreate, ClassTeacherMappingOut,
     StudentEnrollmentCreate, StudentEnrollmentOut
 )
 from app.schemas.reports import (
@@ -251,6 +256,7 @@ def _user_dependencies(user_id: int) -> list[tuple[str, object, str]]:
     return [
         ("student enrollment(s)", firestore_student_enrollments, "student_id"),
         ("teacher mapping(s)", firestore_teacher_mappings, "teacher_id"),
+        ("class teacher assignment(s)", firestore_class_teacher_mappings, "teacher_id"),
         ("timetable entry(s)", firestore_timetable, "teacher_id"),
         ("attendance record(s) as student", firestore_attendance, "student_id"),
         ("attendance record(s) as teacher", firestore_attendance, "teacher_id"),
@@ -558,12 +564,23 @@ def delete_class_room(
     [Admin Only] Delete a Class/Section.
     Refuses with 409 while enrollments, teacher mappings, or academic records still reference it,
     unless `force=true` is supplied to cascade the delete.
+
+    Cascading also removes the class-teacher assignments, and any teacher left leading no
+    class at all drops back to the plain `TEACHER` role.
     """
+    # Read before the cascade: afterwards there is no record of who used to lead this class,
+    # and they would keep a CLASS_TEACHER role pointing at nothing.
+    led_by = [
+        m.get("teacher_id")
+        for m in firestore_class_teacher_mappings.query_documents("class_id", "==", class_id)
+    ]
+
     delete_with_dependencies(
         firestore_classes, class_id, "ClassRoom",
         dependencies=[
             ("student enrollment(s)", firestore_student_enrollments, "class_id"),
             ("teacher mapping(s)", firestore_teacher_mappings, "class_id"),
+            ("class teacher assignment(s)", firestore_class_teacher_mappings, "class_id"),
             ("attendance record(s)", firestore_attendance, "class_id"),
             ("topic(s)", firestore_topics, "class_id"),
             ("meeting(s)", firestore_meetings, "class_id"),
@@ -572,6 +589,10 @@ def delete_class_room(
         ],
         force=force,
     )
+
+    for teacher_id in led_by:
+        sync_class_teacher_role(teacher_id)
+
     return None
 
 
@@ -663,7 +684,9 @@ def map_teacher_to_class(
     [Admin Only] Assign a Teacher to teach a specific Subject in a Class.
     """
     teacher = firestore_users.get_document(str(mapping_in.teacher_id))
-    if not teacher or UserRole(teacher.get("role")) != UserRole.TEACHER:
+    # A class teacher still takes subjects, so both teaching roles are valid here. Testing
+    # against UserRole.TEACHER alone would refuse to give a promoted teacher new periods.
+    if not teacher or teacher.get("role") not in TEACHING_ROLE_VALUES:
         raise HTTPException(status_code=404, detail="Teacher not found or specified user is not a teacher")
 
     subject = firestore_subjects.get_document(str(mapping_in.subject_id))
@@ -713,6 +736,163 @@ def delete_teacher_mapping(mapping_id: int, _: UserOut = Depends(require_admin))
     """
     require_document(firestore_teacher_mappings, mapping_id, "Teacher mapping")
     firestore_teacher_mappings.delete_document(str(mapping_id))
+    return None
+
+
+def sync_class_teacher_role(teacher_id: int | None) -> str | None:
+    """
+    Brings a teacher's role label back into line with their class-teacher mappings.
+
+    The mappings are the authority for what a class teacher may do; the role exists only so
+    the frontend can gate navigation straight from the Firebase claim. Running this after
+    every assign and unassign is what stops the two from drifting into the state
+    `app.services.permissions` warns about - a role reading CLASS_TEACHER while no mapping
+    says which class, or a teacher still leading 9-A whose token says plain TEACHER.
+
+    Admins are deliberately left untouched. An admin already outranks a class teacher
+    everywhere, so rewriting their role would cost them the rest of the system to grant
+    authority they had anyway.
+
+    Returns the role now held, or None when there was no non-admin user to sync.
+    """
+    if teacher_id is None:
+        return None
+
+    user = firestore_users.get_document(str(teacher_id))
+    if not user or user.get("role") == UserRole.ADMIN.value:
+        return None
+
+    leads = bool(firestore_class_teacher_mappings.query_documents("teacher_id", "==", teacher_id))
+    target = UserRole.CLASS_TEACHER if leads else UserRole.TEACHER
+
+    if user.get("role") == target.value:
+        return target.value
+
+    firestore_users.add_document(str(teacher_id), {
+        "role": target.value,
+        "updated_at": datetime.utcnow().isoformat(),
+    })
+
+    firebase_uid = user.get("firebase_uid")
+    if firebase_uid:
+        set_role_claims(firebase_uid, target, teacher_id)
+        # Claims are baked into an already-issued ID token, so without revoking, a teacher
+        # promoted mid-session keeps seeing the old navigation until the token expires.
+        revoke_tokens(firebase_uid)
+
+    return target.value
+
+
+@router.post(
+    "/mappings/class-teacher",
+    response_model=ClassTeacherMappingOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def assign_class_teacher(
+    mapping_in: ClassTeacherMappingCreate,
+    _: UserOut = Depends(require_admin)
+):
+    """
+    [Admin Only] Make a teacher the class teacher of a class.
+
+    This is broader than a subject mapping and deliberately carries no `subject_id`: a class
+    teacher answers for the class as a whole, so they may read and correct the attendance,
+    topics, grades, meetings and study materials that **every** teacher files against that
+    class, not only their own periods. Authority stays scoped to the classes assigned here —
+    leading 9-A grants nothing over 10-B.
+
+    The teacher's role is promoted to `CLASS_TEACHER` and their Firebase claims re-issued, so
+    the frontend can gate navigation without another call. Their existing subject mappings,
+    periods and records are untouched; a class teacher is still an ordinary teacher elsewhere.
+
+    A class may have several class teachers (joint or relief arrangements), and re-posting an
+    assignment that already exists returns it unchanged instead of duplicating it.
+    """
+    teacher = firestore_users.get_document(str(mapping_in.teacher_id))
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+
+    if teacher.get("role") == UserRole.ADMIN.value:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"User {mapping_in.teacher_id} is an administrator and already has full access "
+                "to every class, so assigning them as class teacher would change nothing."
+            ),
+        )
+
+    if teacher.get("role") not in TEACHING_ROLE_VALUES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"User {mapping_in.teacher_id} is not a teacher and cannot lead a class.",
+        )
+
+    require_document(firestore_classes, mapping_in.class_id, "ClassRoom")
+
+    duplicates = [
+        m for m in firestore_class_teacher_mappings.query_documents(
+            "teacher_id", "==", mapping_in.teacher_id
+        )
+        if m.get("class_id") == mapping_in.class_id
+    ]
+    if duplicates:
+        return ClassTeacherMappingOut(**hydrate_class_teacher_mapping(duplicates[0]))
+
+    mapping_id = firestore_class_teacher_mappings.get_next_numeric_id()
+    mapping_data = {
+        "teacher_id": mapping_in.teacher_id,
+        "class_id": mapping_in.class_id,
+        "assigned_at": datetime.utcnow().isoformat(),
+    }
+    firestore_class_teacher_mappings.add_document(str(mapping_id), mapping_data)
+    mapping_data["id"] = mapping_id
+
+    sync_class_teacher_role(mapping_in.teacher_id)
+    return ClassTeacherMappingOut(**hydrate_class_teacher_mapping(mapping_data))
+
+
+@router.get("/mappings/class-teacher", response_model=List[ClassTeacherMappingOut])
+def list_class_teacher_mappings(
+    class_id: Optional[int] = Query(None, description="Only the class teacher(s) leading this class"),
+    teacher_id: Optional[int] = Query(None, description="Only the classes led by this teacher"),
+    _: UserOut = Depends(require_admin)
+):
+    """
+    [Admin Only] View which teacher is class teacher of which class.
+
+    Filter by `class_id` to answer "who leads 9-A", or by `teacher_id` for "what does this
+    teacher lead". Unfiltered, this is the full class-teacher chart.
+    """
+    if class_id is not None:
+        mappings = firestore_class_teacher_mappings.query_documents("class_id", "==", class_id)
+        if teacher_id is not None:
+            mappings = [m for m in mappings if m.get("teacher_id") == teacher_id]
+    elif teacher_id is not None:
+        mappings = firestore_class_teacher_mappings.query_documents("teacher_id", "==", teacher_id)
+    else:
+        mappings = firestore_class_teacher_mappings.list_all()
+
+    prefetch_references(
+        mappings,
+        ("teacher_id", firestore_users),
+        ("class_id", firestore_classes),
+    )
+    return [ClassTeacherMappingOut(**hydrate_class_teacher_mapping(m)) for m in mappings]
+
+
+@router.delete("/mappings/class-teacher/{mapping_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_class_teacher_mapping(mapping_id: int, _: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Remove a class teacher assignment.
+
+    The teacher keeps their subject mappings, periods and everything they logged; they simply
+    stop being answerable for the class, and lose the cross-teacher visibility that came with
+    it. If this was their last class, their role drops back to `TEACHER` and their Firebase
+    claims are re-issued so the frontend stops offering the class-teacher screens.
+    """
+    mapping = require_document(firestore_class_teacher_mappings, mapping_id, "Class teacher mapping")
+    firestore_class_teacher_mappings.delete_document(str(mapping_id))
+    sync_class_teacher_role(mapping.get("teacher_id"))
     return None
 
 
@@ -904,7 +1084,7 @@ def update_timetable_entry(
         teacher = firestore_users.get_document(str(updated["teacher_id"]))
         if not teacher:
             raise HTTPException(status_code=404, detail=f"Teacher {updated['teacher_id']} not found")
-        if teacher.get("role") not in (UserRole.TEACHER.value, UserRole.ADMIN.value):
+        if teacher.get("role") not in TEACHING_OR_ADMIN_VALUES:
             raise HTTPException(
                 status_code=400,
                 detail=f"User {updated['teacher_id']} is not a teacher and cannot be assigned a period.",
@@ -1413,7 +1593,9 @@ def build_monitoring_report(progress: Callable[[int, str], None] | None = None) 
     report(45, "Indexing records")
 
     students = [u for u in users if u.get("role") == UserRole.STUDENT.value and u.get("is_active", False)]
-    teachers = [u for u in users if u.get("role") == UserRole.TEACHER.value and u.get("is_active", False)]
+    # Both teaching roles, or a teacher would drop out of the activity report the moment they
+    # were made a class teacher - exactly the person an admin most wants to see on it.
+    teachers = [u for u in users if u.get("role") in TEACHING_ROLE_VALUES and u.get("is_active", False)]
 
     def group_by(records: list[dict], field: str) -> dict:
         buckets: dict = {}

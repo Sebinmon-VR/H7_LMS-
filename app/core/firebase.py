@@ -592,19 +592,32 @@ def require_document(collection_service: FirestoreService, doc_id: str | int, la
 
 def assert_owner(record: dict, current_user: Any, label: str = "record") -> None:
     """
-    Ensures the acting user owns the record. Admins bypass the check.
-    Raises 403 when a teacher targets another teacher's record.
+    Ensures the acting user may modify the record.
+
+    Admins bypass the check. So does the class teacher of the class the record belongs to:
+    being answerable for a class means being able to correct what the subject teachers filed
+    against it, which is the whole reason the role exists. Everyone else may only touch their
+    own records, and gets a 403 naming what they tried to reach.
     """
     from fastapi import HTTPException
 
     if getattr(current_user, "role", None) == UserRole.ADMIN:
         return
 
-    if record.get("teacher_id") != current_user.id:
-        raise HTTPException(
-            status_code=403,
-            detail=f"You can only modify your own {label}",
-        )
+    if record.get("teacher_id") == getattr(current_user, "id", None):
+        return
+
+    # Imported here rather than at module scope: app.services.permissions reads the collections
+    # defined at the bottom of this module, so a top-level import would be circular.
+    from app.services.permissions import is_class_teacher_of
+
+    if is_class_teacher_of(current_user, record.get("class_id")):
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail=f"You can only modify your own {label}, or those of a class you are class teacher of",
+    )
 
 
 def delete_with_dependencies(
@@ -685,6 +698,15 @@ def hydrate_teacher_mapping(mapping: dict) -> dict:
         "teacher": _resolve_document(firestore_users, mapping.get("teacher_id")),
         "subject": _resolve_document(firestore_subjects, mapping.get("subject_id")),
         "class_room": _resolve_document(firestore_classes, mapping.get("class_id")),
+    }
+
+
+def hydrate_class_teacher_mapping(mapping: dict) -> dict:
+    return {
+        "id": mapping["id"],
+        "teacher": _resolve_document(firestore_users, mapping.get("teacher_id")),
+        "class_room": _resolve_document(firestore_classes, mapping.get("class_id")),
+        "assigned_at": mapping.get("assigned_at"),
     }
 
 
@@ -819,6 +841,10 @@ firestore_users = FirestoreService("users", cacheable=True)
 firestore_classes = FirestoreService("class_rooms", cacheable=True)
 firestore_subjects = FirestoreService("subjects", cacheable=True)
 firestore_teacher_mappings = FirestoreService("teacher_subject_class_mappings")
+# Which teacher is answerable for a class as a whole. Small and slow-changing, but read on
+# every authorization check a class teacher makes, so it is queried rather than fetched by id
+# and does not benefit from the document cache.
+firestore_class_teacher_mappings = FirestoreService("class_teacher_mappings")
 firestore_student_enrollments = FirestoreService("student_enrollments")
 firestore_attendance = FirestoreService("attendance_records")
 firestore_topics = FirestoreService("topics_covered")

@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict
 from app.schemas.user import UserOut
 
@@ -57,6 +59,20 @@ class TeacherMappingOut(BaseModel):
     teacher: UserOut
     subject: SubjectOut
     class_room: ClassRoomOut
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ClassTeacherMappingCreate(BaseModel):
+    teacher_id: int
+    class_id: int
+
+
+class ClassTeacherMappingOut(BaseModel):
+    id: int
+    teacher: UserOut
+    class_room: ClassRoomOut
+    assigned_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
