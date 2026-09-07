@@ -772,6 +772,12 @@ def hydrate_live_meeting(meeting: dict) -> dict:
         "google_calendar_id": meeting.get("google_calendar_id"),
         "meet_status": meeting.get("meet_status"),
         "meet_error": meeting.get("meet_error"),
+        "auto_record": meeting.get("auto_record"),
+        "recording_status": meeting.get("recording_status"),
+        "recording_error": meeting.get("recording_error"),
+        "recording_drive_file_id": meeting.get("recording_drive_file_id"),
+        "recording_stored_at": meeting.get("recording_stored_at"),
+        "recording_files": meeting.get("recording_files"),
     }
 
 
@@ -829,8 +835,10 @@ def hydrate_exam_grade(grade: dict) -> dict:
         "exam_name": grade.get("exam_name"),
         "marks_obtained": grade.get("marks_obtained"),
         "max_marks": grade.get("max_marks"),
+        "grade": grade.get("grade"),
         "remarks": grade.get("remarks"),
         "created_at": grade.get("created_at"),
+        "exam_id": grade.get("exam_id"),
     }
 
 
@@ -857,3 +865,24 @@ firestore_timetable = FirestoreService("timetable_entries", cacheable=True)
 # One document per reminder actually sent, so a restart or an overlapping sweep cannot
 # email the same student about the same period twice.
 firestore_reminder_log = FirestoreService("reminder_log")
+# One document per (meeting, Meet recording), claimed atomically before the video is moved.
+# It is what stops two server workers filing the same recording twice, and it doubles as the
+# audit trail for where each class recording ended up.
+firestore_recording_log = FirestoreService("recording_log")
+
+# The exam module. An exam document carries its own question form inline, so a student
+# opening a paper and a teacher valuing it both cost one read rather than one per question.
+firestore_exams = FirestoreService("exams")
+# One document per (exam, student), with the id derived from both - see
+# `app.services.exams.submission_id`. That makes a double submit an update rather than a
+# second script, without a read-then-write race between two tabs.
+firestore_exam_submissions = FirestoreService("exam_submissions")
+# Issued report cards. Snapshots, so they are never cached: a card read back must be the
+# version the class teacher last saved, including a remark added seconds ago.
+firestore_report_cards = FirestoreService("report_cards")
+
+# The exam hydrators live in `app.services.exams` and `app.services.report_cards` rather
+# than here beside `hydrate_exam_grade`. They are not plain reference-resolution: an exam's
+# window state is computed from the clock, and a student's copy of a paper must have the
+# answer key stripped from it. Keeping that logic next to the rules it enforces is what stops
+# a second, key-leaking hydrator being written by hand in a router.

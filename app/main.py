@@ -9,11 +9,17 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.auth import router as auth_router
 from app.api.v1.admin import router as admin_router
+from app.api.v1.exams import (
+    report_router as report_card_router,
+    router as exam_router,
+    student_router as student_exam_router,
+)
 from app.api.v1.teachers import router as teacher_router
 from app.api.v1.students import router as student_router
 from app.api.v1.storage import router as storage_router
 from app.core.config import settings
 from app.db.init_db import init_db
+from app.services.recordings import get_scheduler as get_recording_scheduler
 from app.services.reminders import get_scheduler
 
 logger = logging.getLogger("lms_app")
@@ -24,9 +30,10 @@ async def lifespan(app: FastAPI):
     """
     Application lifespan manager.
 
-    Neither startup task may take the API down: seeding and the reminder scheduler are both
+    No startup task may take the API down: seeding and the two background schedulers are all
     conveniences, and a school that cannot log in because a background thread failed to
-    start is strictly worse off than one whose reminders are late.
+    start is strictly worse off than one whose reminders are late or whose class recordings
+    are filed on the next restart.
     """
     try:
         init_db()
@@ -39,12 +46,23 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Class reminder scheduler could not start: %s", exc)
 
+    recording_scheduler = get_recording_scheduler()
+    try:
+        recording_scheduler.start()
+    except Exception as exc:
+        logger.warning("Class recording scheduler could not start: %s", exc)
+
     yield
 
     try:
         scheduler.stop()
     except Exception as exc:
         logger.warning("Class reminder scheduler did not stop cleanly: %s", exc)
+
+    try:
+        recording_scheduler.stop()
+    except Exception as exc:
+        logger.warning("Class recording scheduler did not stop cleanly: %s", exc)
 
 
 app = FastAPI(
@@ -54,7 +72,8 @@ app = FastAPI(
         "Integrated with Firebase Cloud Firestore & Google Cloud Storage APIs. "
         "Supports Authentication & RBAC, Students Module, Teachers Module, Admin Module, "
         "Independent Attendance Logging, Syllabus Topic Tracker, Live Meetings & Recordings, "
-        "Book/Notes File Uploads, Exam Mark Entry, and Admin Monitoring Analytics."
+        "Book/Notes File Uploads, Online & Offline Exams with Answer Keys and Valuation, "
+        "Report Cards, and Admin Monitoring Analytics."
     ),
     version="1.0.0",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
@@ -121,6 +140,11 @@ app.include_router(admin_router, prefix=settings.API_V1_STR)
 app.include_router(teacher_router, prefix=settings.API_V1_STR)
 app.include_router(student_router, prefix=settings.API_V1_STR)
 app.include_router(storage_router, prefix=settings.API_V1_STR)
+# The exam module carries its own routers because the same operations are performed by
+# three different roles; each endpoint enforces its own role guard.
+app.include_router(exam_router, prefix=settings.API_V1_STR)
+app.include_router(report_card_router, prefix=settings.API_V1_STR)
+app.include_router(student_exam_router, prefix=settings.API_V1_STR)
 
 
 @app.get("/", tags=["Health Check"])

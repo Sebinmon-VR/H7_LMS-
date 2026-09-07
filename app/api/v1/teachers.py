@@ -22,6 +22,7 @@ from app.services.content import (
     schedule_meeting, store_material,
 )
 from app.services.permissions import visible_records
+from app.services.recordings import harvest_meeting
 from app.schemas.academic import ClassTeacherMappingOut, TeacherMappingOut
 from app.schemas.timetable import ScheduledPeriod, TimetableEntryOut
 from app.schemas.user import UserOut
@@ -426,6 +427,35 @@ def delete_live_meeting(
 
     firestore_meetings.delete_document(str(meeting_id))
     return None
+
+
+@router.post("/meetings/{meeting_id}/recording/sync", response_model=LiveMeetingOut)
+def sync_meeting_recording(
+    meeting_id: int,
+    current_user: UserOut = Depends(require_teacher),
+):
+    """
+    [Teacher Only] Fetch this session's recording now rather than waiting for the sweep.
+
+    Recordings are collected automatically a few minutes after each class ends, so this is
+    for the impatient case - a teacher who has just finished and wants the video in front of
+    the class. A recording Meet is still processing comes back with `recording_status`
+    WAITING, and calling again later is free: an already-filed video is never filed twice.
+    """
+    meeting = require_document(firestore_meetings, meeting_id, "Meeting")
+    assert_owner(meeting, current_user, "meetings")
+
+    if not (meeting.get("meet_space_name") or meeting.get("meet_meeting_code")):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This meeting has no Google Meet conference behind it, so there is no "
+                "recording to collect. Only sessions with a generated Meet link are recorded."
+            ),
+        )
+
+    harvest_meeting(meeting)
+    return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
 
 
 @router.post("/materials", response_model=StudyMaterialOut, status_code=status.HTTP_201_CREATED)

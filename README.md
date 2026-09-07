@@ -10,6 +10,7 @@ This repository contains a FastAPI-based Learning Management System (LMS) backen
 - Teacher workflows for attendance, topic logging, meeting scheduling, material uploads, and grade entry
 - Student workflows for viewing classes, attendance, topics, meetings, materials, and grades
 - **Google Meet links generated automatically** as real Google Calendar events, with enrolled students invited
+- **Online classes record themselves**, and the finished video is filed into the school's Shared Drive and shared with the class
 - **Pluggable file storage**: Google Cloud Storage, a Workspace Shared Drive, or local disk
 - **Full update and delete coverage** across every resource, with referential-integrity guards
 - Firestore seeding for initial demo data
@@ -143,6 +144,44 @@ Every event is stamped with `GOOGLE_CALENDAR_TIMEZONE`. Calendar rejects a naive
 
 **Scopes are probed, not assumed.** Google fails the *entire* token exchange with `unauthorized_client` if any single requested scope is missing from the domain-wide delegation grant, so requesting extra scopes "just in case" breaks an otherwise working setup. The client tries `calendar.events` first (all that Meet requires), then wider sets, and remembers whichever authenticates. Pin the set with `GOOGLE_CALENDAR_SCOPES` if you prefer. `GET /admin/integrations` reports the granted scopes and the numeric Client ID the delegation form asks for.
 
+### Automatic class recording
+
+Online classes record themselves, and the video ends up in the school's Drive rather than in a teacher's personal one.
+
+Recording is a property of the **meeting space**, not of the calendar event, so the Calendar API cannot ask for it. When a session is scheduled the backend makes a second call, against the Google Meet REST API v2:
+
+```
+Calendar events.insert  ->  hangoutLink  ->  meeting code
+Meet spaces.get         ->  the space's resource name
+Meet spaces.patch       ->  config.artifactConfig.recordingConfig.autoRecordingGeneration = ON
+```
+
+Meet then starts recording on its own when the first participant joins. Nobody has to press anything, and a teacher who forgets does not lose the lesson.
+
+A background sweep every `RECORDING_SCAN_INTERVAL_SECONDS` picks the video up afterwards. Meet writes it into the *organiser's* Drive, where it is invisible to students, counts against that teacher's quota, and leaves with them when they go — so `RECORDING_HARVEST_DELAY_MINUTES` after a session's scheduled end the sweep asks Meet for its recordings, moves each one into the Shared Drive under `Class Recordings/class_<id>/`, and grants every enrolled student read access. `recording_url` on the meeting then points at the stored copy.
+
+`recording_status` on every meeting tracks the whole lifecycle:
+
+| Status | Meaning |
+| --- | --- |
+| `NOT_REQUESTED` | `auto_record: false` on the session, or the link was entered by hand |
+| `ARMED` | Meet will record it automatically |
+| `ARM_FAILED` | Arming did not work — still swept, in case a teacher records manually |
+| `WAITING` | The class has ended and Meet has not published a file yet |
+| `STORED` | The video is in the school Drive; `recording_url` points at it |
+| `UNAVAILABLE` | Nothing was ever published; gave up after `RECORDING_MAX_AGE_HOURS` |
+| `FAILED` | A recording exists but could not be filed; `recording_error` says why |
+
+Three properties matter, because the failure mode of an automated file mover is not silence — it is duplicate videos and lost originals:
+
+- **Exactly once.** Before transferring, the sweep *claims* a Firestore document keyed by (meeting, Meet recording name) with an atomic `create`. A second server worker, an overlapping sweep, and `POST /admin/recordings/run` all lose the race and skip.
+- **No infinite polling.** A class nobody joined never produces a recording. Sessions are polled until `RECORDING_MAX_AGE_HOURS` after they end and then marked `UNAVAILABLE`, so the Meet API cost of the sweep stays proportional to today's timetable rather than to the school's whole history.
+- **Never lose the link.** Every failure degrades rather than aborts: a video that cannot be moved is copied, one that cannot be copied is linked where it lies, and the reason lands in `recording_error`.
+
+`RECORDING_TRANSFER_MODE` chooses between `MOVE` (default — organisation-owned, no duplicate storage), `COPY` (the teacher keeps the original), and `LINK` (record where it already is).
+
+**Requirements beyond the Calendar setup:** the Meet API enabled on the project, the `meetings.space.settings` and `meetings.space.readonly` scopes added to the delegation grant, and a Workspace edition that can record at all — Business Standard/Plus, Enterprise, Education Plus, or the Teaching & Learning Upgrade. Business Starter and personal Gmail accounts cannot record, and no API configuration changes that. `GET /admin/integrations` reports the `meet_recording` section separately from `google_meet`, because Meet links can work perfectly while recording is unauthorized.
+
 ### Google Drive storage option
 
 `StorageService` changed from a local/cloud boolean into a three-way `STORAGE_PROVIDER` switch (`GCS` | `DRIVE` | `LOCAL`). Two Drive layouts are supported:
@@ -189,7 +228,7 @@ Reminders are **opt-out** per user (`reminder_opt_in`): enrolling a student mean
 
 ### Integration diagnostics
 
-`GET /api/v1/admin/integrations` probes Drive, Cloud Storage, Calendar/Meet, and SMTP and reports `ok` plus a `detail` naming the precise misconfiguration — Drive API not enabled on the project, domain-wide delegation refused, a Shared Drive ID the service account cannot see, a folder layout that will hit `storageQuotaExceeded`. `POST /api/v1/admin/integrations/storage/test-upload` proves a real write works by uploading a probe file and deleting it. Teachers get the storage half at `GET /api/v1/storage/status`.
+`GET /api/v1/admin/integrations` probes Drive, Cloud Storage, Calendar/Meet, Meet recording, and SMTP and reports `ok` plus a `detail` naming the precise misconfiguration — Drive API not enabled on the project, domain-wide delegation refused, a Shared Drive ID the service account cannot see, a folder layout that will hit `storageQuotaExceeded`. `POST /api/v1/admin/integrations/storage/test-upload` proves a real write works by uploading a probe file and deleting it. Teachers get the storage half at `GET /api/v1/storage/status`.
 
 ### Full update and delete coverage
 
@@ -231,13 +270,15 @@ The API previously had exactly one delete endpoint (a soft user deactivation). I
 | `app/core/jobs.py` | Background job registry with progress reporting, and the result cache |
 | `app/core/firebase_auth.py` | Firebase Auth: token verification, account creation, custom claims, disable/revoke |
 | `app/core/google_meet.py` | Google Meet link generation via the Calendar API, plus `check_access()` diagnostics |
-| `app/core/google_drive.py` | Shared Drive / folder uploads, folder resolution, deletion, plus `check_access()` diagnostics |
+| `app/core/meet_recordings.py` | Meet REST API v2: arming auto-recording on a meeting space, finding its recordings afterwards |
+| `app/core/google_drive.py` | Shared Drive / folder uploads, folder resolution, recording transfer, deletion, plus `check_access()` diagnostics |
 | `app/core/gcp_services.py` | Storage provider switch (GCS / Drive / Local) |
 | `app/core/security.py` | Legacy JWT decoding only; removable after cutover |
 | `app/api/v1/` | Versioned routers: auth, admin, teachers, students, storage |
 | `app/services/content.py` | Meeting scheduling and material storage shared by the teacher and admin routers |
 | `app/services/timetable.py` | Recurring period storage, clash detection, resolution against calendar dates |
 | `app/services/reminders.py` | Timetable-driven reminder sweep and its background scheduler |
+| `app/services/recordings.py` | Collecting finished class recordings into the school Drive, and its background scheduler |
 | `app/schemas/` | Pydantic request/response models |
 | `app/db/init_db.py` | Firestore seeding at startup |
 | `scripts/migrate_users_to_firebase_auth.py` | One-time migration linking existing users to Firebase Auth |
@@ -327,6 +368,19 @@ database).
 | `GOOGLE_MEET_INVITE_ATTENDEES` | `True` | Invite enrolled students as Calendar guests. Turning it off still yields a Meet link |
 | `GOOGLE_CALENDAR_SCOPES` | `""` | Pin the Calendar OAuth scopes. Blank probes narrowest-first and settles on whatever delegation granted |
 
+### Class recording
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ENABLE_MEET_AUTO_RECORDING` | `True` | Arm every generated Meet conference to record itself, and run the collection sweep |
+| `RECORDING_TRANSFER_MODE` | `MOVE` | `MOVE` into the Shared Drive, `COPY` there, or `LINK` to the teacher's original |
+| `RECORDING_DRIVE_FOLDER_NAME` | `Class Recordings` | Folder under the Drive root holding the per-class recording folders |
+| `RECORDING_SHARE_WITH_STUDENTS` | `True` | Grant each enrolled student read access to their class's recording |
+| `RECORDING_HARVEST_DELAY_MINUTES` | `5` | Wait this long after a session's scheduled end before looking. Meet needs minutes to write the file |
+| `RECORDING_SCAN_INTERVAL_SECONDS` | `300` | Sweep interval, floored at 60s |
+| `RECORDING_MAX_AGE_HOURS` | `48` | Give up on a session with no recording after this, and stop polling it |
+| `MEET_RECORDING_SCOPES` | `""` | Pin the Meet OAuth scopes. Blank probes narrowest-first, as with Calendar |
+
 ### Timetable & reminders
 
 | Variable | Default | Purpose |
@@ -369,6 +423,7 @@ gcloud services enable \
   storage.googleapis.com \
   calendar-json.googleapis.com \
   drive.googleapis.com \
+  meet.googleapis.com \
   iamcredentials.googleapis.com
 ```
 
@@ -376,7 +431,8 @@ gcloud services enable \
 | --- | --- | --- |
 | `identitytoolkit` | Identity Toolkit API | Firebase Auth |
 | `calendar-json` | Google Calendar API | Meet link generation |
-| `drive` | Google Drive API | Shared Drive uploads |
+| `drive` | Google Drive API | Shared Drive uploads, filing recordings |
+| `meet` | Google Meet API | Automatic class recording |
 | `iamcredentials` | IAM Service Account Credentials API | Delegation token minting |
 
 ### 2. Enable Firebase Auth providers
@@ -396,17 +452,28 @@ This is what allows the backend to act as a teacher without a per-user consent s
 3. **Client ID** = the numeric Unique ID from step 1.
 4. **OAuth scopes**, comma-separated with no spaces:
    ```
-   https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/drive
+   https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/meetings.space.settings,https://www.googleapis.com/auth/meetings.space.readonly
    ```
+   The last two are needed only for automatic class recording; drop them if `ENABLE_MEET_AUTO_RECORDING=False`.
 5. Authorize. Propagation is usually under a minute, but Google documents up to 24 hours.
 
-> **Scope discipline:** delegation lets the backend impersonate *any* user in the domain within the granted scopes. Grant only these two.
+> **Scope discipline:** delegation lets the backend impersonate *any* user in the domain within the granted scopes. Grant only these four — and only the first two if you are not recording classes.
+>
+> Add every scope you need **in one entry**. Google rejects the entire token exchange with `unauthorized_client` when any single requested scope is unauthorized, so a half-updated grant breaks Calendar as well as Meet.
 
-### 4. Create the Shared Drive (only if using Drive storage)
+### 4. Create the Shared Drive (required for Drive storage *or* class recording)
 
 1. **drive.google.com → Shared drives → New**.
 2. **Manage members** → add the service account email as **Content manager**.
 3. Copy the ID from the URL `drive.google.com/drive/folders/<ID>` into `GOOGLE_DRIVE_SHARED_DRIVE_ID`.
+
+Class recordings are filed here even when `STORAGE_PROVIDER=GCS`. A Meet recording is already a Drive file, and moving it within Drive costs nothing, while downloading and re-uploading a lecture-sized video would.
+
+### 4b. Enable Meet recording (only for automatic class recording)
+
+**admin.google.com → Apps → Google Workspace → Google Meet → Meet video settings** → select the OU the teachers are in → turn **Recording** on.
+
+This is an edition feature, not a permission: it exists on Business Standard/Plus, Enterprise, Education Plus and the Teaching & Learning Upgrade, and does not exist at all on Business Starter or personal Gmail. A `403` from the Meet API in `GET /admin/integrations` means this first, delegation second.
 
 ### 5. Grant IAM roles
 
@@ -449,7 +516,7 @@ Roles are read from the Firestore profile regardless of authentication provider;
 
 Collections exposed as top-level services:
 
-`users`, `class_rooms`, `subjects`, `teacher_subject_class_mappings`, `student_enrollments`, `attendance_records`, `topics_covered`, `live_meetings`, `study_materials`, `exam_grades`, `drive_folders`
+`users`, `class_rooms`, `subjects`, `teacher_subject_class_mappings`, `student_enrollments`, `attendance_records`, `topics_covered`, `live_meetings`, `study_materials`, `exam_grades`, `exams`, `exam_submissions`, `report_cards`, `drive_folders`
 
 ### `FirestoreService`
 
@@ -535,7 +602,12 @@ New endpoints added in this release are marked **NEW**.
 | `GET` | `/api/v1/admin/reminders/preview` | **NEW** — what the next sweep would send, sending nothing |
 | `POST` | `/api/v1/admin/reminders/run` | **NEW** — trigger a sweep now; returns a job id |
 | `GET` | `/api/v1/admin/reminders/log` | **NEW** — reminders actually delivered, newest first |
-| `GET` | `/api/v1/admin/integrations` | **NEW** — live health of Drive, Cloud Storage, Meet, and SMTP, with the exact misconfiguration named |
+| `GET` | `/api/v1/admin/recordings/status` | **NEW** — recording sweep health, transfer mode, last run |
+| `GET` | `/api/v1/admin/recordings/pending` | **NEW** — what the next sweep would file, filing nothing |
+| `POST` | `/api/v1/admin/recordings/run` | **NEW** — collect finished recordings now; returns a job id |
+| `GET` | `/api/v1/admin/recordings/log` | **NEW** — recordings filed, where they went, and why any failed |
+| `POST` | `/api/v1/admin/meetings/{meeting_id}/recording/sync` | **NEW** — fetch and file one session's recording immediately |
+| `GET` | `/api/v1/admin/integrations` | **NEW** — live health of Drive, Cloud Storage, Meet, Meet recording, and SMTP, with the exact misconfiguration named |
 | `POST` | `/api/v1/admin/integrations/storage/test-upload` | **NEW** — upload a probe file, report where it landed, delete it again |
 | `GET` | `/api/v1/admin/reports/monitoring` | Overall stats, teacher activity, student performance. Cached; `?refresh=true` recomputes |
 | `POST` | `/api/v1/admin/reports/monitoring/refresh` | **NEW** — rebuild in the background, returns `202` with a job id |
@@ -558,10 +630,11 @@ All update and delete routes enforce ownership: teachers may only modify their o
 | `GET` | `/api/v1/teachers/topics` | Topics logged by this teacher |
 | `PUT` | `/api/v1/teachers/topics/{topic_id}` | **NEW** — edit a topic |
 | `DELETE` | `/api/v1/teachers/topics/{topic_id}` | **NEW** — remove a topic |
-| `POST` | `/api/v1/teachers/meetings` | Schedule a session; auto-creates a Meet link |
+| `POST` | `/api/v1/teachers/meetings` | Schedule a session; auto-creates a Meet link and arms auto-recording |
 | `GET` | `/api/v1/teachers/meetings` | Meetings created by this teacher |
 | `PUT` | `/api/v1/teachers/meetings/{meeting_id}` | **NEW** — reschedule; propagates to Calendar |
 | `DELETE` | `/api/v1/teachers/meetings/{meeting_id}` | **NEW** — cancel; deletes the Calendar event |
+| `POST` | `/api/v1/teachers/meetings/{meeting_id}/recording/sync` | **NEW** — file this session's recording now instead of waiting for the sweep |
 | `POST` | `/api/v1/teachers/materials` | Upload study material (multipart) |
 | `GET` | `/api/v1/teachers/materials` | Materials uploaded by this teacher |
 | `PUT` | `/api/v1/teachers/materials/{material_id}` | **NEW** — rename or change type |
@@ -582,7 +655,87 @@ All accept an optional `?subject_id=` filter.
 | `GET` | `/api/v1/students/topics` | Topics covered for the student's class |
 | `GET` | `/api/v1/students/meetings` | Meeting links and recordings |
 | `GET` | `/api/v1/students/materials` | Study materials |
-| `GET` | `/api/v1/students/grades` | Exam grades and remarks |
+| `GET` | `/api/v1/students/grades` | Exam grades and remarks, including marks mirrored from published exams |
+
+### Exams Module
+
+Set an exam ONLINE (a form students answer in the LMS) or OFFLINE (a paper they write on and
+upload a scan of). Both carry time rules; both are valued by a teacher; both feed report cards.
+
+An exam is created as a `DRAFT` and is invisible to students until released with
+`POST /exams/{id}/publish` — a student who guesses a draft's id gets a 404. Marks are
+withheld from students until `POST /exams/{id}/results/publish`, which also mirrors each
+result into `exam_grades`, so it reaches `/students/grades` and the admin analytics rather
+than living in a second results screen.
+
+**Time rules.** `starts_at`/`ends_at` bound the window; `duration_minutes` limits each student
+once they start; `upload_grace_minutes` is the class-wide *uploading concession* — minutes past
+the deadline in which a hand-in is still accepted and flagged late. `POST /exams/{id}/concessions`
+grants extra time to one student as an access arrangement, moving their deadline and nobody
+else's, and their work is **not** flagged late for using it. A student's deadline is fixed when
+they start, so a concession edited mid-paper cannot shorten a paper already under way.
+
+**Valuation.** `grading_scheme` is chosen at creation and frozen once scripts are in: `MARKS`
+awards numbers (a grade letter is derived from `grade_bands` if defined), `GRADE` awards a
+letter from the exam's own scale. An answer key may be set at creation **or after the scripts
+are in** — `PUT /exams/{id}/answer-key` re-marks everything already submitted, keeping marks a
+teacher awarded by hand. Objective marking is all-or-nothing and every auto-marked line is
+flagged `auto`, so a teacher can see what they are being asked to trust and override any of it.
+Essays are never auto-marked.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/api/v1/exams` | Set an exam (ONLINE or OFFLINE), with its form, time rules, and grading scheme |
+| `GET` | `/api/v1/exams` | Exams you set, plus every exam in a class you lead. Filters: `class_id`, `subject_id`, `status`, `mode` |
+| `GET` | `/api/v1/exams/{id}` | One exam in full, answer key included |
+| `PUT` | `/api/v1/exams/{id}` | Correct details or time rules. `409` if you change what it is worth after scripts are in |
+| `DELETE` | `/api/v1/exams/{id}` | `409` while scripts reference it; `?force=true` cascades |
+| `PUT` | `/api/v1/exams/{id}/questions` | Build or rewrite the exam sheet. Frozen once scripts are in |
+| `PUT` | `/api/v1/exams/{id}/answer-key` | Set or correct the key, before or after submissions; re-marks by default |
+| `POST` | `/api/v1/exams/{id}/paper` | Upload the question paper for an OFFLINE exam (multipart) |
+| `POST` | `/api/v1/exams/{id}/publish` | Release the exam to the class |
+| `POST` | `/api/v1/exams/{id}/concessions` | Grant one student extra time; `extra_minutes: 0` withdraws it |
+| `GET` | `/api/v1/exams/{id}/stats` | Submitted, valued, missing, late, average, pass/fail |
+| `GET` | `/api/v1/exams/{id}/submissions` | Every script. Staff only — students never see each other's work |
+| `GET` | `/api/v1/exams/{id}/submissions/{student_id}` | One student's answers and uploaded sheets |
+| `POST` | `/api/v1/exams/{id}/submissions/{student_id}/evaluate` | Award marks per question, a flat total, or a grade |
+| `POST` | `/api/v1/exams/{id}/submissions/{student_id}/reopen` | Hand a script back; voids its valuation and any published mark |
+| `POST` | `/api/v1/exams/{id}/results/publish` | Release marks to the class and mirror them into `exam_grades` |
+
+### Report Cards
+
+Issued by the **class teacher** of a class, or an admin — deliberately stricter than the exam
+endpoints, since a card consolidates every other teacher's marks. One card per enrolled
+student, grouped by subject, with totals, percentage, letter grade, attendance, and class rank.
+
+A card is a **snapshot**, not a live query: it records the marks as they stood when issued, so a
+card already handed out does not change because somebody corrected a mark last night.
+Re-issuing with the same `title` overwrites that card rather than leaving two. A paper never sat
+is listed as `missed` and left out of the totals unless `count_missing_as_zero` is set.
+Letter-graded exams appear on the card but do not move the totals, since letters cannot be added
+up. Cards start unpublished so the class teacher can read them before the class does.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/api/v1/report-cards/generate` | Issue cards for a class. Bound by `from_date`/`to_date` or `exam_ids` |
+| `GET` | `/api/v1/report-cards` | Cards for classes you lead. Filters: `class_id`, `student_id` |
+| `GET` | `/api/v1/report-cards/{card_id}` | One card in full |
+| `PUT` | `/api/v1/report-cards/{card_id}` | Add overall or per-subject remarks; publish or withdraw |
+| `DELETE` | `/api/v1/report-cards/{card_id}` | Withdraw a card issued in error |
+
+### Student Exam Endpoints
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/v1/students/exams` | Released exams for this student's classes, each with their own state and deadline |
+| `GET` | `/api/v1/students/exams/{id}` | Open the paper. Questions appear once the window opens; the key only once results are published |
+| `POST` | `/api/v1/students/exams/{id}/start` | Start and stamp the clock; returns `expires_at` |
+| `PATCH` | `/api/v1/students/exams/{id}/answers` | Autosave; answers merge by question id |
+| `POST` | `/api/v1/students/exams/{id}/attachments` | Upload an answer sheet, or a file answering one question |
+| `POST` | `/api/v1/students/exams/{id}/submit` | Hand in. Final — only a teacher can reopen it |
+| `GET` | `/api/v1/students/exams/{id}/submission` | Own script, and the result once published |
+| `GET` | `/api/v1/students/report-cards` | Published report cards for this student |
+| `GET` | `/api/v1/students/report-cards/{card_id}` | One published card |
 
 ### Storage
 
@@ -600,14 +753,17 @@ All accept an optional `?subject_id=` filter.
 | --- | --- | --- |
 | `class_id`, `subject_id`, `title`, `scheduled_time` | — | Required |
 | `auto_create_meet` | `true` | Generate a Calendar event with a Meet link |
-| `duration_minutes` | `60` | Event length |
+| `auto_record` | `true` | Record the session automatically and file the video into the school Drive |
+| `duration_minutes` | `60` | Event length — also decides when the recording sweep starts looking |
 | `invite_students` | `true` | Add enrolled students as attendees |
 | `meeting_link` | `null` | Supply manually to skip generation |
 | `recording_url`, `status` | — | Optional metadata |
 
-The response adds `google_event_id` and `google_calendar_id` when a Calendar event backs the meeting.
+The response adds `google_event_id` and `google_calendar_id` when a Calendar event backs the meeting, plus `recording_status` and `recording_error` describing whether the conference was armed to record itself.
 
-**Clients must handle a null `meeting_link` on a `201` response.** Meet generation is best-effort by design, so the meeting is always persisted even when the link cannot be created.
+**Clients must handle a null `meeting_link` on a `201` response.** Meet generation is best-effort by design, so the meeting is always persisted even when the link cannot be created. The same applies to recording: `recording_status: "ARM_FAILED"` on a `201` means the session was scheduled and the link works, but Meet will not record it — `recording_error` says why.
+
+`recording_url` is filled in by the background sweep once the class is over and the video has been filed. Until then it is `null` and `recording_status` says what the system is waiting for.
 
 ---
 
@@ -638,8 +794,8 @@ Example `409` body:
 | --- | --- |
 | `UserCreate` | `password` is now optional |
 | `UserOut` | Added `firebase_uid` |
-| `LiveMeetingCreate` | Added `auto_create_meet`, `duration_minutes`, `invite_students` |
-| `LiveMeetingOut` | Added `google_event_id`, `google_calendar_id` |
+| `LiveMeetingCreate` | Added `auto_create_meet`, `duration_minutes`, `invite_students`, `auto_record` |
+| `LiveMeetingOut` | Added `google_event_id`, `google_calendar_id`, `auto_record`, `recording_status`, `recording_error`, `recording_drive_file_id`, `recording_stored_at`, `recording_files` |
 | `StudyMaterialOut` | Added `storage_provider` |
 | New partial-update models | `ClassRoomUpdate`, `SubjectUpdate`, `AttendanceUpdate`, `TopicUpdate`, `LiveMeetingUpdate`, `StudyMaterialUpdate`, `GradeEntryUpdate` |
 

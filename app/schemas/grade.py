@@ -23,6 +23,14 @@ class GradeEntryUpdate(BaseModel):
 
 
 class ExamGradeOut(BaseModel):
+    """
+    A mark on a student's record.
+
+    Rows arrive here two ways: entered by hand through `/teachers/grades`, or mirrored from a
+    published exam by the exam module. The exam module is why `marks_obtained` is nullable and
+    `grade` exists - an exam valued on a letter scale has a grade and no marks, and inventing
+    a number for it would put fabricated data on a report card.
+    """
     id: int
     student_id: int
     student: UserOut | None = None
@@ -33,9 +41,14 @@ class ExamGradeOut(BaseModel):
     teacher_id: int
     teacher: UserOut | None = None
     exam_name: str
-    marks_obtained: float
-    max_marks: float
+    marks_obtained: float | None = None
+    max_marks: float | None = None
+    # Set when this row came from a letter-graded exam, or from one whose scale defines bands.
+    grade: str | None = None
     remarks: str | None = None
     created_at: datetime
+    # The exam this mark came from, when it was mirrored from the exam module rather than
+    # typed in by hand. Lets a client link a mark back to the script it was awarded for.
+    exam_id: int | None = None
 
     model_config = ConfigDict(from_attributes=True)

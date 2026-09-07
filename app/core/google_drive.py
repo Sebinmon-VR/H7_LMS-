@@ -150,13 +150,17 @@ def _describe_api_error(exc: Exception) -> str:
     return f"{label}: {reason or exc}{hint}"
 
 
-def _build_drive_service():
+def _build_drive_service(as_user: str | None = None):
     """
     Builds a Drive API client.
 
     Impersonation is used when GOOGLE_DRIVE_IMPERSONATION is on and a fallback identity is
     configured, so files are owned by a real Workspace user rather than the bare service
     account (which cannot own files at all outside a Shared Drive).
+
+    `as_user` overrides that identity for one call chain. Class recordings need it: Meet
+    writes the video into the *meeting organiser's* Drive, and only that user can move it out
+    of their own My Drive - the LMS service identity cannot see the file at all.
     """
     try:
         from google.oauth2 import service_account
@@ -178,7 +182,7 @@ def _build_drive_service():
         credentials = service_account.Credentials.from_service_account_file(
             cred_path, scopes=DRIVE_SCOPES
         )
-        subject = impersonated_identity()
+        subject = (as_user or "").strip() or impersonated_identity()
         if subject:
             credentials = credentials.with_subject(subject)
     except GoogleDriveError:
@@ -562,6 +566,255 @@ def delete_file(file_id: str) -> bool:
             file_id, delete_error, _describe_api_error(exc),
         )
         return False
+
+
+def grant_readers(file_id: str, emails: list[str], as_user: str | None = None) -> dict:
+    """
+    Gives each address read access to one file. Best effort, per address.
+
+    Returns {"granted": [...], "failed": {email: reason}}. Failures are collected rather than
+    raised because one student with a mistyped address must not cost the whole class its
+    recording - and the file is already stored by the time this runs.
+    """
+    result: dict = {"granted": [], "failed": {}}
+    targets = [e.strip() for e in (emails or []) if e and e.strip()]
+    if not file_id or not targets:
+        return result
+
+    try:
+        service = _build_drive_service(as_user=as_user)
+    except GoogleDriveError as exc:
+        result["failed"] = {email: str(exc) for email in targets}
+        return result
+
+    for email in targets:
+        try:
+            service.permissions().create(
+                fileId=file_id,
+                body={"type": "user", "role": "reader", "emailAddress": email},
+                # Students are told about a new recording by the LMS, not by a Drive robot.
+                sendNotificationEmail=False,
+                supportsAllDrives=True,
+            ).execute()
+            result["granted"].append(email)
+        except Exception as exc:
+            result["failed"][email] = _describe_api_error(exc)
+
+    if result["failed"]:
+        logger.warning(
+            "Could not share '%s' with %d of %d recipients.",
+            file_id, len(result["failed"]), len(targets),
+        )
+    return result
+
+
+def _grant_folder_writer(service, folder_id: str, email: str) -> str | None:
+    """
+    Lets `email` write into a Shared Drive folder. Returns a reason string on failure.
+
+    A teacher who is not a member of the Shared Drive cannot move their recording into it, and
+    the move is performed as the teacher because only the file's owner can take it out of
+    their My Drive. Granting writer on the destination folder - as the LMS identity, which is
+    a Content manager - is the smallest permission that makes that move legal.
+    """
+    try:
+        service.permissions().create(
+            fileId=folder_id,
+            body={"type": "user", "role": "writer", "emailAddress": email},
+            sendNotificationEmail=False,
+            supportsAllDrives=True,
+        ).execute()
+        return None
+    except Exception as exc:
+        return _describe_api_error(exc)
+
+
+def transfer_recording(
+    drive_file_id: str,
+    owner_email: str,
+    folder_path: str,
+    filename: str | None = None,
+    mode: str | None = None,
+    share_with: list[str] | None = None,
+) -> dict:
+    """
+    Files a Meet recording that Meet left in `owner_email`'s Drive into the school's Drive.
+
+    Returns {"ok", "mode", "file_id", "web_view_link", "folder_id", "name", "size_bytes",
+             "shared_with", "warning", "error"}.
+
+    Three modes, from settings.RECORDING_TRANSFER_MODE:
+      MOVE  - re-parent the video into the Shared Drive. The organisation owns it from then
+              on, so it survives the teacher leaving, and no storage is duplicated.
+      COPY  - leave the teacher's original alone and put an org-owned copy in the Drive.
+      LINK  - store nothing; just record where the video already is.
+
+    MOVE degrades to COPY and COPY to LINK rather than failing outright: a recording that is
+    merely in the wrong place is a filing problem, while a recording nobody has a link to is
+    a lost lesson. Whatever was given up is returned in `warning`.
+    """
+    outcome = {
+        "ok": False,
+        "mode": None,
+        "file_id": drive_file_id,
+        "web_view_link": None,
+        "folder_id": None,
+        "name": None,
+        "size_bytes": None,
+        "shared_with": [],
+        "warning": None,
+        "error": None,
+    }
+
+    requested = (mode or settings.recording_transfer_mode).upper()
+
+    try:
+        as_owner = _build_drive_service(as_user=owner_email)
+    except GoogleDriveError as exc:
+        return {**outcome, "error": f"Could not act as the meeting organiser. {exc}"}
+
+    try:
+        meta = as_owner.files().get(
+            fileId=drive_file_id,
+            fields="id, name, mimeType, size, parents, webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as exc:
+        return {
+            **outcome,
+            "error": (
+                f"Could not read recording '{drive_file_id}' as {owner_email}. "
+                f"{_describe_api_error(exc)}"
+            ),
+        }
+
+    original_link = meta.get("webViewLink") or f"https://drive.google.com/file/d/{drive_file_id}/view"
+    outcome.update({
+        "name": meta.get("name"),
+        "size_bytes": int(meta["size"]) if str(meta.get("size", "")).isdigit() else None,
+        "web_view_link": original_link,
+    })
+
+    def finish_as_link(reason: str | None) -> dict:
+        """Fall back to recording where the video already is."""
+        shared = grant_readers(drive_file_id, share_with or [], as_user=owner_email)
+        return {
+            **outcome,
+            "ok": True,
+            "mode": "LINK",
+            "shared_with": shared["granted"],
+            "warning": reason,
+        }
+
+    if requested == "LINK":
+        return finish_as_link(None)
+
+    problems = configuration_problems()
+    if problems:
+        return finish_as_link(
+            "The recording was left in the organiser's Drive because the school Drive is "
+            "not configured. " + " ".join(problems)
+        )
+
+    # The folder tree is resolved by the LMS identity, which owns the structure and whose
+    # folder IDs are the ones cached in Firestore. Resolving it as each teacher in turn would
+    # create a private tree per teacher the first time any of them recorded a class.
+    try:
+        as_lms = _build_drive_service()
+        parent_id = _resolve_target_folder(as_lms, folder_path)
+    except GoogleDriveError as exc:
+        return finish_as_link(f"Could not prepare the destination folder. {exc}")
+    except Exception as exc:
+        return finish_as_link(
+            f"Could not prepare the destination folder. {_describe_api_error(exc)}"
+        )
+
+    outcome["folder_id"] = parent_id
+    target_name = filename or meta.get("name") or "Class recording.mp4"
+
+    # Only meaningful when the organiser is a different identity from the LMS one; granting
+    # a user access to a folder they already manage is a no-op Drive accepts anyway.
+    grant_failure = _grant_folder_writer(as_lms, parent_id, owner_email)
+
+    move_error = None
+    if requested == "MOVE":
+        try:
+            updated = as_owner.files().update(
+                fileId=drive_file_id,
+                addParents=parent_id,
+                removeParents=",".join(meta.get("parents") or []),
+                body={"name": target_name},
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            ).execute()
+        except Exception as exc:
+            move_error = _describe_api_error(exc)
+            logger.warning(
+                "Could not move recording '%s' into the school Drive; trying a copy. %s",
+                drive_file_id, move_error,
+            )
+        else:
+            file_id = updated["id"]
+            shared = grant_readers(file_id, share_with or [], as_user=None)
+            return {
+                **outcome,
+                "ok": True,
+                "mode": "MOVE",
+                "file_id": file_id,
+                "name": updated.get("name") or target_name,
+                "web_view_link": updated.get("webViewLink")
+                                 or f"https://drive.google.com/file/d/{file_id}/view",
+                "shared_with": shared["granted"],
+                "warning": _sharing_warning(shared),
+            }
+
+    try:
+        copied = as_owner.files().copy(
+            fileId=drive_file_id,
+            body={"name": target_name, "parents": [parent_id]},
+            fields="id, name, webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as exc:
+        reasons = [r for r in (move_error, _describe_api_error(exc)) if r]
+        if grant_failure:
+            reasons.append(
+                f"The organiser could not be given write access to the destination folder: "
+                f"{grant_failure}"
+            )
+        return finish_as_link(
+            "The recording stayed in the organiser's Drive. " + " | ".join(reasons)
+        )
+
+    file_id = copied["id"]
+    shared = grant_readers(file_id, share_with or [], as_user=None)
+    warning = _sharing_warning(shared)
+    if move_error:
+        warning = " | ".join(filter(None, [
+            f"A copy was filed instead of moving the original: {move_error}", warning,
+        ]))
+
+    return {
+        **outcome,
+        "ok": True,
+        "mode": "COPY",
+        "file_id": file_id,
+        "name": copied.get("name") or target_name,
+        "web_view_link": copied.get("webViewLink")
+                         or f"https://drive.google.com/file/d/{file_id}/view",
+        "shared_with": shared["granted"],
+        "warning": warning,
+    }
+
+
+def _sharing_warning(shared: dict) -> str | None:
+    """One line naming who could not be given access, or None when everyone could."""
+    failed = shared.get("failed") or {}
+    if not failed:
+        return None
+    listed = ", ".join(list(failed)[:5])
+    suffix = f" and {len(failed) - 5} more" if len(failed) > 5 else ""
+    return f"Could not share the recording with {listed}{suffix}."
 
 
 def extract_file_id(file_url: str) -> str | None:

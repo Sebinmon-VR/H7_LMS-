@@ -4,7 +4,7 @@ from typing import Callable, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status, Query
 
 from app.api.v1.dependencies import require_admin
-from app.core import google_drive, google_meet
+from app.core import google_drive, google_meet, meet_recordings
 from app.core.concurrency import run_parallel
 from app.core.config import settings
 from app.core.enums import (
@@ -25,6 +25,8 @@ from app.core.firebase import (
     firestore_student_enrollments,
     firestore_attendance, firestore_topics, firestore_meetings,
     firestore_materials, firestore_grades, firestore_timetable, firestore_reminder_log,
+    firestore_recording_log, firestore_exams, firestore_exam_submissions,
+    firestore_report_cards,
     hydrate_teacher_mapping, hydrate_class_teacher_mapping, hydrate_student_enrollment,
     hydrate_live_meeting, hydrate_study_material, hydrate_timetable_entry,
     require_document, delete_with_dependencies, prefetch_references, prefetch_academic
@@ -32,6 +34,9 @@ from app.core.firebase import (
 from app.services import timetable as timetable_service
 from app.services.content import (
     active_students_in_class, resolve_teacher, schedule_meeting, store_material
+)
+from app.services.recordings import (
+    get_scheduler as get_recording_scheduler, harvest_meeting, sweep as run_recording_sweep,
 )
 from app.services.reminders import get_scheduler, sweep as run_reminder_sweep
 from app.schemas.meeting import AdminLiveMeetingCreate, LiveMeetingUpdate, LiveMeetingOut
@@ -265,6 +270,9 @@ def _user_dependencies(user_id: int) -> list[tuple[str, object, str]]:
         ("study material(s)", firestore_materials, "teacher_id"),
         ("exam grade(s) as student", firestore_grades, "student_id"),
         ("exam grade(s) as teacher", firestore_grades, "teacher_id"),
+        ("exam(s) set", firestore_exams, "teacher_id"),
+        ("exam submission(s)", firestore_exam_submissions, "student_id"),
+        ("report card(s)", firestore_report_cards, "student_id"),
     ]
 
 
@@ -586,6 +594,9 @@ def delete_class_room(
             ("meeting(s)", firestore_meetings, "class_id"),
             ("study material(s)", firestore_materials, "class_id"),
             ("exam grade(s)", firestore_grades, "class_id"),
+            ("exam(s)", firestore_exams, "class_id"),
+            ("exam submission(s)", firestore_exam_submissions, "class_id"),
+            ("report card(s)", firestore_report_cards, "class_id"),
         ],
         force=force,
     )
@@ -669,6 +680,8 @@ def delete_subject(
             ("meeting(s)", firestore_meetings, "subject_id"),
             ("study material(s)", firestore_materials, "subject_id"),
             ("exam grade(s)", firestore_grades, "subject_id"),
+            ("exam(s)", firestore_exams, "subject_id"),
+            ("exam submission(s)", firestore_exam_submissions, "subject_id"),
         ],
         force=force,
     )
@@ -1194,6 +1207,91 @@ def list_reminder_log(
     return records[:limit]
 
 
+@router.get("/recordings/status")
+def get_recording_status(_: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Whether class recordings are being collected, and what the last sweep did.
+
+    Open this first when a finished class has no video: `meet_problems` names any missing
+    piece of the Meet setup, and `last_result.details` shows what the sweep decided about
+    each session it looked at.
+    """
+    return get_recording_scheduler().status()
+
+
+@router.get("/recordings/pending")
+def preview_recordings(_: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] What the next sweep would file, without moving or sharing anything.
+
+    Safe to call repeatedly: no claim is taken and no Drive file is touched, so this answers
+    "is recording actually working?" without committing to the answer.
+    """
+    return run_recording_sweep(dry_run=True)
+
+
+@router.post("/recordings/run", status_code=status.HTTP_202_ACCEPTED)
+def run_recordings_now(current_user: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Collect finished recordings now instead of waiting for the next tick.
+
+    Returns a job id to poll at `GET /admin/jobs/{job_id}`. Recordings already filed are
+    skipped by their Firestore claim, so running this by hand cannot duplicate a video.
+    """
+    job = job_registry.submit(
+        name="recording_sweep",
+        func=lambda progress: run_recording_sweep(progress=progress),
+        requested_by=current_user.id,
+    )
+    return {**job.to_dict(), "poll_url": f"/api/v1/admin/jobs/{job.id}"}
+
+
+@router.post("/meetings/{meeting_id}/recording/sync", response_model=LiveMeetingOut)
+def admin_sync_meeting_recording(
+    meeting_id: int,
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Fetch and file one session's recording immediately.
+
+    For the session someone is asking about right now, rather than waiting up to
+    RECORDING_SCAN_INTERVAL_SECONDS for the sweep to reach it. The outcome is written to the
+    meeting exactly as the sweep would write it, and a session Meet has not finished
+    processing simply comes back as WAITING.
+    """
+    meeting = require_document(firestore_meetings, meeting_id, "Meeting")
+
+    if not (meeting.get("meet_space_name") or meeting.get("meet_meeting_code")):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This meeting has no Google Meet conference behind it, so there is no "
+                "recording to collect. Only sessions with a generated Meet link are recorded."
+            ),
+        )
+
+    harvest_meeting(meeting)
+    return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
+
+
+@router.get("/recordings/log")
+def list_recording_log(
+    limit: int = Query(50, ge=1, le=500),
+    meeting_id: Optional[int] = Query(None),
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Recently filed class recordings, newest first.
+    Answers "where did that video go?" - and, for a failure, why it did not go there.
+    """
+    records = (
+        firestore_recording_log.query_documents("meeting_id", "==", meeting_id)
+        if meeting_id is not None else firestore_recording_log.list_all()
+    )
+    records.sort(key=lambda r: r.get("claimed_at") or "", reverse=True)
+    return records[:limit]
+
+
 def _owner_email(record: dict) -> str:
     """
     Email of the teacher a record belongs to.
@@ -1330,6 +1428,7 @@ def admin_regenerate_meeting_link(
         scheduled_time=datetime.fromisoformat(scheduled_time),
         duration_minutes=meeting.get("duration_minutes") or 60,
         attendee_emails=attendee_emails,
+        auto_record=meeting.get("auto_record", True),
     )
 
     if not created["ok"]:
@@ -1347,6 +1446,15 @@ def admin_regenerate_meeting_link(
         "google_calendar_id": created["calendar_id"],
         "meet_status": "CREATED",
         "meet_error": created["error"],
+        # The regenerated link is a different conference, so its space - and therefore where
+        # its recording will be found - replaces whatever the failed attempt left behind.
+        "meet_space_name": created["space_name"],
+        "meet_meeting_code": created["meeting_code"],
+        "recording_status": (
+            "ARMED" if created["recording_armed"]
+            else ("NOT_REQUESTED" if not meeting.get("auto_record", True) else "ARM_FAILED")
+        ),
+        "recording_error": created["recording_error"],
     })
     return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
 
@@ -1486,12 +1594,19 @@ def get_integration_status(
     storage = storage_service.check_access() if probe else storage_service.describe()
     drive = google_drive.check_access() if probe else google_drive.describe_configuration()
     meet = google_meet.check_access() if probe else google_meet.describe_configuration()
+    recording = (
+        meet_recordings.check_access() if probe
+        else meet_recordings.describe_configuration()
+    )
 
     return {
         "storage": storage,
         "storage_config_conflict": settings.storage_config_conflict,
         "drive": drive,
         "google_meet": meet,
+        # Recording rides on its own delegation grant and its own API, so it is reported
+        # separately: Meet links can work perfectly while recording is unauthorized.
+        "meet_recording": recording,
         "email": {
             "enabled": settings.ENABLE_EMAIL_NOTIFICATIONS,
             "configured": mail_is_configured(),
@@ -1649,12 +1764,18 @@ def build_monitoring_report(progress: Callable[[int, str], None] | None = None) 
         att_percentage = (present / len(records) * 100.0) if records else 0.0
 
         student_grades = grades_by_student.get(s["id"], [])
+        # Rows mirrored from a letter-graded exam carry a grade and no marks. They are real
+        # results but there is no number in them to average, so they are counted as exams
+        # taken and left out of the percentage rather than treated as a zero.
+        scored = [
+            g for g in student_grades
+            if g.get("marks_obtained") is not None and g.get("max_marks")
+        ]
         avg_grade = 0.0
-        if student_grades:
+        if scored:
             avg_grade = sum(
-                (g.get("marks_obtained", 0.0) / (g.get("max_marks") or 1.0)) * 100.0
-                for g in student_grades
-            ) / len(student_grades)
+                (g["marks_obtained"] / g["max_marks"]) * 100.0 for g in scored
+            ) / len(scored)
 
         student_reports.append(StudentPerformanceReport(
             student_id=s["id"],

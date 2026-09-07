@@ -279,6 +279,18 @@ def _resolve_impersonation_email(teacher_email: str | None) -> str | None:
     )
 
 
+def resolve_impersonation_email(teacher_email: str | None) -> str | None:
+    """
+    Public form of `_resolve_impersonation_email`, for the recording modules.
+
+    Which identity a meeting is owned by decides where its recording lands, so the recording
+    code has to resolve it exactly the same way this module does rather than assuming the
+    teacher. A session that fell back to GOOGLE_IMPERSONATION_FALLBACK is recorded into that
+    account's Drive, and looking in the teacher's would find nothing.
+    """
+    return _resolve_impersonation_email(teacher_email)
+
+
 def _event_time(moment: datetime) -> dict:
     """
     Formats a datetime for the Calendar API.
@@ -398,16 +410,23 @@ def create_meeting(
     duration_minutes: int = 60,
     description: str | None = None,
     attendee_emails: list[str] | None = None,
+    auto_record: bool = True,
 ) -> dict:
     """
     Creates a Calendar event with an attached Google Meet conference.
 
     Always returns a dict:
-      {"ok": bool, "meeting_link", "event_id", "calendar_id", "html_link", "error"}
+      {"ok": bool, "meeting_link", "event_id", "calendar_id", "html_link", "error",
+       "space_name", "meeting_code", "recording_armed", "recording_error"}
 
     `ok` is False - with `error` explaining why - when Meet generation is disabled or the
     Calendar call fails. Callers persist the meeting either way, but can now show the reason
     instead of leaving the user staring at an empty link field.
+
+    When `auto_record` is set, the meeting space behind the new link is then configured to
+    record itself (see app/core/meet_recordings.py). That is a separate API on a separate
+    delegation grant, so it is reported separately too: a school without recording still gets
+    its meeting, and `recording_error` says what would have to be authorized to change that.
     """
     failure = {
         "ok": False,
@@ -416,6 +435,10 @@ def create_meeting(
         "calendar_id": None,
         "html_link": None,
         "error": None,
+        "space_name": None,
+        "meeting_code": None,
+        "recording_armed": False,
+        "recording_error": None,
     }
 
     problems = configuration_problems()
@@ -499,6 +522,18 @@ def create_meeting(
         )
         logger.warning(warning)
 
+    recording = {"ok": False, "space_name": None, "meeting_code": None, "error": None}
+    if meeting_link and auto_record and settings.ENABLE_MEET_AUTO_RECORDING:
+        # Imported here rather than at module scope: meet_recordings imports this module for
+        # the impersonation rules, and a top-level import either way would be circular.
+        from app.core import meet_recordings
+
+        recording = meet_recordings.enable_auto_recording(
+            teacher_email=teacher_email, meeting_link=meeting_link
+        )
+        if not recording["ok"]:
+            logger.warning("Auto-recording was not armed: %s", recording["error"])
+
     return {
         "ok": bool(meeting_link),
         "meeting_link": meeting_link,
@@ -506,7 +541,27 @@ def create_meeting(
         "calendar_id": settings.GOOGLE_CALENDAR_ID,
         "html_link": event.get("htmlLink"),
         "error": warning,
+        # Persisted by the caller: the space name is what finds this conference's recordings
+        # once the class is over, and it cannot be derived from the event afterwards.
+        "space_name": recording["space_name"],
+        "meeting_code": recording["meeting_code"]
+                        or _meeting_code_of(meeting_link),
+        "recording_armed": recording["ok"],
+        "recording_error": recording["error"],
     }
+
+
+def _meeting_code_of(meeting_link: str | None) -> str | None:
+    """
+    Meeting code from a Meet URL, even when arming the recording never ran.
+
+    Stored regardless of whether recording could be armed, because it is the only handle on
+    the conference that survives: a school that authorizes the Meet scopes next week can then
+    collect the recordings of meetings scheduled today.
+    """
+    from app.core.meet_recordings import meeting_code_from_link
+
+    return meeting_code_from_link(meeting_link)
 
 
 def update_meeting(

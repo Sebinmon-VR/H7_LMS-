@@ -84,3 +84,98 @@ _ISO_WEEKDAYS = {
 }
 
 _BY_ISO_WEEKDAY = {iso: day for day, iso in _ISO_WEEKDAYS.items()}
+
+
+class ExamMode(str, enum.Enum):
+    """
+    How an exam is answered.
+
+    ONLINE  - the student answers the form in the LMS; answers are stored per question.
+    OFFLINE - the student writes on paper and uploads a scan or PDF of the answer sheet.
+
+    The mode is fixed at creation because it decides what a submission even is, and every
+    later check - what may be saved, what must be uploaded, how it is valued - branches on
+    it. Changing it after students have started would orphan whatever they already filed.
+    """
+    ONLINE = "ONLINE"
+    OFFLINE = "OFFLINE"
+
+
+class ExamStatus(str, enum.Enum):
+    """
+    The lifecycle a teacher controls by hand.
+
+    Deliberately separate from `ExamWindowState`, which is derived from the clock. A teacher
+    decides whether an exam is visible at all; the clock decides whether it is answerable
+    right now. Conflating the two makes "why can my class not see tomorrow's exam?" and "why
+    can they still submit?" the same field, and neither question gets a clear answer.
+    """
+    DRAFT = "DRAFT"          # Being written. Invisible to students.
+    PUBLISHED = "PUBLISHED"  # Released to the class; the time rules now apply.
+    CANCELLED = "CANCELLED"  # Called off. Visible as cancelled, accepts nothing.
+
+
+class ExamWindowState(str, enum.Enum):
+    """
+    Where the clock currently sits relative to an exam's time rules. Never stored - always
+    computed, because it changes without anybody writing to the database.
+    """
+    NOT_OPEN = "NOT_OPEN"  # Before `starts_at`.
+    OPEN = "OPEN"          # Inside the window; submissions are on time.
+    GRACE = "GRACE"        # Past `ends_at` but inside the upload concession; accepted, flagged late.
+    CLOSED = "CLOSED"      # Past everything; nothing more is accepted.
+
+
+class QuestionType(str, enum.Enum):
+    """A question on the exam form."""
+    MCQ = "MCQ"                    # One correct option.
+    MULTI_SELECT = "MULTI_SELECT"  # Several correct options; all of them required for the mark.
+    TRUE_FALSE = "TRUE_FALSE"
+    SHORT_ANSWER = "SHORT_ANSWER"  # A word or a line; auto-marked on a normalized match.
+    LONG_ANSWER = "LONG_ANSWER"    # An essay. Always valued by a human.
+    NUMERIC = "NUMERIC"            # A number, compared within an optional tolerance.
+    FILE_UPLOAD = "FILE_UPLOAD"    # The answer is an attached file (a diagram, a worked sheet).
+
+
+# The types an answer key can settle without a human reading the script. LONG_ANSWER and
+# FILE_UPLOAD are absent because no key can mark them, and pretending otherwise would put a
+# zero on every essay the moment a key was saved.
+OBJECTIVE_QUESTION_TYPES = frozenset({
+    QuestionType.MCQ,
+    QuestionType.MULTI_SELECT,
+    QuestionType.TRUE_FALSE,
+    QuestionType.SHORT_ANSWER,
+    QuestionType.NUMERIC,
+})
+OBJECTIVE_QUESTION_VALUES = frozenset(t.value for t in OBJECTIVE_QUESTION_TYPES)
+
+# Types whose answer is a list of option keys rather than free text.
+CHOICE_QUESTION_VALUES = frozenset({
+    QuestionType.MCQ.value,
+    QuestionType.MULTI_SELECT.value,
+    QuestionType.TRUE_FALSE.value,
+})
+
+
+class GradingScheme(str, enum.Enum):
+    """
+    What a valued script is worth, chosen when the exam is created.
+
+    MARKS - the evaluator awards numbers, and a grade letter is derived from the bands if any
+            were defined.
+    GRADE - the evaluator awards a letter directly from the exam's bands, with no arithmetic.
+            Used where the school reports grades only, so marks would be invented data.
+
+    Fixed at creation because half a class valued in marks and half in letters cannot be
+    combined into one result sheet, and a report card cannot total a column of letters.
+    """
+    MARKS = "MARKS"
+    GRADE = "GRADE"
+
+
+class SubmissionStatus(str, enum.Enum):
+    """Where one student's script has got to."""
+    IN_PROGRESS = "IN_PROGRESS"  # Started, answers saved, not handed in.
+    SUBMITTED = "SUBMITTED"      # Handed in, awaiting valuation.
+    EVALUATED = "EVALUATED"      # Valued; a mark or grade is recorded.
+    MISSED = "MISSED"            # The window closed with nothing handed in.

@@ -29,6 +29,12 @@ MEET_SKIPPED = "SKIPPED"   # Generation was not requested.
 MEET_CREATED = "CREATED"   # A Meet link was generated successfully.
 MEET_FAILED = "FAILED"     # Generation was attempted and did not produce a link.
 
+# Where a session starts in the recording lifecycle. The rest of it - WAITING, STORED,
+# UNAVAILABLE, FAILED - is driven by the sweep in app/services/recordings.py.
+RECORDING_NOT_REQUESTED = "NOT_REQUESTED"
+RECORDING_ARMED = "ARMED"
+RECORDING_ARM_FAILED = "ARM_FAILED"
+
 
 def active_students_in_class(class_id: int) -> list[dict]:
     """
@@ -98,6 +104,12 @@ def schedule_meeting(
     google_event_id = None
     google_calendar_id = None
     meet_error = None
+    space_name = None
+    meeting_code = None
+    # A hand-entered link belongs to a conference the LMS does not own, so there is nothing
+    # to arm and nothing to collect afterwards.
+    recording_status = RECORDING_NOT_REQUESTED
+    recording_error = None
 
     if meeting_link:
         meet_status = MEET_MANUAL
@@ -118,12 +130,25 @@ def schedule_meeting(
             scheduled_time=meeting_in.scheduled_time,
             duration_minutes=meeting_in.duration_minutes,
             attendee_emails=attendee_emails,
+            auto_record=meeting_in.auto_record,
         )
         meeting_link = created["meeting_link"]
         google_event_id = created["event_id"]
         google_calendar_id = created["calendar_id"]
         meet_error = created["error"]
         meet_status = MEET_CREATED if created["ok"] else MEET_FAILED
+
+        space_name = created["space_name"]
+        meeting_code = created["meeting_code"]
+        recording_error = created["recording_error"]
+        if not meeting_in.auto_record:
+            recording_status = RECORDING_NOT_REQUESTED
+        elif created["recording_armed"]:
+            recording_status = RECORDING_ARMED
+        else:
+            # Still swept afterwards: a teacher who records the session by hand should have
+            # that video filed too, and the school may authorize the Meet scopes later.
+            recording_status = RECORDING_ARM_FAILED
 
     meeting_id = firestore_meetings.get_next_numeric_id()
     meeting_data = {
@@ -140,6 +165,14 @@ def schedule_meeting(
         "google_calendar_id": google_calendar_id,
         "meet_status": meet_status,
         "meet_error": meet_error,
+        # Recording. `meet_space_name` is the handle the Meet API needs to find this
+        # conference's video once the class is over; it cannot be recovered from the Calendar
+        # event later, so it is persisted even when arming failed.
+        "auto_record": meeting_in.auto_record,
+        "meet_space_name": space_name,
+        "meet_meeting_code": meeting_code,
+        "recording_status": recording_status,
+        "recording_error": recording_error,
         "created_at": datetime.utcnow().isoformat(),
     }
     firestore_meetings.add_document(str(meeting_id), meeting_data)

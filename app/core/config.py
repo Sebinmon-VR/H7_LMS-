@@ -111,6 +111,36 @@ class Settings(BaseSettings):
     # external guests, so this can be turned off without losing the Meet link itself.
     GOOGLE_MEET_INVITE_ATTENDEES: bool = True
 
+    # Automatic class recording (Google Meet REST API v2).
+    #
+    # Every generated Meet conference is configured to record itself, so a teacher never has
+    # to remember to press record. Requires the Meet API enabled on the GCP project, the
+    # meetings.space.settings and meetings.space.readonly scopes authorized for the service
+    # account under domain-wide delegation, and a Workspace edition that can record at all
+    # (Business Standard/Plus, Enterprise, Education Plus, Teaching & Learning Upgrade).
+    ENABLE_MEET_AUTO_RECORDING: bool = True
+    # Comma-separated override for the Meet OAuth scopes, in the same spirit as
+    # GOOGLE_CALENDAR_SCOPES: leave blank to let the client settle on whichever set the
+    # delegation grant actually authorizes.
+    MEET_RECORDING_SCOPES: str = ""
+    # Meet writes the video into the meeting organiser's own Drive. What the LMS then does
+    # with it: MOVE it into the Shared Drive (organisation-owned, no duplicate storage),
+    # COPY it there (the teacher keeps the original), or LINK to it where it lies.
+    RECORDING_TRANSFER_MODE: str = "MOVE"
+    # Folder under the Drive root that holds the per-class recording folders.
+    RECORDING_DRIVE_FOLDER_NAME: str = "Class Recordings"
+    # Grant each enrolled student read access to their class's recording.
+    RECORDING_SHARE_WITH_STUDENTS: bool = True
+    # How long after a session's scheduled end to start looking for its recording. Meet needs
+    # a few minutes to finish writing the file, and asking sooner just burns quota.
+    RECORDING_HARVEST_DELAY_MINUTES: int = 5
+    # How often the background sweep looks for finished sessions whose recording has landed.
+    RECORDING_SCAN_INTERVAL_SECONDS: float = 300.0
+    # A session with no recording this long after it ended is marked UNAVAILABLE and stops
+    # being polled - a class nobody attended produces no recording, and retrying it forever
+    # would cost a Meet API call per sweep for the life of the deployment.
+    RECORDING_MAX_AGE_HOURS: int = 48
+
     # Storage backend selection
     STORAGE_PROVIDER: str = "GCS"            # GCS | DRIVE | LOCAL
     GOOGLE_DRIVE_SHARED_DRIVE_ID: str = ""
@@ -169,6 +199,18 @@ class Settings(BaseSettings):
             if value >= 0:
                 offsets.add(value)
         return sorted(offsets, reverse=True) or [15]
+
+    @property
+    def recording_transfer_mode(self) -> str:
+        """
+        What to do with a finished recording: MOVE, COPY or LINK.
+
+        An unrecognised value falls back to MOVE rather than raising. A typo here would
+        otherwise take down the whole recording sweep, and the safe reading of "the school
+        wants recordings in its Drive" is to put them there.
+        """
+        mode = (self.RECORDING_TRANSFER_MODE or "").strip().upper()
+        return mode if mode in {"MOVE", "COPY", "LINK"} else "MOVE"
 
     # Credential provisioning.
     # Admins create users by name; the login email is derived as firstname.lastname@domain
