@@ -35,6 +35,12 @@ from app.core.mailer import is_configured as mail_is_configured, send_class_remi
 from app.services.timetable import (
     entry_active_on, now_local, parse_time, school_timezone,
 )
+# Reminder timing is administrator-editable at runtime, not only at deploy time: the lead
+# time is a decision the school makes and changes, and an engineer plus a restart is the
+# wrong price for it. `lms_settings()` resolves the stored value, falling back to the
+# environment variable and then to the built-in default, so a deployment that has never
+# touched the admin screen behaves exactly as it did before.
+from app.services.tuition.settings_store import lms_settings
 
 logger = logging.getLogger("reminders")
 
@@ -140,7 +146,7 @@ def _recipients(entry: dict, context: _SweepContext) -> list[dict]:
         if student.get("email") and _wants_reminders(student)
     ]
 
-    if settings.REMIND_TEACHERS and entry.get("teacher_id") is not None:
+    if lms_settings()["remind_teachers"] and entry.get("teacher_id") is not None:
         teacher = context.user(entry.get("teacher_id"))
         if (
             teacher.get("email")
@@ -166,7 +172,7 @@ def due_periods(reference: datetime | None = None) -> list[dict]:
     """
     tz = school_timezone()
     reference = reference or datetime.now(tz)
-    lateness = timedelta(minutes=max(settings.REMINDER_MAX_LATENESS_MINUTES, 0))
+    lateness = timedelta(minutes=max(lms_settings()["reminder_max_lateness_minutes"], 0))
 
     entries = [e for e in firestore_timetable.list_all() if e.get("is_active", True)]
     if not entries:
@@ -196,7 +202,7 @@ def due_periods(reference: datetime | None = None) -> list[dict]:
             if ends_at <= reference:
                 continue
 
-            for offset in settings.reminder_offsets:
+            for offset in lms_settings()["reminder_minutes_before"]:
                 send_at = starts_at - timedelta(minutes=offset)
                 if send_at <= reference <= send_at + lateness:
                     due.append({
@@ -239,12 +245,12 @@ def sweep(
         "dry_run": dry_run,
         "mail_configured": mail_is_configured(),
         "reference": (reference or now_local()).isoformat(),
-        "offsets": settings.reminder_offsets,
+        "offsets": lms_settings()["reminder_minutes_before"],
         "details": [],
     }
 
-    if not settings.ENABLE_CLASS_REMINDERS:
-        summary["detail"] = "ENABLE_CLASS_REMINDERS is False; nothing was sent."
+    if not lms_settings()["reminders_enabled"]:
+        summary["detail"] = "Class reminders are switched off; nothing was sent."
         return summary
 
     if not dry_run and not summary["mail_configured"]:
@@ -388,7 +394,7 @@ class ReminderScheduler:
         logger.info(
             "Class reminder scheduler started: every %.0fs, offsets %s, timezone %s.",
             settings.REMINDER_SCAN_INTERVAL_SECONDS,
-            settings.reminder_offsets,
+            lms_settings()["reminder_minutes_before"],
             settings.resolved_school_timezone,
         )
         return True
@@ -420,13 +426,13 @@ class ReminderScheduler:
 
     def status(self) -> dict:
         return {
-            "enabled": settings.ENABLE_CLASS_REMINDERS,
+            "enabled": lms_settings()["reminders_enabled"],
             "running": self.is_running,
             "timezone": settings.resolved_school_timezone,
-            "offsets_minutes": settings.reminder_offsets,
+            "offsets_minutes": lms_settings()["reminder_minutes_before"],
             "scan_interval_seconds": settings.REMINDER_SCAN_INTERVAL_SECONDS,
-            "max_lateness_minutes": settings.REMINDER_MAX_LATENESS_MINUTES,
-            "remind_teachers": settings.REMIND_TEACHERS,
+            "max_lateness_minutes": lms_settings()["reminder_max_lateness_minutes"],
+            "remind_teachers": lms_settings()["remind_teachers"],
             "mail_configured": mail_is_configured(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "last_run_at": self.last_run_at.isoformat() if self.last_run_at else None,

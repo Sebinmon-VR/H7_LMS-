@@ -34,7 +34,8 @@ class ExamGradeOut(BaseModel):
     id: int
     student_id: int
     student: UserOut | None = None
-    class_id: int
+    # Null on a tuition record, which belongs to one student rather than a class.
+    class_id: int | None = None
     class_room: ClassRoomOut | None = None
     subject_id: int
     subject: SubjectOut | None = None

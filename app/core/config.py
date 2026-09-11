@@ -268,6 +268,93 @@ class Settings(BaseSettings):
                 )
         return None
 
+    # ---------------------------------------------------------------------------------
+    # Online tuition
+    #
+    # The tuition product is one-to-one: a slot belongs to one student and one teacher, and
+    # is billed by the class rather than by the term. These are *deployment defaults*; the
+    # values an administrator actually operates on live in the `app_settings` Firestore
+    # document and are edited from the admin API, because a school that wants a 45-minute
+    # class instead of 60 should not need a redeploy. See `app.services.tuition.settings`.
+    # ---------------------------------------------------------------------------------
+    ENABLE_TUITION_MODULE: bool = True
+    # The zone tuition slot times are written and read in, and the default every user is
+    # shown times in until their own is known. Deliberately its own setting rather than
+    # inheriting SCHOOL_TIMEZONE: the tuition programme runs on Indian time whatever zone the
+    # school itself keeps, and the two products should be able to disagree.
+    TUITION_TIMEZONE: str = "Asia/Kolkata"
+    # Default length of one one-to-one class, in minutes.
+    TUITION_DEFAULT_SESSION_MINUTES: int = 60
+    # Minutes before a class that participants are reminded, comma-separated like the LMS
+    # equivalent. Kept separate because a one-to-one class wants a short, sharp nudge where
+    # a school timetable wants a morning summary.
+    TUITION_REMINDER_MINUTES_BEFORE: str = "10"
+    ENABLE_TUITION_REMINDERS: bool = True
+    # How long after a teacher's late arrival the class may still be extended. Without a cap,
+    # a teacher joining two hours late would owe the student a class ending after midnight,
+    # colliding with everything scheduled behind it.
+    TUITION_MAX_TEACHER_LATE_EXTENSION_MINUTES: int = 30
+    # Whether a class opens on schedule by itself, or waits for the teacher to start it.
+    #
+    # False (default) - the teacher presses start, and that moment is when the class begins.
+    #                   A student cannot be late for a class nobody has started.
+    # True            - the class opens at its scheduled time whether or not the teacher has
+    #                   arrived, and lateness is measured from the timetable.
+    #
+    # Either way both join times are recorded separately, and a late *teacher* still earns the
+    # student extra time. See `app.services.tuition.sessions.class_started_at`.
+    TUITION_AUTO_START_CLASS: bool = False
+    # A teacher who has not joined this many minutes after the start is treated as a no-show,
+    # which makes the class non-billable. Distinct from the extension cap: one decides
+    # whether the class still happens, the other how long it may run.
+    TUITION_TEACHER_NO_SHOW_MINUTES: int = 15
+    # Minutes after the scheduled start beyond which a student's arrival counts as LATE.
+    TUITION_STUDENT_LATE_GRACE_MINUTES: int = 5
+    # Minimum gap between two consecutive classes for the same person, so a teacher is not
+    # scheduled to finish one class and start another in the same minute.
+    TUITION_MIN_GAP_MINUTES: int = 0
+    # How far ahead the scheduler will materialize concrete sessions from recurring slots.
+    TUITION_SESSION_HORIZON_DAYS: int = 30
+    # Whether a student may upload to the shared library without a teacher approving it.
+    TUITION_STUDENT_UPLOADS_NEED_APPROVAL: bool = True
+    # Default per-class fee used when an enrollment carries no fee plan of its own.
+    TUITION_DEFAULT_SESSION_FEE: float = 0.0
+    TUITION_CURRENCY: str = "INR"
+    # Prefixes for the identifiers issued to tuition accounts when none is supplied, as
+    # PREFIX-YEAR-0001. Every tuition student carries a unique admission number; leaving an
+    # administrator to invent one per student is how blanks and duplicates get into the data.
+    TUITION_ADMISSION_PREFIX: str = "TUI"
+    TUITION_EMPLOYEE_PREFIX: str = "TUT"
+
+    @property
+    def resolved_tuition_timezone(self) -> str:
+        """
+        IANA zone the tuition programme runs in.
+
+        Falls back through the school's zone rather than straight to UTC, so a deployment
+        that has only ever configured one timezone keeps behaving sensibly.
+        """
+        return (self.TUITION_TIMEZONE or self.resolved_school_timezone or "UTC").strip()
+
+    @property
+    def tuition_reminder_offsets(self) -> list[int]:
+        """
+        Minutes-before values for tuition class reminders, largest first.
+
+        Parsed with the same leniency as `reminder_offsets`, and for the same reason: a typo
+        in an environment variable must not stop the reminder sweep from starting.
+        """
+        raw = (self.TUITION_REMINDER_MINUTES_BEFORE or "").replace(",", " ").split()
+        offsets = set()
+        for token in raw:
+            try:
+                value = int(token)
+            except ValueError:
+                continue
+            if value >= 0:
+                offsets.add(value)
+        return sorted(offsets, reverse=True) or [10]
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

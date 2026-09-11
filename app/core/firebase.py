@@ -886,3 +886,101 @@ firestore_report_cards = FirestoreService("report_cards")
 # window state is computed from the clock, and a student's copy of a paper must have the
 # answer key stripped from it. Keeping that logic next to the rules it enforces is what stops
 # a second, key-leaking hydrator being written by hand in a router.
+
+
+# ---------------------------------------------------------------------------------------
+# Online tuition collections
+#
+# A separate set of collections rather than a `program` column on the LMS ones. The two
+# products disagree about what the unit of teaching *is*: an LMS record hangs off a class
+# that many students share, while a tuition record hangs off one (student, subject, teacher)
+# arrangement that by definition nobody else is in. Sharing the collections would mean every
+# LMS query grew a filter it does not need, and every tuition query carried a `class_id` that
+# means nothing. The infrastructure below - the service, the cache, the batched reads - is
+# shared, which is where the actual leverage is.
+# ---------------------------------------------------------------------------------------
+
+# The spine of the product: one document per (student, subject) arrangement, naming the one
+# teacher who takes it. Read on nearly every tuition request to answer "may this person see
+# this?", and changed only when an admin re-maps a subject, so it earns the reference cache.
+firestore_tuition_enrollments = FirestoreService("tuition_enrollments", cacheable=True)
+# Recurring weekly slots, one per enrollment per weekday-and-time. Cached for the same
+# reason the LMS timetable is: every conflict check and every "what have I got today" reads
+# the whole set for a person.
+firestore_tuition_slots = FirestoreService("tuition_slots", cacheable=True)
+# Concrete classes on concrete dates, materialized from the slots. Never cached: join times,
+# attendance and status change during the class itself, and a stale read here would show a
+# teacher a class as not started while they are sitting in it.
+firestore_tuition_sessions = FirestoreService("tuition_sessions")
+# Books, notes and recordings shared by admins, teachers and students.
+firestore_tuition_library = FirestoreService("tuition_library")
+# What a class costs, per enrollment or per subject.
+firestore_tuition_fee_plans = FirestoreService("tuition_fee_plans", cacheable=True)
+# Generated bills. Never cached - an issued invoice is read back immediately after a payment
+# is recorded against it.
+firestore_tuition_invoices = FirestoreService("tuition_invoices")
+# One document per reminder sent, claimed atomically, exactly as the LMS reminder log works.
+firestore_tuition_reminder_log = FirestoreService("tuition_reminder_log")
+# Runtime configuration an administrator edits without a redeploy: reminder lead times,
+# class length, the school timezone. Shared by both products, keyed by program. Small,
+# read on every reminder sweep, so it is cached.
+firestore_app_settings = FirestoreService("app_settings", cacheable=True)
+
+
+def hydrate_tuition_enrollment(enrollment: dict) -> dict:
+    """
+    Expands an enrollment's three references.
+
+    Returned in full - student, teacher and subject as whole profiles rather than ids -
+    because the brief asks for exactly that: an admin setting up a class wants the student's
+    details and the teacher's details in front of them, not two numbers.
+    """
+    return {
+        **enrollment,
+        "student": _resolve_document(firestore_users, enrollment.get("student_id")),
+        "teacher": _resolve_document(firestore_users, enrollment.get("teacher_id")),
+        "subject": _resolve_document(firestore_subjects, enrollment.get("subject_id")),
+    }
+
+
+def hydrate_tuition_slot(slot: dict) -> dict:
+    return {
+        **slot,
+        "student": _resolve_document(firestore_users, slot.get("student_id")),
+        "teacher": _resolve_document(firestore_users, slot.get("teacher_id")),
+        "subject": _resolve_document(firestore_subjects, slot.get("subject_id")),
+    }
+
+
+def hydrate_tuition_session(session: dict) -> dict:
+    return {
+        **session,
+        "student": _resolve_document(firestore_users, session.get("student_id")),
+        "teacher": _resolve_document(firestore_users, session.get("teacher_id")),
+        "subject": _resolve_document(firestore_subjects, session.get("subject_id")),
+    }
+
+
+def hydrate_tuition_library_item(item: dict) -> dict:
+    return {
+        **item,
+        "uploader": _resolve_document(firestore_users, item.get("uploaded_by")),
+        "subject": _resolve_document(firestore_subjects, item.get("subject_id")),
+    }
+
+
+def prefetch_tuition(records: list[dict]) -> None:
+    """
+    Warms the cache for a list of tuition records before they are hydrated one by one.
+
+    The same N+1 problem `prefetch_academic` solves for the LMS: a teacher's month of
+    sessions resolves the same student and subject sixty times over. One batched read per
+    collection replaces sixty individual ones.
+    """
+    prefetch_references(
+        records,
+        ("student_id", firestore_users),
+        ("teacher_id", firestore_users),
+        ("uploaded_by", firestore_users),
+        ("subject_id", firestore_subjects),
+    )

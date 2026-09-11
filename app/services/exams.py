@@ -659,7 +659,7 @@ async def store_question_paper(exam: dict, file: UploadFile) -> dict:
     """Uploads the offline question paper and attaches it to the exam."""
     try:
         stored = await storage_service.save_file_detailed(
-            file=file, folder=f"class_{exam['class_id']}/exams/{exam['id']}"
+            file=file, folder=storage_folder(exam)
         )
     except StorageError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -685,12 +685,41 @@ def enrolled_student_ids(class_id: int) -> set[int]:
     }
 
 
+def roster_for(exam: dict) -> set[int]:
+    """
+    Who is entitled to sit this exam.
+
+    The one place the exam engine has to know that two products use it. An LMS exam is set
+    for a class and its roster is the enrollment list; a tuition exam is set for one student
+    on one arrangement, and the roster is that student. Everything else in this module -
+    windows, concessions, auto-marking, valuation, publishing - is identical for both, which
+    is why this is a fork of four lines rather than a second exam engine.
+
+    A tuition exam with no `student_id` returns an empty roster and is therefore sittable by
+    nobody. That is the safe direction to fail: the alternative would be an exam addressed to
+    everyone.
+    """
+    if exam.get("program") == "TUITION":
+        student_id = exam.get("student_id")
+        return {student_id} if student_id is not None else set()
+    return enrolled_student_ids(exam["class_id"])
+
+
+def storage_folder(exam: dict) -> str:
+    """Where an exam's papers and scripts are filed, per product."""
+    if exam.get("program") == "TUITION":
+        return f"tuition/enrollment_{exam.get('enrollment_id')}/exams/{exam['id']}"
+    return f"class_{exam['class_id']}/exams/{exam['id']}"
+
+
 def assert_enrolled(exam: dict, student_id: int) -> None:
-    if student_id not in enrolled_student_ids(exam["class_id"]):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Student {student_id} is not enrolled in the class this exam is set for.",
+    if student_id not in roster_for(exam):
+        detail = (
+            f"Student {student_id} is not the student this tuition assessment is set for."
+            if exam.get("program") == "TUITION"
+            else f"Student {student_id} is not enrolled in the class this exam is set for."
         )
+        raise HTTPException(status_code=403, detail=detail)
 
 
 def assert_student_may_sit(exam: dict, student_id: int) -> None:
@@ -776,7 +805,7 @@ def ensure_submission(exam: dict, student_id: int) -> dict:
     document = {
         "exam_id": exam["id"],
         "student_id": student_id,
-        "class_id": exam["class_id"],
+        "class_id": exam.get("class_id"),
         "subject_id": exam["subject_id"],
         "status": SubmissionStatus.IN_PROGRESS.value,
         "started_at": started_at.isoformat(),
@@ -971,7 +1000,7 @@ async def store_answer_sheet(
     try:
         stored = await storage_service.save_file_detailed(
             file=file,
-            folder=f"class_{exam['class_id']}/exams/{exam['id']}/submissions/{submission['student_id']}",
+            folder=f"{storage_folder(exam)}/submissions/{submission['student_id']}",
         )
     except StorageError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -1160,7 +1189,7 @@ def _write_grade_row(exam: dict, submission: dict) -> int | None:
     row_id = submission.get("grade_record_id") or generate_id()
     firestore_grades.add_document(str(row_id), {
         "student_id": submission["student_id"],
-        "class_id": exam["class_id"],
+        "class_id": exam.get("class_id"),
         "subject_id": exam["subject_id"],
         "teacher_id": submission.get("evaluated_by") or exam["teacher_id"],
         "exam_id": exam["id"],
@@ -1221,7 +1250,7 @@ def publish_results(exam: dict) -> dict:
 def exam_stats(exam: dict) -> dict:
     """A teacher's at-a-glance view of where an exam has got to."""
     submissions = submissions_for_exam(exam["id"])
-    enrolled = enrolled_student_ids(exam["class_id"])
+    enrolled = roster_for(exam)
 
     submitted = [s for s in submissions if s.get("status") in (
         SubmissionStatus.SUBMITTED.value, SubmissionStatus.EVALUATED.value
@@ -1233,7 +1262,7 @@ def exam_stats(exam: dict) -> dict:
     return {
         "exam_id": exam["id"],
         "title": exam.get("title"),
-        "class_id": exam["class_id"],
+        "class_id": exam.get("class_id"),
         "enrolled_students": len(enrolled),
         "started": len(submissions),
         "submitted": len(submitted),
@@ -1268,6 +1297,13 @@ def hydrate_exam(exam: dict) -> dict:
 
     return {
         "id": exam["id"],
+        # Present on every exam so a client can tell which product it belongs to without
+        # inferring it from a null class. LMS exams written before tuition existed carry no
+        # `program` field at all, and read as LMS - which is what they are.
+        "program": exam.get("program") or "LMS",
+        "category": exam.get("category") or "EXAM",
+        "student_id": exam.get("student_id"),
+        "enrollment_id": exam.get("enrollment_id"),
         "class_id": exam.get("class_id"),
         "class_room": _resolve_document(firestore_classes, exam.get("class_id")),
         "subject_id": exam.get("subject_id"),
@@ -1367,6 +1403,13 @@ def hydrate_exam_for_student(
 
     return {
         "id": exam["id"],
+        # Present on every exam so a client can tell which product it belongs to without
+        # inferring it from a null class. LMS exams written before tuition existed carry no
+        # `program` field at all, and read as LMS - which is what they are.
+        "program": exam.get("program") or "LMS",
+        "category": exam.get("category") or "EXAM",
+        "student_id": exam.get("student_id"),
+        "enrollment_id": exam.get("enrollment_id"),
         "class_id": exam.get("class_id"),
         "class_room": _resolve_document(firestore_classes, exam.get("class_id")),
         "subject_id": exam.get("subject_id"),

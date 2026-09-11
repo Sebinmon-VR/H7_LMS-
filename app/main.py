@@ -17,10 +17,15 @@ from app.api.v1.exams import (
 from app.api.v1.teachers import router as teacher_router
 from app.api.v1.students import router as student_router
 from app.api.v1.storage import router as storage_router
+from app.api.v1.tuition_admin import router as tuition_admin_router
+from app.api.v1.tuition_library import router as tuition_library_router
+from app.api.v1.tuition_students import router as tuition_student_router
+from app.api.v1.tuition_teachers import router as tuition_teacher_router
 from app.core.config import settings
 from app.db.init_db import init_db
 from app.services.recordings import get_scheduler as get_recording_scheduler
 from app.services.reminders import get_scheduler
+from app.services.tuition.reminders import get_scheduler as get_tuition_scheduler
 
 logger = logging.getLogger("lms_app")
 
@@ -52,6 +57,16 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Class recording scheduler could not start: %s", exc)
 
+    # The tuition sweep does three jobs on one cadence: class reminders, extending the
+    # generated-session horizon, and closing classes nobody ended. Like the two above it is a
+    # convenience - a tuition programme whose sweep failed to start still teaches, marks and
+    # bills; it just needs the admin's "run maintenance" button.
+    tuition_scheduler = get_tuition_scheduler()
+    try:
+        tuition_scheduler.start()
+    except Exception as exc:
+        logger.warning("Tuition scheduler could not start: %s", exc)
+
     yield
 
     try:
@@ -63,6 +78,11 @@ async def lifespan(app: FastAPI):
         recording_scheduler.stop()
     except Exception as exc:
         logger.warning("Class recording scheduler did not stop cleanly: %s", exc)
+
+    try:
+        tuition_scheduler.stop()
+    except Exception as exc:
+        logger.warning("Tuition scheduler did not stop cleanly: %s", exc)
 
 
 app = FastAPI(
@@ -145,6 +165,15 @@ app.include_router(storage_router, prefix=settings.API_V1_STR)
 app.include_router(exam_router, prefix=settings.API_V1_STR)
 app.include_router(report_card_router, prefix=settings.API_V1_STR)
 app.include_router(student_exam_router, prefix=settings.API_V1_STR)
+
+# The online tuition product. A separate set of routers sharing this application's login,
+# user table and infrastructure - see `app.models.tuition` for why the domain underneath is
+# genuinely different rather than a filtered view of the LMS. Access is gated by the
+# `programs` list on a profile, checked after the role guard on every route.
+app.include_router(tuition_admin_router, prefix=settings.API_V1_STR)
+app.include_router(tuition_teacher_router, prefix=settings.API_V1_STR)
+app.include_router(tuition_student_router, prefix=settings.API_V1_STR)
+app.include_router(tuition_library_router, prefix=settings.API_V1_STR)
 
 
 @app.get("/", tags=["Health Check"])

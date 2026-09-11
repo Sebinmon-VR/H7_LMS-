@@ -1,8 +1,9 @@
 from datetime import date, datetime
+from typing import List
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.core.enums import Gender, UserRole
+from app.core.enums import Gender, Program, UserRole
 
 
 class UserProfileFields(BaseModel):
@@ -22,6 +23,13 @@ class UserProfileFields(BaseModel):
     date_of_birth: date | None = None
     gender: Gender | None = None
     photo_url: str | None = Field(None, max_length=2048, description="Profile picture URL")
+    # Display timezone. Times are stored as absolute instants and rendered per reader, so a
+    # student in London and their teacher in Dubai each see the same class at the hour on
+    # their own clock. Unset means they see the programme's zone, which is the right default
+    # for the majority who are in it.
+    timezone: str | None = Field(
+        None, max_length=64, description="IANA zone for displaying times, e.g. 'Asia/Dubai'"
+    )
 
     # Address.
     address_line1: str | None = Field(None, max_length=200)
@@ -103,6 +111,17 @@ class UserCreate(UserProfileFields):
     email: str | None = None
     password: str | None = None
     role: UserRole = UserRole.STUDENT
+    # Which products this account may reach. Access control, not profile detail, which is
+    # why it sits beside `role` rather than among the optional fields above: the two are
+    # checked together on every request, and a role without a program reaches nothing.
+    #
+    # Defaults to LMS so existing callers are unaffected. A tuition teacher or student must
+    # be created with ["TUITION"] (or both), which is the "special key" that scopes them to
+    # the tuition modules and nothing else.
+    programs: List[Program] = Field(
+        default_factory=lambda: [Program.LMS],
+        description="Products this account may use: LMS, TUITION, or both.",
+    )
 
     @field_validator("full_name", mode="before")
     @classmethod
@@ -150,6 +169,9 @@ class UserUpdate(UserProfileFields):
     is_active: bool | None = None
     role: UserRole | None = Field(
         None, description="Changing this re-issues the user's Firebase role claims"
+    )
+    programs: List[Program] | None = Field(
+        None, description="Replaces the account's product access outright when supplied."
     )
 
 
@@ -199,6 +221,16 @@ class UserOut(BaseModel):
 
     notes: str | None = None
     reminder_opt_in: bool | None = None
+    timezone: str | None = None
+    # Where this user's browser last reported being, recorded automatically from the
+    # `X-Timezone` header. Used for display only when `timezone` is unset - an explicit
+    # choice always wins - but kept updated regardless so a UI can offer to switch when
+    # somebody travels. See `app.services.tuition.common.user_timezone`.
+    detected_timezone: str | None = None
+    # Absent on profiles created before the tuition module existed, which read as LMS-only -
+    # the safe direction, since defaulting the other way would hand a whole school access to
+    # a product it never bought.
+    programs: List[str] = Field(default_factory=lambda: [Program.LMS.value])
     updated_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)

@@ -108,7 +108,11 @@ class ReportCardOut(BaseModel):
     id: str
     student_id: int
     student: UserOut | None = None
-    class_id: int
+    # "LMS" for a class card, "TUITION" for one spanning a student's one-to-one subjects.
+    # A tuition card carries no rank or class size: a one-to-one student has no cohort.
+    program: str = "LMS"
+    # Null on a tuition record, which belongs to one student rather than a class.
+    class_id: int | None = None
     class_room: ClassRoomOut | None = None
 
     title: str

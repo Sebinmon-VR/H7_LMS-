@@ -179,3 +179,160 @@ class SubmissionStatus(str, enum.Enum):
     SUBMITTED = "SUBMITTED"      # Handed in, awaiting valuation.
     EVALUATED = "EVALUATED"      # Valued; a mark or grade is recorded.
     MISSED = "MISSED"            # The window closed with nothing handed in.
+
+
+# ---------------------------------------------------------------------------------------
+# Online tuition
+#
+# The tuition system is a second product sharing one login, one user table and one set of
+# infrastructure with the school LMS. Everything below exists to keep the two apart at the
+# level that matters - what a signed-in user may reach, and which collections a record
+# belongs to - without forking the codebase.
+# ---------------------------------------------------------------------------------------
+
+
+class Program(str, enum.Enum):
+    """
+    Which product a user, or a record, belongs to.
+
+    A user carries a *list* of these (`programs` on the profile) rather than a single value,
+    because an administrator runs both and a teacher may genuinely do both jobs. A role says
+    what someone may do; a program says where they may do it, and both have to pass.
+
+    Absent on a profile means LMS: every account that existed before tuition was added was a
+    school account, and defaulting the other way would silently hand the whole school access
+    to a product they never bought.
+    """
+    LMS = "LMS"
+    TUITION = "TUITION"
+
+
+DEFAULT_PROGRAMS = (Program.LMS.value,)
+ALL_PROGRAM_VALUES = frozenset(p.value for p in Program)
+
+
+def normalize_programs(value) -> list[str]:
+    """
+    Coerces whatever is stored on a profile into a clean list of program values.
+
+    Accepts a list, a single string, or None, and drops anything unrecognized. Written
+    permissively because this is read on every authenticated request: a profile hand-edited
+    in the Firestore console should cost that user their tuition access at worst, never a
+    500 on login.
+    """
+    if value is None:
+        return list(DEFAULT_PROGRAMS)
+    if isinstance(value, str):
+        candidates = [value]
+    else:
+        try:
+            candidates = list(value)
+        except TypeError:
+            return list(DEFAULT_PROGRAMS)
+
+    resolved = []
+    for item in candidates:
+        text = str(item).strip().upper()
+        if text in ALL_PROGRAM_VALUES and text not in resolved:
+            resolved.append(text)
+    return resolved or list(DEFAULT_PROGRAMS)
+
+
+class TuitionEnrollmentStatus(str, enum.Enum):
+    """
+    The life of one (student, subject) tuition arrangement.
+
+    PAUSED rather than deleting: a student who stops for the exam season keeps their
+    history, their materials and their teacher, and the slots stop generating sessions
+    without anybody having to rebuild the arrangement afterwards.
+    """
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+
+
+class TuitionSessionStatus(str, enum.Enum):
+    """
+    Where one one-to-one class has got to.
+
+    NO_SHOW_TEACHER and NO_SHOW_STUDENT are separate from CANCELLED because the fee module
+    counts them differently: a class the teacher missed is not billable to the student, and
+    a class the student missed generally is. Collapsing them into one "did not happen"
+    status makes that distinction unrecoverable at invoicing time.
+    """
+    SCHEDULED = "SCHEDULED"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    NO_SHOW_TEACHER = "NO_SHOW_TEACHER"
+    NO_SHOW_STUDENT = "NO_SHOW_STUDENT"
+
+
+# Sessions that actually took place, for attendance percentages and billable counts.
+CONDUCTED_SESSION_VALUES = frozenset({
+    TuitionSessionStatus.COMPLETED.value,
+    TuitionSessionStatus.NO_SHOW_STUDENT.value,
+})
+
+# Sessions that are over, one way or another. Anything not in here is still to come.
+CLOSED_SESSION_VALUES = CONDUCTED_SESSION_VALUES | {
+    TuitionSessionStatus.CANCELLED.value,
+    TuitionSessionStatus.NO_SHOW_TEACHER.value,
+}
+
+
+class LibraryVisibility(str, enum.Enum):
+    """
+    Who a shared book, note or recording reaches.
+
+    ENROLLMENT is the default for anything a teacher or student files against a specific
+    arrangement - in a one-to-one product that means exactly two people plus the admin,
+    which is the privacy expectation of a private class. SUBJECT and PROGRAM widen it
+    deliberately, and are how a library is actually built.
+    """
+    PRIVATE = "PRIVATE"          # Only the uploader (and admins).
+    ENROLLMENT = "ENROLLMENT"    # The one student and their teacher for that subject.
+    SUBJECT = "SUBJECT"          # Everyone taking or teaching that subject.
+    PROGRAM = "PROGRAM"          # Every tuition user. The shared library.
+
+
+class LibraryApprovalStatus(str, enum.Enum):
+    """
+    Whether an upload may be seen by anybody but its uploader.
+
+    Students may upload - that was a requirement - but a student cannot publish to the whole
+    programme unreviewed. Teacher and admin uploads are approved on arrival; a student's are
+    PENDING until a teacher or admin says otherwise, except when they are PRIVATE, which
+    reaches nobody and so needs no review.
+    """
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+
+
+class FeeBasis(str, enum.Enum):
+    """
+    How a tuition fee is worked out.
+
+    PER_SESSION is the one the brief asks for: the admin's reports count conducted classes
+    and the invoice multiplies. MONTHLY is a flat retainer regardless of count, and HOURLY
+    bills the minutes actually taught, which differ from the scheduled minutes whenever a
+    teacher was late and the class ran on.
+    """
+    PER_SESSION = "PER_SESSION"
+    HOURLY = "HOURLY"
+    MONTHLY = "MONTHLY"
+
+
+class InvoiceStatus(str, enum.Enum):
+    """
+    An invoice's life. DRAFT is recomputed from session counts every time it is regenerated;
+    once ISSUED the numbers are frozen, because a bill that changes after it was sent is not
+    a bill.
+    """
+    DRAFT = "DRAFT"
+    ISSUED = "ISSUED"
+    PARTIALLY_PAID = "PARTIALLY_PAID"
+    PAID = "PAID"
+    CANCELLED = "CANCELLED"

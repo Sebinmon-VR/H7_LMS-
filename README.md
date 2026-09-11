@@ -21,6 +21,328 @@ The implementation avoids SQLAlchemy and relational databases entirely, relying 
 
 ## What's New
 
+### Online Tuition Module (new)
+
+A second product alongside the school LMS, sharing this deployment's login, user table, and
+infrastructure — Firestore, Firebase Auth, Google Meet, storage, mail — but with its own
+collections, services, and routers.
+
+It is a separate product rather than a filtered view of the LMS because the two disagree
+about what the unit of teaching *is*:
+
+| | School LMS | Online Tuition |
+| --- | --- | --- |
+| Unit of teaching | a class, many students | an **enrollment**: one student, one subject, **one** teacher |
+| Timetable clash | two periods want the same teacher | two classes want the same teacher **or the same student** |
+| Attendance | a roster per period | one student per session; attendance *is* the session outcome |
+| Billing | not modelled | per conducted class, derived from the counts |
+| Access | `role` | `role` **and** `programs` |
+
+**Access control.** Every profile carries a `programs` list. A teacher or student needs
+`"TUITION"` in it before any tuition endpoint will answer them — this is the "special key"
+that scopes an account to the tuition modules. A profile with no `programs` field reads as
+LMS-only, so every account that existed before this release is unaffected. Administrators
+reach both products unconditionally: one admin team runs both, and an admin locked out
+because nobody ticked a box is a support call, not a security win.
+
+Grant it at creation (`POST /api/v1/admin/users` with `"programs": ["TUITION"]`) or
+afterwards (`PUT /api/v1/admin/tuition/users/{id}/programs`).
+
+#### The scheduling rule
+
+A tuition slot is refused if it overlaps something **either** participant already has. A
+student's maths teacher and physics teacher have no way of knowing about each other, so if
+the system does not check both diaries, nothing does. The 409 names who is busy and when.
+An admin can override with `?allow_conflicts=true`; the conflicts are still returned and
+appear on `GET /api/v1/admin/tuition/conflicts`.
+
+Slots are recurring rules ("Tuesdays 17:00, 60 minutes"). Concrete classes are generated
+from them up to a configurable horizon, idempotently — the document id is derived from
+(slot, date), so the sweep, an admin's button, and the create-slot call can all race and the
+worst outcome is the same class written twice with identical content. Generation only ever
+adds: a class somebody has started, cancelled, or rescheduled is never overwritten.
+
+#### The timing rule
+
+A class has a fixed length set by the administrator. From that:
+
+```
+scheduled_start ─┬─ teacher_joined_at ──► pushes the end out (capped)
+                 └─ student_joined_at ──► records lateness, moves nothing
+scheduled_end   ──► effective_end_at: the earliest the teacher may stop
+```
+
+**If the teacher is late, the class runs on** — the end moves to a full lesson from the
+moment they actually joined, capped by `TUITION_MAX_TEACHER_LATE_EXTENSION_MINUTES` so one
+late teacher cannot push the student's next class off the evening. **If the student is late,
+nothing moves** — the teacher may finish at the scheduled time and the missed minutes are the
+student's. The asymmetry is the point.
+
+**The two lateness figures are measured against different references**, which matters as much
+as the extension does:
+
+| | measured from | because |
+| --- | --- | --- |
+| Teacher late | the **timetable** | they promised 17:00; being late is what owes the student time |
+| Student late | when the class **actually started** | you cannot be late for something that has not begun |
+
+So a student who joins at 17:05 for a class the teacher opens at 17:12 is **on time**, and
+one who joins at 17:15 is 3 minutes late — not 15. A student waiting for a class nobody has
+started is never late at all; `timing.waiting_for_teacher` is what their screen should read
+from, rather than a late warning for a class that is not running.
+
+**Who starts the class** is an admin setting, `auto_start_class` (env default
+`TUITION_AUTO_START_CLASS=False`):
+
+- **False (default)** — the teacher presses start, and that moment is when the class begins.
+- **True** — the class opens on its timetabled slot regardless, and student lateness runs
+  from the timetable.
+
+Both join times are recorded separately in either mode, and a late teacher earns the student
+extra time either way — auto-start opens a room, it does not claim the teacher was in it. The
+sweep stamps due classes `IN_PROGRESS`, but correctness never depends on it having run:
+`class_started_at` derives the same answer from the timetable, so lateness is right even if
+the sweep is minutes behind.
+
+`effective_end_at` is stored, not recomputed on read: an invoice queried three months later
+must produce the same answer the participants saw at the time. Both the teacher's and the
+student's responses carry the same server-computed `timing` block, including `may_end_now`,
+so the two sides cannot disagree about when the class ends.
+
+Ending early is *allowed* and recorded (`ended_early`, `short_by_minutes`) rather than
+refused — connections drop and students leave, and a teacher who cannot end a finished class
+simply closes the tab, leaving it IN_PROGRESS forever.
+
+#### Adding tuition students and teachers
+
+Tuition accounts are created through the tuition module, not borrowed from the LMS:
+
+| Method | Path | |
+| --- | --- | --- |
+| `POST` | `/api/v1/admin/tuition/students` | New student — login, profile, tuition access |
+| `POST` | `/api/v1/admin/tuition/teachers` | New teacher |
+
+The two user bases overlap only sometimes — a tuition student may attend the school here, or
+may never have set foot in it — so requiring an LMS profile first would force every tuition
+family to be enrolled in a school they have nothing to do with. Both endpoints create a fresh
+account with `programs: ["TUITION"]`; pass `also_lms: true` for someone who genuinely is both,
+or grant it later with `PUT /admin/tuition/users/{id}/programs`.
+
+- `email` may be omitted — derived as firstname.lastname@`USER_EMAIL_DOMAIN`.
+- `password` may be omitted — issue one later with
+  `POST /admin/users/{id}/generate-credentials`, which emails it.
+- `admission_number` (students) and `employee_id` (teachers) are **generated** when omitted,
+  as `TUI-2026-0001` / `TUT-2026-0001`. The brief asks that every student carry a unique id,
+  and leaving an administrator to invent one per student is how blanks and duplicates get in.
+- The role is forced by the route, never read from the body — an endpoint called "add a
+  student" cannot mint an administrator because the request said so.
+
+Editing and deactivating go through the existing `PUT`/`DELETE /api/v1/admin/users/{id}`;
+account creation itself is shared with the LMS in `app/services/accounts.py`, so both
+products create people identically.
+
+#### Meeting links
+
+Every class needs somewhere to happen, and a link can always be supplied by hand — the module
+does not assume Google Meet:
+
+| | |
+| --- | --- |
+| On a slot | `meeting_link` on `POST`/`PUT /admin/tuition/slots` — a standing room for every occurrence |
+| On one class | `PUT /admin/tuition/sessions/{id}/meeting-link`, or `POST /tuition/teachers/sessions/{id}/meeting-link` with a body |
+| Generated | the same teacher endpoint with **no** body creates a Google Meet on the spot |
+
+A hand-entered link is marked `meet_status: MANUAL` and is **never overwritten** by Meet
+generation afterwards, so a Zoom or Teams link a teacher pastes in stays put. Meet links are
+created lazily — on demand rather than for every generated class — because a month of
+scheduled classes would otherwise be a month of Calendar API calls for classes that may be
+rescheduled or cancelled before anyone opens them.
+
+#### Timezones — Indian by default, the student's own automatically
+
+The programme runs on **`Asia/Kolkata`** with **`INR`** (`TUITION_TIMEZONE`,
+`TUITION_CURRENCY`; both admin-editable at runtime). The school LMS keeps its own
+`SCHOOL_TIMEZONE` — the two products can disagree.
+
+**A student outside India needs no configuration.** The frontend sends the browser's own
+zone on every request:
+
+```js
+fetch(url, { headers: { "X-Timezone": Intl.DateTimeFormat().resolvedOptions().timeZone } })
+```
+
+That zone is saved to their profile and every time they are shown is converted to it. Saving
+it — rather than using it for the one request — is what makes the **reminder email** correct
+too: that is sent from a background sweep with no request to read a header from, and a student
+in London would otherwise get Indian hours by email and London hours on screen.
+
+Resolution is `timezone` (explicitly chosen) → `detected_timezone` (browser) → programme.
+An explicit choice always wins and survives travel, while `detected_timezone` keeps updating
+underneath so a UI can offer *"you seem to be in Europe/London — switch?"* rather than moving
+anything unasked. `GET /api/v1/tuition/me` returns `effective_timezone` and a
+`timezone_source` of `EXPLICIT` / `DETECTED` / `PROGRAMME` so the UI can say which applied.
+`PUT /api/v1/tuition/me/timezone` pins one; `null` unpins back to automatic.
+
+An unrecognised header is ignored, never rejected — it arrives on every request from a
+browser API, and a client sending `GMT+5:30` should fall back to programme time, not fail
+every call.
+
+Underneath: slots are wall-clock rules stored in the programme zone; sessions are absolute
+UTC instants, because two people in different countries must attend the same moment. Every
+response adds `<field>_local` plus `viewer_timezone`, leaving the UTC values untouched for
+clients that format times themselves.
+
+#### Admin-editable settings
+
+Reminder lead times, the timezone, class length, and the timing thresholds are stored in
+Firestore and edited from `GET`/`PUT /api/v1/admin/tuition/settings/{LMS|TUITION}` — **for
+both products**. The environment variables are deployment defaults that apply until an
+administrator changes something; resolution is stored value → environment → built-in, so the
+module ships working with no configuration and an existing `.env` keeps deciding behaviour
+until somebody actually edits it.
+
+#### What is reused, and what is not
+
+Reused unchanged with a program discriminator: the **exam engine** (`app/services/exams.py`)
+— question types, answer keys, timed windows, per-student concessions, auto-marking,
+valuation, published results — and the **report card** arithmetic. An LMS exam's roster comes
+from class enrollments; a tuition assessment's is the one student it is addressed to.
+`roster_for(exam)` is the only fork, and it is four lines.
+
+Not reused, because the domain differs: enrollments, scheduling, sessions and attendance,
+the library, fees.
+
+#### Reports
+
+- **Students** and **teachers** see only their own (`/reports/me`); there is no parameter for
+  anyone else's, by design.
+- **Admins** get the programme (`/reports/overview`) plus any individual's.
+- `attendance_percentage` is measured against classes **conducted**, not scheduled — a
+  student whose teacher missed two classes reads 100%, not 60%. Since these counts price the
+  invoices, that distinction is money as well as fairness.
+
+#### Fees and billing (admin only)
+
+Not exposed on the teacher or student routers at all. An invoice is **derived**, not typed
+in: conducted-class counts price the lines, and both the count and the rate are stored on
+each line so a bill can always be read back as "eight physics classes at ₹500". Fee plans
+resolve enrollment → subject → programme default. A draft is recomputed on every
+regeneration; once issued the figures are frozen.
+
+**Nothing is emailed.** Invoices are generated, issued and read in the admin module; there
+is no delivery step, by design — how a bill reaches a family is left to whoever runs the
+programme.
+
+The billing screens:
+
+| | |
+| --- | --- |
+| `GET /admin/tuition/billing` | Filtered ledger with its own totals — by student, status, period, or unpaid-only |
+| `GET /admin/tuition/billing/students/{id}` | One student's complete history, newest first, with contact details |
+| `GET /admin/tuition/invoices/{id}/detail` | One invoice down to the **individual classes** behind every line |
+
+`summary` on the ledger is computed from exactly the rows it returns, never a separate
+query, so the figures at the top cannot disagree with the rows underneath. `overdue` counts
+only *issued* invoices past their due date — a draft is never overdue, because nobody has
+been asked to pay it, and counting them would put unbilled work on an aged-debt report.
+
+`/detail` reads the sessions back from the session records rather than storing a copy on the
+invoice: the invoice keeps the *counts* it was priced from, and duplicating every session
+onto every invoice would give the truth two places to live.
+
+#### Exports
+
+CSV, on the principle **export the workings, not just the totals**. A file of amounts is a
+report you have to trust; one carrying the class count beside each amount, with a companion
+export listing those classes by date and attendance, is a report you can *check* — which is
+what turns a billing dispute into a lookup.
+
+| | |
+| --- | --- |
+| `GET /admin/tuition/billing/export?view=` | `summary` (one row per invoice, for reconciling against the bank) · `lines` (one row per subject with its class counts — the accountant's file) · `payments` (receipts) · `sessions` (every class in the period) |
+| `GET /admin/tuition/invoices/{id}/export?view=` | `lines` or `sessions` — the latter is the attachment to send a parent querying a bill |
+| `GET /admin/tuition/reports/export?view=` | `students` · `teachers` · `sessions` — the attendance counts fees are planned from |
+
+All take the same filters as the screen they mirror. Session times render in the **reader's
+own timezone** (an admin checking "was there a class on the 14th?" against a parent's
+recollection needs the hour that parent saw, not UTC), files are UTF-8 **with a BOM** so
+Excel on Windows renders Indian names correctly instead of mangling them, and line endings
+are CRLF per RFC 4180.
+
+#### The library
+
+All three roles upload. `visibility` is the uploader's intent (PRIVATE / ENROLLMENT /
+SUBJECT / PROGRAM); `approval_status` is whether that intent has been honoured. Teacher and
+admin uploads are live on arrival; a student's wait for review unless they reach nobody.
+Widening an approved student upload re-opens it, so the approval step cannot be bypassed by
+uploading narrow and editing wide. Read access is computed per viewer rather than stored per
+item, so it follows a student's current enrollments instead of going stale silently.
+
+#### Endpoints
+
+**Admin** — `/api/v1/admin/tuition/…`
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` `PUT` | `/settings/{program}` | Reminder lead times, timezone, class length, timing rules — for `LMS` or `TUITION` |
+| `POST` | `/students`, `/teachers` | **Add new tuition users.** Auto-issues admission/employee ids and derives the login email |
+| `GET` | `/users` | People in the programme; `include_all=true` to find accounts to grant access to |
+| `PUT` | `/users/{id}/programs` | Grant or revoke product access |
+| `POST` `GET` `PUT` `DELETE` | `/enrollments`, `/enrollments/{id}` | Map a teacher to a student for a subject. 409 on a second teacher for the same subject |
+| `POST` `GET` `PUT` `DELETE` | `/slots`, `/slots/{id}` | Recurring class times. 409 with named conflicts from both diaries |
+| `POST` | `/slots/check-availability` | "Can I put a class here?" — before committing to it |
+| `GET` | `/conflicts` | Every clash currently in the timetable |
+| `GET` `POST` | `/schedule/status`, `/schedule/generate` | Horizon, and materialize classes from slots |
+| `GET` `POST` | `/sessions` | Classes across the programme; book a one-off extra |
+| `POST` | `/sessions/{id}/reschedule` `/cancel` `/billable` | Move one class; call it off; override whether it is billed |
+| `PUT` | `/sessions/{id}/meeting-link` | Point at Zoom / Teams / a standing room |
+| `GET` | `/reports/overview` `/reports/students/{id}` `/reports/teachers/{id}` | Class and attendance counts |
+| `POST` `GET` `PUT` `DELETE` | `/fee-plans`, `/fee-plans/{id}` | What a class costs |
+| `POST` | `/invoices/generate` `/invoices/generate-batch` | Bill from conducted-class counts |
+| `GET` | `/invoices`, `/invoices/{id}`, `/fees/summary` | Bills, and billed-vs-collected |
+| `GET` | `/billing`, `/billing/students/{id}` | Filtered ledger with totals; one student's account |
+| `GET` | `/invoices/{id}/detail` | An invoice down to the individual classes behind each line |
+| `GET` | `/billing/export`, `/invoices/{id}/export`, `/reports/export` | CSV downloads — summary, lines, payments, sessions |
+| `POST` | `/invoices/{id}/issue` `/payments` `/cancel` | Freeze and send; record money; void |
+| `GET` `POST` | `/reminders/status` `/preview` `/run`, `/maintenance/run` | Reminder sweep and housekeeping |
+
+**Teacher** — `/api/v1/tuition/teachers/…`
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/my-students` | Students assigned to me, with their details and syllabus |
+| `GET` | `/timetable`, `/sessions`, `/sessions/upcoming` | Weekly pattern; classes in my own timezone |
+| `POST` | `/sessions/{id}/start` | Join. **If you are late, this is what buys the student their extra time** |
+| `POST` | `/sessions/{id}/end` | Close it, record the topic. Early finishes are recorded |
+| `POST` | `/sessions/{id}/attendance` | Mark the student. Overrides what the timestamps imply |
+| `POST` | `/sessions/{id}/meeting-link` | Generate a Meet, or supply another provider's link |
+| `POST` | `/sessions`, `/sessions/{id}/reschedule` `/cancel` | Extra class; move one; call one off |
+| `POST` `GET` | `/assessments`, `/assessments/{id}` | Homework, assignments, exams — the full exam engine, one student |
+| `POST` | `/report-cards`, `/report-cards/{id}/publish` | Build a card, then release it |
+| `GET` | `/reports/me`, `/reports/students/{id}` | My own record; one of my students, my subjects only |
+
+**Student** — `/api/v1/tuition/students/…`
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/my-subjects` | Subjects I take and who teaches each |
+| `GET` | `/timetable`, `/sessions`, `/sessions/upcoming` | My classes, in my own timezone |
+| `POST` | `/sessions/{id}/join` | Join and get the link. Joining late does not shorten the class |
+| `GET` | `/assessments`, `/report-cards` | Work set for me (answer keys stripped); published cards |
+| `GET` | `/reports/me` | My own attendance, by subject |
+
+**Library & preferences** — `/api/v1/tuition/…` (all three roles)
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/library/upload`, `/library/links` | Share a file or a link. Anyone may upload |
+| `GET` | `/library` | Everything shared with me, filtered and searchable |
+| `GET` `POST` | `/library/pending`, `/library/{id}/moderate` | Teacher/admin review of student uploads |
+| `GET` `PUT` `DELETE` | `/library/{id}` | One item; edit or remove my own |
+| `POST` | `/library/{id}/download` | Count an access and get the URL |
+| `GET` `PUT` | `/me`, `/me/timezone` | Who I am here; `effective_timezone` and `timezone_source`. `PUT` pins a zone, `null` unpins back to browser detection |
+
+
 ### Public registration removed (security fix)
 
 `POST /api/v1/auth/register` accepted a `role` field from an **unauthenticated** request

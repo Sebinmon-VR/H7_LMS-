@@ -1,5 +1,4 @@
 from datetime import date, datetime
-from enum import Enum
 from typing import Callable, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status, Query
 
@@ -9,11 +8,11 @@ from app.core.concurrency import run_parallel
 from app.core.config import settings
 from app.core.enums import (
     UserRole, AttendanceStatus, DayOfWeek,
-    TEACHING_ROLE_VALUES, TEACHING_OR_ADMIN_VALUES,
+    TEACHING_ROLE_VALUES, TEACHING_OR_ADMIN_VALUES, normalize_programs,
 )
 from app.core.gcp_services import storage_service
 from app.core.jobs import job_registry, report_cache
-from app.core.credentials import generate_email, generate_password
+from app.core.credentials import generate_password
 from app.core.mailer import is_configured as mail_is_configured, send_credentials_email
 from app.core.firebase_auth import (
     create_auth_user, delete_auth_user, set_role_claims, set_auth_password,
@@ -31,6 +30,7 @@ from app.core.firebase import (
     hydrate_live_meeting, hydrate_study_material, hydrate_timetable_entry,
     require_document, delete_with_dependencies, prefetch_references, prefetch_academic
 )
+from app.services import accounts as account_service
 from app.services import timetable as timetable_service
 from app.services.content import (
     active_students_in_class, resolve_teacher, schedule_meeting, store_material
@@ -46,7 +46,7 @@ from app.schemas.timetable import (
     TimetableEntryCreate, TimetableEntryOut, TimetableEntryUpdate,
 )
 from app.schemas.user import (
-    UserCreate, UserProfileFields, UserUpdate, UserOut, UserDeleted,
+    UserCreate, UserUpdate, UserOut, UserDeleted,
     GenerateCredentialsRequest, CredentialsIssued
 )
 from app.schemas.academic import (
@@ -64,59 +64,12 @@ from app.schemas.reports import (
 router = APIRouter(prefix="/admin", tags=["Admin Module"])
 
 
-def _email_is_taken(email: str) -> bool:
-    """Collision check for generated addresses, against LMS profiles."""
-    return firestore_users.get_document_by_field("email", email) is not None
-
-
-# School-issued identifiers that must not repeat. Both are optional, but a duplicate
-# admission number is the kind of error that surfaces months later as two students sharing
-# a report card, so it is rejected at write time.
-_UNIQUE_USER_FIELDS = (
-    ("admission_number", "admission number"),
-    ("employee_id", "employee ID"),
-)
-
-
-def _assert_identifiers_free(stored: dict, exclude_user_id: int | None = None) -> None:
-    """Rejects an admission number or employee ID already held by a different user."""
-    for field, label in _UNIQUE_USER_FIELDS:
-        value = stored.get(field)
-        if not value:
-            continue
-
-        clash = firestore_users.get_document_by_field(field, value)
-        if clash and int(clash["id"]) != (exclude_user_id or -1):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"The {label} '{value}' is already assigned to "
-                    f"{clash.get('full_name') or 'another user'} (id {clash['id']})."
-                ),
-            )
-
-
-def _profile_fields(payload: UserProfileFields, exclude_unset: bool = True) -> dict:
-    """
-    The profile portion of a create/update payload, as a Firestore-ready dict.
-
-    Dates become ISO strings and enums their values, because Firestore has no native date
-    type here and the rest of the codebase already stores ISO strings.
-    """
-    known = set(UserProfileFields.model_fields)
-    raw = payload.model_dump(exclude_unset=exclude_unset, exclude_none=True)
-
-    stored: dict = {}
-    for key, value in raw.items():
-        if key not in known:
-            continue
-        if isinstance(value, Enum):
-            stored[key] = value.value
-        elif isinstance(value, (date, datetime)):
-            stored[key] = value.isoformat()
-        else:
-            stored[key] = value
-    return stored
+# Account creation and the profile helpers live in `app.services.accounts`, because the
+# tuition module creates its own students and teachers and both products must do it
+# identically. Aliased here under the names the rest of this router already uses.
+_email_is_taken = account_service.email_is_taken
+_assert_identifiers_free = account_service.assert_identifiers_free
+_profile_fields = account_service.profile_fields
 
 
 @router.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -133,57 +86,7 @@ def create_user(user_in: UserCreate, _: UserOut = Depends(require_admin)):
     `{full_name, role}` payload still works. `admission_number` and `employee_id` are
     rejected if already held by another user.
     """
-    if user_in.email:
-        email = user_in.email.strip().lower()
-        if _email_is_taken(email):
-            raise HTTPException(status_code=400, detail="User with this email already exists")
-    else:
-        if not user_in.full_name.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="full_name is required to generate an email address",
-            )
-        try:
-            email = generate_email(
-                user_in.full_name,
-                settings.resolved_user_email_domain,
-                is_taken=_email_is_taken,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    profile = _profile_fields(user_in)
-    _assert_identifiers_free(profile)
-
-    firebase_uid = create_auth_user(email, user_in.password, user_in.full_name)
-
-    user_id = firestore_users.get_next_numeric_id()
-    user_data = {
-        **profile,
-        "full_name": user_in.full_name,
-        "email": email,
-        "firebase_uid": firebase_uid,
-        "role": user_in.role.value,
-        "is_active": True,
-        # Reminders are opt-out: enrolling a student means intending to tell them when
-        # class starts, so the default has to be on unless the admin says otherwise.
-        "reminder_opt_in": profile.get("reminder_opt_in", True),
-        "created_at": datetime.utcnow().isoformat()
-    }
-
-    try:
-        firestore_users.add_document(str(user_id), user_data)
-    except Exception:
-        # Roll the auth account back so a retry is not blocked by a duplicate email.
-        if firebase_uid:
-            delete_auth_user(firebase_uid)
-        raise
-
-    if firebase_uid:
-        set_role_claims(firebase_uid, user_in.role, user_id)
-
-    user_data["id"] = user_id
-    return UserOut(**user_data)
+    return UserOut(**account_service.create_account(user_in))
 
 
 @router.get("/users", response_model=List[UserOut])
@@ -226,6 +129,10 @@ def update_user(
         updated["is_active"] = user_in.is_active
     if user_in.role is not None:
         updated["role"] = user_in.role.value
+    if user_in.programs is not None:
+        # Replaces the list outright rather than merging. Product access is the kind of thing
+        # an admin needs to be able to take away, and a merge would make revoking impossible.
+        updated["programs"] = normalize_programs([p.value for p in user_in.programs])
 
     if not updated:
         raise HTTPException(status_code=400, detail="No fields provided to update")

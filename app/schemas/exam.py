@@ -277,7 +277,23 @@ class TimeConcessionGrant(BaseModel):
 class ExamOut(BaseModel):
     """The staff view. Carries the answer key; never return this to a student."""
     id: int
-    class_id: int
+
+    # --- Which product this belongs to -------------------------------------------------
+    # "LMS" for a school exam set for a class, "TUITION" for one set for a single student on
+    # a one-to-one arrangement. Absent on exams written before the tuition module existed,
+    # which read as LMS - which is what they are.
+    program: str = "LMS"
+    category: str = Field("EXAM", description="EXAM | HOMEWORK | ASSIGNMENT | TEST | PROJECT")
+    student_id: int | None = Field(
+        None, description="The single student a tuition assessment is set for. Null for a "
+                          "class exam, whose roster comes from the class."
+    )
+    enrollment_id: int | None = None
+
+    # Null on a tuition assessment, which is set for one student rather than a class. Every
+    # *output* schema in this module allows it; `ExamCreate` above does not, because the LMS
+    # route that uses it genuinely does require a class. See `app.services.exams.roster_for`.
+    class_id: int | None = None
     class_room: ClassRoomOut | None = None
     subject_id: int
     subject: SubjectOut | None = None
@@ -334,7 +350,14 @@ class StudentExamOut(BaseModel):
     later `closes_at` rather than as a rule the client has to apply itself.
     """
     id: int
-    class_id: int
+    program: str = "LMS"
+    category: str = "EXAM"
+    enrollment_id: int | None = None
+
+    # Null on a tuition assessment, which is set for one student rather than a class. Every
+    # *output* schema in this module allows it; `ExamCreate` above does not, because the LMS
+    # route that uses it genuinely does require a class. See `app.services.exams.roster_for`.
+    class_id: int | None = None
     class_room: ClassRoomOut | None = None
     subject_id: int
     subject: SubjectOut | None = None
@@ -432,7 +455,10 @@ class SubmissionOut(BaseModel):
     exam_id: int
     student_id: int
     student: UserOut | None = None
-    class_id: int
+    # Null on a tuition assessment, which is set for one student rather than a class. Every
+    # *output* schema in this module allows it; `ExamCreate` above does not, because the LMS
+    # route that uses it genuinely does require a class. See `app.services.exams.roster_for`.
+    class_id: int | None = None
     subject_id: int
 
     status: SubmissionStatus
@@ -531,8 +557,13 @@ class ExamStats(BaseModel):
     """A quick read on where an exam has got to, for the teacher's dashboard."""
     exam_id: int
     title: str
-    class_id: int
-    enrolled_students: int
+    # Null on a tuition assessment, which is set for one student rather than a class. Every
+    # *output* schema in this module allows it; `ExamCreate` above does not, because the LMS
+    # route that uses it genuinely does require a class. See `app.services.exams.roster_for`.
+    class_id: int | None = None
+    enrolled_students: int = Field(
+        ..., description="Students entitled to sit it: the class roster, or 1 for tuition."
+    )
     started: int
     submitted: int
     evaluated: int

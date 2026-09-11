@@ -1,7 +1,7 @@
 import logging
 from typing import Callable, List
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 
 from app.core.config import settings
@@ -119,3 +119,57 @@ require_student = require_roles([UserRole.STUDENT, UserRole.ADMIN])
 require_any_authenticated = require_roles(
     [UserRole.ADMIN, UserRole.CLASS_TEACHER, UserRole.TEACHER, UserRole.STUDENT]
 )
+
+
+# ---------------------------------------------------------------------------------------
+# Online tuition guards
+#
+# Two checks, not one, and the order matters. The role guard answers "may a teacher do
+# this?"; the program guard answers "is this teacher one of ours?". A school teacher with a
+# perfectly valid login and the TEACHER role has no business in the tuition timetable, and
+# only the second check stops them.
+#
+# Implemented as a wrapper around the existing role guards rather than as new roles. Adding
+# TUITION_TEACHER and TUITION_STUDENT to UserRole would have meant revisiting every
+# `role in TEACHING_ROLE_VALUES` check in the codebase, and a teacher who does both jobs
+# would have needed two accounts. A role says what you do; a program says where.
+# ---------------------------------------------------------------------------------------
+
+def require_tuition(role_guard: Callable) -> Callable:
+    """
+    Wraps a role guard so it also demands tuition programme membership, and notes where the
+    caller is.
+
+    The `X-Timezone` header is the second half of the timezone requirement. A frontend sets it
+    from `Intl.DateTimeFormat().resolvedOptions().timeZone` - the browser's own view of where
+    the machine is - and this records it on the profile, so a student sitting outside India
+    sees their classes at their own local hour without configuring anything, and so does the
+    reminder email that reaches them from a background sweep hours later.
+
+    It is recorded, never enforced: a request with no header, or with a header a browser
+    mangled, simply falls through to the user's explicit zone or the programme's. Nothing here
+    can fail a request that would otherwise have worked.
+    """
+    def guard(
+        current_user: UserOut = Depends(role_guard),
+        x_timezone: str | None = Header(
+            None, alias="X-Timezone",
+            description="The caller's IANA timezone, e.g. 'Europe/London'. Send "
+                        "Intl.DateTimeFormat().resolvedOptions().timeZone from the browser.",
+        ),
+    ) -> UserOut:
+        from app.services.tuition.common import apply_detected_timezone, assert_tuition_access
+
+        assert_tuition_access(current_user)
+        apply_detected_timezone(current_user, x_timezone)
+        return current_user
+
+    return guard
+
+
+# Admins are not program-scoped: one admin team runs both products, and an administrator
+# locked out of tuition because nobody ticked a box is a support call, not a security win.
+require_tuition_admin = require_admin
+require_tuition_teacher = require_tuition(require_teacher)
+require_tuition_student = require_tuition(require_student)
+require_tuition_user = require_tuition(require_any_authenticated)
