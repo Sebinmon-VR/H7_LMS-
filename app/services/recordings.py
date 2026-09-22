@@ -46,6 +46,7 @@ from app.core.firebase import (
     firestore_meetings, firestore_recording_log, firestore_student_enrollments,
     firestore_users,
 )
+from app.core.firebase import log_backend_failure
 
 logger = logging.getLogger("recordings")
 
@@ -511,7 +512,7 @@ class RecordingScheduler:
                 # A sweep failure must never kill the thread, or recordings stop being
                 # collected silently until someone restarts the server.
                 self.last_error = str(exc)
-                logger.exception("Recording sweep failed")
+                log_backend_failure(logger, "Recording sweep failed", exc)
             finally:
                 self.last_run_at = datetime.utcnow()
                 self.run_count += 1

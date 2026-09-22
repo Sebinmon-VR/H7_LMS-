@@ -1,0 +1,1107 @@
+<title>H7 LMS September Backend Handoff</title>
+<style>
+  /* Tokens carried over verbatim from docs/frontend-api-changes.html so the two handoff
+     documents read as one series. Light palette on bare :root; dark redefines tokens only. */
+  :root {
+    --ground: #ffffff;
+    --paper: #f5f6f8;
+    --ink: #131820;
+    --ink-soft: #59616f;
+    --rule: #dde0e6;
+    --rule-soft: #eaecf0;
+    --accent: #2a4b7c;
+    --accent-bg: #eaf0f8;
+    --new: #1a6b3c;
+    --new-bg: #e8f3ec;
+    --changed: #8a5a10;
+    --changed-bg: #f8f0e0;
+    --breaking: #9c2843;
+    --breaking-bg: #fbe9ed;
+    --code-bg: #f5f6f8;
+
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0e1116;
+      --paper: #161b22;
+      --ink: #e6e9ee;
+      --ink-soft: #99a3b1;
+      --rule: #262d38;
+      --rule-soft: #1c222b;
+      --accent: #85adde;
+      --accent-bg: #17233a;
+      --new: #5fd08a;
+      --new-bg: #12261a;
+      --changed: #e0b25f;
+      --changed-bg: #2a2110;
+      --breaking: #f08fa5;
+      --breaking-bg: #2c1219;
+      --code-bg: #161b22;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0e1116;
+    --paper: #161b22;
+    --ink: #e6e9ee;
+    --ink-soft: #99a3b1;
+    --rule: #262d38;
+    --rule-soft: #1c222b;
+    --accent: #85adde;
+    --accent-bg: #17233a;
+    --new: #5fd08a;
+    --new-bg: #12261a;
+    --changed: #e0b25f;
+    --changed-bg: #2a2110;
+    --breaking: #f08fa5;
+    --breaking-bg: #2c1219;
+    --code-bg: #161b22;
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0;
+    padding-block: 0 96px;
+    padding-inline: 20px;
+  }
+
+  .wrap { max-width: 940px; margin: 0 auto; }
+
+  header {
+    border-bottom: 2px solid var(--ink);
+    padding: 48px 0 20px;
+    margin-bottom: 32px;
+  }
+  header h1 {
+    font-size: 1.9rem;
+    line-height: 1.2;
+    margin: 0 0 8px;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  header p { color: var(--ink-soft); margin: 0; max-width: 68ch; }
+  .meta {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--ink-soft);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 12px;
+  }
+
+  h2 {
+    font-size: 1.3rem;
+    margin: 56px 0 4px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+  h3 { font-size: 1.02rem; margin: 32px 0 6px; text-wrap: balance; }
+  h4 {
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--ink-soft);
+    margin: 24px 0 6px;
+  }
+  p { margin: 10px 0; max-width: 72ch; }
+  ul { margin: 10px 0; padding-left: 22px; max-width: 72ch; }
+  li { margin: 5px 0; }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.86em;
+    background: var(--code-bg);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: 1px 5px;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 0.84rem;
+    line-height: 1.55;
+    margin: 12px 0;
+  }
+  pre code { background: none; border: 0; padding: 0; font-size: 1em; }
+
+  .scroll { overflow-x: auto; margin: 14px 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.88rem;
+    min-width: 560px;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px 8px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+  }
+  th {
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--ink-soft);
+    border-bottom: 1px solid var(--rule);
+    font-weight: 600;
+  }
+  td code { white-space: nowrap; }
+
+  .chip {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 2px 7px;
+    border-radius: 3px;
+    vertical-align: 2px;
+  }
+  .chip.new { color: var(--new); background: var(--new-bg); }
+  .chip.changed { color: var(--changed); background: var(--changed-bg); }
+  .chip.breaking { color: var(--breaking); background: var(--breaking-bg); }
+
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-bg);
+    padding: 14px 18px;
+    border-radius: 0 5px 5px 0;
+    margin: 18px 0;
+  }
+  .callout.warn { border-left-color: var(--breaking); background: var(--breaking-bg); }
+  .callout p:first-child { margin-top: 0; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  nav.toc {
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    padding: 16px 20px;
+    margin: 24px 0 8px;
+  }
+  nav.toc ol { margin: 0; padding-left: 20px; }
+  nav.toc li { margin: 3px 0; }
+  a { color: var(--accent); }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .method {
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: 0.78rem;
+    white-space: nowrap;
+  }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* Module ledger. This release adds nine modules rather than a handful of endpoints, so
+     the count per module is real navigational information - it tells you how much surface
+     each one has before you open its section. */
+  .ledger {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(212px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    overflow: hidden;
+    margin: 20px 0 8px;
+  }
+  .ledger div {
+    background: var(--ground);
+    padding: 12px 14px;
+  }
+  .ledger dt {
+    font-weight: 600;
+    font-size: 0.92rem;
+    margin: 0 0 2px;
+  }
+  .ledger dd {
+    margin: 0;
+    color: var(--ink-soft);
+    font-size: 0.82rem;
+    line-height: 1.45;
+  }
+  .ledger .count {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.72rem;
+    color: var(--ink-soft);
+    letter-spacing: 0.04em;
+  }
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="meta">Backend handoff &middot; 17 September 2026, updated 22 September</div>
+  <h1>H7 LMS — API changes for the frontend</h1>
+  <p>Nine new modules and one changed enum. This covers admissions, families and parent
+  accounts, the notice board, school finance, live-class timing, extra-class approval, the
+  calendar, homework, staff leave and support. Live schema is always at <code>/docs</code>
+  and <code>/api/v1/openapi.json</code>.</p>
+</header>
+
+<nav class="toc" aria-label="Contents">
+  <ol>
+    <li><a href="#watch">What to change in existing screens</a></li>
+    <li><a href="#modules">The nine new modules</a></li>
+    <li><a href="#admissions">Admissions — years and categories</a></li>
+    <li><a href="#families">Families, parent accounts and the parent portal</a></li>
+    <li><a href="#notices">Notice board</a></li>
+    <li><a href="#finance">School finance and the payment page</a></li>
+    <li><a href="#live">Live classes — the join button</a></li>
+    <li><a href="#extra">Extra classes</a></li>
+    <li><a href="#calendar">Calendar and tile view</a></li>
+    <li><a href="#homework">Homework</a></li>
+    <li><a href="#leave">Staff leave</a></li>
+    <li><a href="#oversight">Cadence and counts</a></li>
+    <li><a href="#support">Support and the product switcher</a></li>
+    <li><a href="#library">Library — read-only mode and syllabus</a></li>
+    <li><a href="#tuition-board">Tuition — its own notice board and admissions</a></li>
+    <li><a href="#settings">Admin settings reference</a></li>
+    <li><a href="#billing-rework">Billing rework — terms, packages and family auto-mapping</a></li>
+    <li><a href="#checkout">Checkout — the payer starts a payment</a></li>
+    <li><a href="#database">Database backend — nothing changes for the frontend</a></li>
+    <li><a href="#admission-fee">Admission fee once, tuition by term</a></li>
+    <li><a href="#collect">Collecting fees at the counter, and term-aware plans</a></li>
+    <li><a href="#reports">Fee reports — the roll, the dues, the collections</a></li>
+  </ol>
+</nav>
+
+<h2 id="watch">1. What to change in existing screens</h2>
+
+<p>Nothing was removed and no response shape changed <em>in the September modules</em>, so
+nothing breaks on deploy. Three things do need attention in screens you already have.</p>
+
+<div class="callout">
+  <p><strong>22 September update — the billing rework does remove things.</strong> The
+  tuition <code>/fee-plans</code> endpoints are gone, replaced by packages;
+  <code>fee_plan_id</code> has left the enrollment shapes; and the tuition fee breakdown
+  now has one package line instead of one line per subject. See
+  <a href="#billing-rework">section 17</a> before touching the fee screens.</p>
+</div>
+
+<h3><span class="chip changed">Changed</span> <code>UserRole</code> has a fifth value</h3>
+
+<p><code>PARENT</code> joins <code>ADMIN</code>, <code>CLASS_TEACHER</code>,
+<code>TEACHER</code> and <code>STUDENT</code>. Any exhaustive switch on role — a role picker,
+a navigation guard, a badge colour map — needs a branch for it, or parents land on whatever
+your default case does.</p>
+
+<p>A parent's home is <code>GET /api/v1/parent/children</code>, which returns the children
+they may open together with per-child permission flags. Render the switcher from that, and
+hide a tab rather than letting the request 403.</p>
+
+<h3><span class="chip changed">Changed</span> New fields on every user profile</h3>
+
+<p>Additive, all optional, on <code>UserCreate</code>, <code>UserUpdate</code> and
+<code>UserOut</code>. Existing forms keep working; the admission form should gain them.</p>
+
+<div class="scroll">
+<table>
+  <tr><th>Field</th><th>Type</th><th>Notes</th></tr>
+  <tr><td><code>academic_year_id</code></td><td>int</td><td>Defaults to the current year when a student is created</td></tr>
+  <tr><td><code>admission_category_id</code></td><td>int</td><td>Carries any standing fee concession</td></tr>
+  <tr><td><code>syllabus</code></td><td>string</td><td>CBSE, ICSE, IGCSE — free text, drives library filtering</td></tr>
+  <tr><td><code>academic_stream</code></td><td>string</td><td>Science, Commerce, Humanities</td></tr>
+  <tr><td><code>medium</code></td><td>string</td><td>Language of instruction</td></tr>
+</table>
+</div>
+
+<h3><span class="chip changed">Changed</span> <code>POST /admin/users</code> now fills in two fields</h3>
+
+<p>When the school's identifier mode is <code>AUTO</code> (the default), leaving
+<code>admission_number</code> or <code>employee_id</code> blank gets one issued —
+<code>ADM-2026-0001</code>, <code>EMP-2026-0001</code>. A value you send is always kept, so
+a migration carrying historical numbers is unaffected. Students also get
+<code>academic_year_id</code> set to the current year when you omit it.</p>
+
+<p>The response carries whatever was assigned, so read it back rather than assuming the
+field is still empty. Switch to <code>MANUAL</code> under
+<code>PUT /admin/finance/settings</code>… see <a href="#settings">settings</a>.</p>
+
+<h2 id="modules">2. The nine new modules</h2>
+
+<p>122 new endpoints. Counts below are a rough guide to how much surface each module has.</p>
+
+<dl class="ledger">
+  <div><dt>Admissions</dt><dd class="count">11 endpoints</dd><dd>Session years, admission categories</dd></div>
+  <div><dt>Families</dt><dd class="count">15 endpoints</dd><dd>Sibling groups, parent logins, parent portal</dd></div>
+  <div><dt>Notices</dt><dd class="count">10 endpoints</dd><dd>Classwise board, scheduling, read receipts</dd></div>
+  <div><dt>Finance</dt><dd class="count">31 endpoints</dd><dd>Fees, charges, tax, instalments, discounts, invoices</dd></div>
+  <div><dt>Live classes</dt><dd class="count">5 endpoints</dd><dd>Class clock, gated join, start and end</dd></div>
+  <div><dt>Extra classes</dt><dd class="count">6 endpoints</dd><dd>Request, approve, schedule</dd></div>
+  <div><dt>Calendar</dt><dd class="count">1 endpoint</dd><dd>Everything on one person's calendar</dd></div>
+  <div><dt>Homework</dt><dd class="count">9 endpoints</dd><dd>Set, submit, mark, reopen</dd></div>
+  <div><dt>Leave</dt><dd class="count">8 endpoints</dd><dd>Apply, decide, balances, cover sheet</dd></div>
+  <div><dt>Support</dt><dd class="count">9 endpoints</dd><dd>Tickets, contact details, product switcher</dd></div>
+</dl>
+
+<h2 id="admissions">3. Admissions — years and categories</h2>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET</td><td><code>/admissions/years/current</code></td><td>Any signed-in user. Returns <code>null</code>, not 404, when unconfigured</td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admissions/years</code></td><td>List, create</td></tr>
+  <tr><td class="method">GET PUT DELETE</td><td><code>/admissions/years/{year_id}</code></td><td>Delete refused while students are admitted into it</td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admissions/categories</code></td><td>Regular, Staff Ward, Transfer…</td></tr>
+  <tr><td class="method">GET PUT DELETE</td><td><code>/admissions/categories/{category_id}</code></td><td>Delete refused while students hold it — deactivate instead</td></tr>
+</table>
+</div>
+
+<div class="callout">
+  <p><strong>Exactly one year is current.</strong> Setting <code>is_current</code> on a year
+  clears it everywhere else in the same write, so a "make this the current year" toggle needs
+  no second call and no optimistic de-selection in your list.</p>
+</div>
+
+<p>A category with no <code>academic_year_id</code> is a standing category inherited by every
+year — that is what you want for all but one-off scholarship schemes. Categories carry
+<code>default_discount_percent</code> and <code>waives_admission_charge</code>, which the fee
+engine applies automatically.</p>
+
+<h2 id="families">4. Families, parent accounts and the parent portal</h2>
+
+<p>Two separate things. A <strong>sibling group</strong> is a billing household and works
+whether or not anybody has a login — it is what the sibling discount counts. A
+<strong>parent link</strong> is an access grant from one parent login to one student.</p>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/families/groups</code></td><td>Households</td></tr>
+  <tr><td class="method">GET PUT DELETE</td><td><code>/admin/families/groups/{group_id}</code></td><td></td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/families/groups/{id}/members</code></td><td>Add a child. 400 if already in another household</td></tr>
+  <tr><td class="method">DELETE</td><td><code>/admin/families/groups/{id}/members/{student_id}</code></td><td>Remove a child</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/families/students/{student_id}/group</code></td><td><code>null</code> for an only child — not an error</td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/families/parents</code></td><td>Create a parent login and its links in one call</td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/families/parents/{parent_id}/links</code></td><td>Grant access to a student</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/families/students/{student_id}/parents</code></td><td>Front-office view: who can reach this child</td></tr>
+  <tr><td class="method">PUT DELETE</td><td><code>/admin/families/links/{link_id}</code></td><td>Change or revoke a grant</td></tr>
+  <tr><td class="method">GET</td><td><code>/parent/children</code></td><td>The switcher, with permission flags per child</td></tr>
+  <tr><td class="method">GET</td><td><code>/parent/children/{student_id}</code></td><td>One child's summary</td></tr>
+  <tr><td class="method">GET</td><td><code>/parent/children/{student_id}/profile</code></td><td>Full profile</td></tr>
+</table>
+</div>
+
+<div class="callout">
+  <p><strong>Permissions are per link, per aspect.</strong> Each child in
+  <code>/parent/children</code> carries <code>may_view_academics</code>,
+  <code>may_view_attendance</code> and <code>may_view_fees</code>. Fees are
+  <strong>off unless an admin grants them</strong>, so build the parent nav from these flags
+  rather than showing a fee tab that 403s.</p>
+  <p>Revocation takes effect on the parent's next request — access is resolved per request,
+  not carried in the token, so there is no window where a deleted link still works.</p>
+</div>
+
+<h2 id="notices">5. Notice board</h2>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET</td><td><code>/notices/feed</code></td><td>The reader's board, with <code>unread_count</code></td></tr>
+  <tr><td class="method">GET</td><td><code>/notices/{notice_id}</code></td><td>Opening one records a read receipt</td></tr>
+  <tr><td class="method">POST</td><td><code>/notices/{notice_id}/dismiss</code></td><td>Clear from the badge without opening</td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/notices</code></td><td>Authoring. Teachers may post to classes they lead</td></tr>
+  <tr><td class="method">GET PUT</td><td><code>/admin/notices/{notice_id}</code></td><td></td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/notices/{id}/publish</code></td><td>Returns <code>recipient_count</code></td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/notices/{id}/archive</code></td><td>Take down, keep the record</td></tr>
+  <tr><td class="method">DELETE</td><td><code>/admin/notices/{notice_id}</code></td><td>Admin only. Prefer archive</td></tr>
+</table>
+</div>
+
+<p><code>audience</code> is one of <code>EVERYONE</code>, <code>ROLE</code>,
+<code>CLASS</code> or <code>USER</code>, and decides which target list is read — the others
+are ignored, so your form can leave stale ids behind safely. Creating a targeted notice with
+an empty target list is rejected at validation.</p>
+
+<p>Visibility has two halves that you should surface separately: <code>status</code> is the
+author's decision and <code>publish_at</code> / <code>expires_at</code> are the clock. The
+response carries <code>is_live</code>, <code>is_scheduled</code> and <code>is_expired</code>
+already resolved — show "Scheduled for Friday" rather than a bare "not visible".</p>
+
+<p><code>unread_count</code> counts the whole feed, not the page, so it stays correct while
+the user filters. Don't recompute it from the items you can see.</p>
+
+<h2 id="finance">6. School finance and the payment page</h2>
+
+<p>The chain is four links: <strong>fee heads</strong> (what can be charged) →
+<strong>structures</strong> (what this class or category is charged) →
+<strong>instalment plans</strong> (when it falls due) → <strong>invoices</strong> (what one
+student owes, frozen when issued).</p>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET PUT</td><td><code>/admin/finance/settings</code></td><td>Currency, tax, late fee, convenience charge, rounding, gateway</td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/finance/heads</code></td><td>Tuition Fee, Transport, Exam Fee…</td></tr>
+  <tr><td class="method">PUT DELETE</td><td><code>/admin/finance/heads/{head_id}</code></td><td></td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/finance/structures</code></td><td>Empty scope lists = the year's default</td></tr>
+  <tr><td class="method">GET PUT DELETE</td><td><code>/admin/finance/structures/{structure_id}</code></td><td></td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/finance/plans</code></td><td>Instalments. Percentages must total 100</td></tr>
+  <tr><td class="method">PUT DELETE</td><td><code>/admin/finance/plans/{plan_id}</code></td><td></td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/finance/discounts</code></td><td>Sibling, multi-registration, category, scholarship</td></tr>
+  <tr><td class="method">PUT DELETE</td><td><code>/admin/finance/discounts/{rule_id}</code></td><td></td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/finance/students/{id}/breakdown</code></td><td>Preview without billing</td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/finance/students/{id}/invoice</code></td><td>Build or rebuild the draft</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/finance/invoices</code></td><td><code>?overdue_only=true</code> for the arrears list</td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/finance/invoices/{id}/issue</code></td><td>Assign a number, freeze the figures</td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/finance/invoices/{id}/payments</code></td><td>Cash, cheque, transfer, card, adjustment</td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/finance/invoices/{id}/waive</code></td><td>Write off an instalment. Reason mandatory</td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/finance/invoices/{id}/late-fees</code></td><td>Idempotent per instalment</td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/finance/invoices/{id}/cancel</code></td><td>Refused once money has been taken</td></tr>
+  <tr><td class="method">GET</td><td><code>/fees/me</code></td><td>Student's own breakdown</td></tr>
+  <tr><td class="method">GET</td><td><code>/fees/me/invoices</code></td><td></td></tr>
+  <tr><td class="method">GET</td><td><code>/parent/fees/children/{student_id}</code></td><td>Requires <code>may_view_fees</code></td></tr>
+  <tr><td class="method">GET</td><td><code>/parent/fees/children/{id}/invoices</code></td><td></td></tr>
+</table>
+</div>
+
+<h3>The payment page renders <code>FeeBreakdownOut</code></h3>
+
+<p><code>/fees/me</code>, <code>/parent/fees/children/{id}</code> and the admin preview all
+return the same shape, from the same computation. The totals relate as:</p>
+
+<pre><code>subtotal
+  − discount_total
+  + tax_total
+  + convenience_total
+  ± rounding_adjustment
+  = total_amount</code></pre>
+
+<p><code>charge_total</code> is the part of <code>subtotal</code> that is not teaching fees,
+so you can render "Fees" and "Charges" as sections without recomputing anything. Every line
+in <code>line_items</code> carries its own <code>discount_amount</code>,
+<code>tax_amount</code> and <code>net_amount</code>.</p>
+
+<div class="callout">
+  <p><strong><code>discounts_not_applied</code> is worth surfacing on the admin screen.</strong>
+  Each entry says why a rule did not fire — <em>"household has 1 child; rule needs 2"</em> —
+  which answers the support question before it is asked.</p>
+</div>
+
+<h3>Discounts</h3>
+
+<p>The two the brief asked for: <code>basis: SIBLING</code> with
+<code>applies_from_nth: 2</code> gives the second child onward a concession while the eldest
+pays full fee, counted over the recorded household. <code>basis: MULTI_REGISTRATION</code>
+counts concurrent enrollments across both products — the "2 registrations at once" case.</p>
+
+<p><code>is_stackable</code> is <strong>off by default</strong>: rules compete and only the
+best-valued one applies. Make that visible in the rule editor, because a staff ward who is
+also a second child getting one concession rather than two will otherwise look like a bug.</p>
+
+<h3><span class="chip new">New</span> Payment gateway — recorded, not wired</h3>
+
+<div class="callout warn">
+  <p><strong>No provider is integrated.</strong> <code>POST /admin/finance/invoices/{id}/intents</code>
+  validates the amount, mints an idempotency key and records the attempt, but returns
+  <code>checkout_url: null</code> and <code>status: "CREATED"</code>.</p>
+  <p>Read <code>gateway_enabled</code> from the breakdown or the settings to decide whether to
+  render "Pay online" at all. Until a provider is chosen, show fees, charges and tax and take
+  payment offline through <code>/payments</code>.</p>
+</div>
+
+<h2 id="live">7. Live classes — the join button</h2>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET</td><td><code>/classes/{meeting_id}/timing</code></td><td>The class clock. Poll for a countdown</td></tr>
+  <tr><td class="method">POST</td><td><code>/classes/{meeting_id}/join</code></td><td>Returns the link only if you may join</td></tr>
+  <tr><td class="method">POST</td><td><code>/classes/{meeting_id}/start</code></td><td>Teacher opens the class</td></tr>
+  <tr><td class="method">POST</td><td><code>/classes/{meeting_id}/end</code></td><td>Closes it</td></tr>
+  <tr><td class="method">GET</td><td><code>/classes/live</code></td><td>Dashboard "join now" strip</td></tr>
+</table>
+</div>
+
+<div class="callout">
+  <p><strong>Bind the join button to <code>may_join</code> and nothing else.</strong> It
+  already accounts for the early-join window, the grace period, the status and whether the
+  teacher has started. Anything you derive yourself will eventually disagree with the server,
+  which enforces the same rule on <code>/join</code> and returns 409.</p>
+  <p>When it is false, show <code>join_blocked_reason</code> verbatim — it distinguishes
+  "The class opens at 09:55", "Waiting for the teacher to start the class" and "This class
+  has ended", which flags alone cannot.</p>
+</div>
+
+<p>Timings are computed server-side so a teacher's screen and a student's screen cannot
+disagree. Useful fields: <code>starts_in_minutes</code>, <code>minutes_remaining</code>,
+<code>class_has_started</code>, <code>waiting_for_teacher</code>, <code>is_live</code>,
+<code>join_opens_at</code>.</p>
+
+<p>With <code>auto_start_class</code> on, a class opens on its timetabled time with no
+teacher action. With it off — the default — students see
+<code>waiting_for_teacher: true</code> until the teacher calls <code>/start</code>. A student
+in that state is waiting, not late; word the UI accordingly.</p>
+
+<h2 id="extra">8. Extra classes</h2>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET POST</td><td><code>/extra-classes</code></td><td>Teachers request; list is a queue, pending first</td></tr>
+  <tr><td class="method">GET</td><td><code>/extra-classes/{request_id}</code></td><td></td></tr>
+  <tr><td class="method">POST</td><td><code>/extra-classes/{id}/decide</code></td><td>Admin approves or rejects. Rejection needs a note</td></tr>
+  <tr><td class="method">POST</td><td><code>/extra-classes/{id}/schedule</code></td><td>Creates the actual class</td></tr>
+  <tr><td class="method">POST</td><td><code>/extra-classes/{id}/cancel</code></td><td>Withdraw</td></tr>
+</table>
+</div>
+
+<p>Approving and scheduling are two calls on purpose: creating the class can fail on a clash
+or a Meet error after a human has already approved it. An <code>APPROVED</code> request with
+no <code>created_meeting_id</code> is an approval whose class has not been made yet — show it
+as such and offer a retry, rather than treating APPROVED as done.</p>
+
+<p>Status flow: <code>PENDING → APPROVED → SCHEDULED</code>, or <code>REJECTED</code> /
+<code>CANCELLED</code>. When <code>extra_class_needs_approval</code> is off, requests are
+created already <code>APPROVED</code> and the screen becomes one step.</p>
+
+<h2 id="calendar">9. Calendar and tile view</h2>
+
+<p><code>GET /calendar?from_date=&amp;to_date=&amp;kinds=&amp;group_by_day=</code> — one
+endpoint for both views.</p>
+
+<p>Every source is flattened to one event shape, so a week renders without knowing which
+collection a row came from. <code>kind</code> is <code>TIMETABLE</code>,
+<code>LIVE_CLASS</code>, <code>TUITION_CLASS</code>, <code>EXAM</code> or
+<code>HOMEWORK</code> — switch on it for colour and icon only.</p>
+
+<ul>
+  <li><code>group_by_day=true</code> adds <code>days[]</code> with <strong>every</strong> date
+  in the range including empty ones, so a month grid lines up without you synthesising blanks.</li>
+  <li>Homework has <code>all_day: true</code> and a <code>due_date</code> rather than a time —
+  render it in the day header.</li>
+  <li><code>meeting_link</code> is present only when the viewer may join right now. The
+  calendar cannot be used to enter a room early.</li>
+  <li>Role decides the sources. A parent gets the union of their children's events, each
+  tagged with <code>student_id</code> and <code>student_name</code>.</li>
+  <li>Ranges are capped at 90 days; longer returns 400.</li>
+</ul>
+
+<h2 id="homework">10. Homework</h2>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET POST</td><td><code>/homework</code></td><td>Students see their class's; teachers see what they set</td></tr>
+  <tr><td class="method">GET PUT DELETE</td><td><code>/homework/{assignment_id}</code></td><td></td></tr>
+  <tr><td class="method">POST</td><td><code>/homework/{id}/submit</code></td><td>Student hands in. Resubmitting updates</td></tr>
+  <tr><td class="method">GET</td><td><code>/homework/{id}/submissions</code></td><td>The marking list, including non-submitters</td></tr>
+  <tr><td class="method">POST</td><td><code>/homework/submissions/{id}/grade</code></td><td></td></tr>
+  <tr><td class="method">POST</td><td><code>/homework/submissions/{id}/reopen</code></td><td>Clear a mark to allow resubmission</td></tr>
+</table>
+</div>
+
+<p>A student's list carries <code>my_status</code> and <code>my_marks</code>; a teacher's
+carries <code>submission_count</code> and <code>expected_count</code>. Status is
+<code>ASSIGNED</code>, <code>SUBMITTED</code>, <code>GRADED</code> or <code>MISSED</code> —
+and <code>MISSED</code> is derived from the due date having passed, never stored, so it is
+correct the morning after with no sweep having run.</p>
+
+<h2 id="leave">11. Staff leave</h2>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">POST</td><td><code>/leave</code></td><td>Apply</td></tr>
+  <tr><td class="method">GET</td><td><code>/leave/me</code></td><td>My requests</td></tr>
+  <tr><td class="method">GET</td><td><code>/leave/me/balance</code></td><td>My totals by type</td></tr>
+  <tr><td class="method">GET</td><td><code>/leave</code></td><td>Admin queue, pending first</td></tr>
+  <tr><td class="method">GET</td><td><code>/leave/on/{day}</code></td><td>Daily cover sheet</td></tr>
+  <tr><td class="method">POST</td><td><code>/leave/{id}/decide</code></td><td>Approve or reject; may name a substitute</td></tr>
+  <tr><td class="method">POST</td><td><code>/leave/{id}/withdraw</code></td><td>Take it back</td></tr>
+  <tr><td class="method">GET</td><td><code>/leave/balance/{teacher_id}</code></td><td>Admin view of one teacher</td></tr>
+</table>
+</div>
+
+<p>A request carries <code>affected_periods</code> — the periods the applicant was
+timetabled to take across those dates, snapshotted at application time. Show it on the
+approval screen: it is what the approver is actually agreeing to cover.</p>
+
+<p><code>taken_days</code> and <code>pending_days</code> are separate maps keyed by leave
+type. Show both. One combined figure is how two teachers get approved for the same week.</p>
+
+<h2 id="oversight">12. Cadence and counts</h2>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET</td><td><code>/admin/academics/cadence</code></td><td>Weekly-exam and daily-homework compliance per class+subject</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/academics/exam-counts</code></td><td>Exams sat vs set, per student</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/academics/homework-counts</code></td><td>Submitted, late, missed, per student</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/reports/parent-preview/{id}</code></td><td>The digest without sending it</td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/reports/parent-send/{id}</code></td><td>Email one child's digest</td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/reports/parent-sweep</code></td><td>Every active student</td></tr>
+</table>
+</div>
+
+<p>Cadence <strong>reports; it never blocks</strong>. Nothing stops a teacher taking a class
+with last week's exam missing — it is a management list, so present it as one: rows sorted
+worst first, subjects never examined above merely overdue.</p>
+
+<p>Exam counts pair <code>exams_attempted</code> with <code>exams_set</code>. Show both: 3 of
+8 and 3 of 3 are the same count and opposite problems.</p>
+
+<div class="callout warn">
+  <p><strong>Parent digests are off by default</strong> (<code>ENABLE_PARENT_REPORTS</code>).
+  The endpoints work on demand, but the background sweep sends nothing until it is turned on.
+  Sending is idempotent per recipient per period, and a period in which nothing happened is
+  skipped rather than mailed as a digest of zeros.</p>
+</div>
+
+<h2 id="support">13. Support and the product switcher</h2>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET POST</td><td><code>/support/tickets</code></td><td>Raise and list. Non-staff see only their own</td></tr>
+  <tr><td class="method">GET PUT</td><td><code>/support/tickets/{ticket_id}</code></td><td>PUT is staff-only</td></tr>
+  <tr><td class="method">POST</td><td><code>/support/tickets/{id}/reply</code></td><td>Add to the thread</td></tr>
+  <tr><td class="method">POST</td><td><code>/support/tickets/{id}/rate</code></td><td>1–5, after resolution</td></tr>
+  <tr><td class="method">GET</td><td><code>/support/contact</code></td><td>Phone, WhatsApp, email, hours — per product</td></tr>
+  <tr><td class="method">PUT</td><td><code>/admin/support/contact</code></td><td>Set them</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/support/queue</code></td><td>Dashboard counts</td></tr>
+  <tr><td class="method">GET</td><td><code>/me/programs</code></td><td>The school / tuition dropdown</td></tr>
+</table>
+</div>
+
+<p>Tickets are threaded rather than live chat, so no socket is needed. A reply with
+<code>is_internal: true</code> from staff is invisible to the reporter — mark those clearly
+in the staff view so nobody writes a private note into the public thread by accident. The
+flag is ignored for non-staff.</p>
+
+<p><code>tickets_enabled</code> can be false per product, in which case
+<code>POST /support/tickets</code> returns 403 and the support page should show the phone and
+email contact only.</p>
+
+<h3>The product switcher</h3>
+
+<p><code>GET /me/programs</code> returns the products this account may use, with labels
+("School", "Online Tuition") and <code>show_switcher</code>, which is false when there is
+nothing to choose between — hide the control rather than rendering a one-item dropdown.
+Admins always get both.</p>
+
+<p>This is a read, not a grant. Selecting a product gives nobody access; every tuition
+endpoint checks <code>programs</code> independently.</p>
+
+<h2 id="library">14. Library — read-only mode and syllabus</h2>
+
+<p><span class="chip changed">Changed</span> Two settings now gate the tuition library for
+students, independently:</p>
+
+<ul>
+  <li><code>student_library_uploads_enabled: false</code> — upload endpoints return 403 for
+  students. Hide the upload control.</li>
+  <li><code>student_library_downloads_enabled: false</code> —
+  <code>POST /tuition/library/{id}/download</code> returns 403 for students. They can still
+  view in the browser.</li>
+</ul>
+
+<p>Library items gained a <code>syllabus</code> array (<code>["CBSE"]</code>). When
+<code>library_syllabus_filter</code> is on, students see only items matching the
+<code>syllabus</code> on their profile — <strong>plus every untagged item</strong>, so
+turning the filter on does not blank an existing library. Teachers and admins always see
+everything.</p>
+
+<h3><span class="chip new">New</span> Tuition subjects, student-first</h3>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET</td><td><code>/admin/tuition/students/{id}/subjects</code></td><td>With teacher and class counts</td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/tuition/students/{id}/subjects</code></td><td>Add. 409 if the subject already has a teacher</td></tr>
+  <tr><td class="method">DELETE</td><td><code>/admin/tuition/students/{id}/subjects/{subject_id}</code></td><td>Cancels; <code>?hard_delete=true</code> removes</td></tr>
+</table>
+</div>
+
+<p>The same records as <code>/enrollments</code>, shaped the way the office thinks about
+them. Adding a subject does not schedule anything — create slots afterwards or the student is
+enrolled with no classes.</p>
+
+<h2 id="tuition-board">15. Tuition — its own notice board and admissions</h2>
+
+<p>The tuition admin area gets the same two options the school has, on its own routes, so a
+screen inside the tuition module never has to pass <code>program=TUITION</code> and never
+sees a school record by mistake. Same collections, same shapes as sections 3 and 5.</p>
+
+<h3><span class="chip new">New</span> Tuition notice board</h3>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/tuition/notices</code></td><td>Admin authoring. <code>program</code> may be omitted — it is always <code>TUITION</code></td></tr>
+  <tr><td class="method">GET PUT DELETE</td><td><code>/admin/tuition/notices/{notice_id}</code></td><td>404 for a school notice</td></tr>
+  <tr><td class="method">POST</td><td><code>/admin/tuition/notices/{id}/publish</code> · <code>/archive</code></td><td>Returns <code>recipient_count</code> of tuition accounts</td></tr>
+  <tr><td class="method">GET</td><td><code>/tuition/notices/feed</code></td><td>Tuition students, teachers and admins. Same <code>NoticeFeed</code> shape</td></tr>
+  <tr><td class="method">GET POST</td><td><code>/tuition/notices/{notice_id}</code> · <code>/dismiss</code></td><td>Open (records a read); clear from the badge</td></tr>
+</table>
+</div>
+
+<div class="callout">
+  <p><strong>No <code>CLASS</code> audience here.</strong> Tuition has enrollments, not
+  classes, and the class ids would be the school's. Offer <code>EVERYONE</code>,
+  <code>ROLE</code> (all tuition teachers or all tuition students) and <code>USER</code>
+  (named students) in the tuition form; a <code>CLASS</code> notice is refused with a 400.
+  <code>include_parents</code> still works — it reaches the parents linked to the targeted
+  students.</p>
+</div>
+
+<h3><span class="chip new">New</span> Tuition session years and admission categories</h3>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET</td><td><code>/admin/tuition/admissions/years/current</code></td><td>Anyone in the programme. <code>null</code> when unconfigured</td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/tuition/admissions/years</code></td><td>Tuition years only. <code>programs</code> defaults to <code>["TUITION"]</code></td></tr>
+  <tr><td class="method">GET PUT DELETE</td><td><code>/admin/tuition/admissions/years/{year_id}</code></td><td>404 for a school-only year. Dropping TUITION from <code>programs</code> is refused</td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/tuition/admissions/categories</code></td><td>Regular, Sibling, Scholarship… tuition only</td></tr>
+  <tr><td class="method">GET PUT DELETE</td><td><code>/admin/tuition/admissions/categories/{category_id}</code></td><td>Delete refused while students hold it</td></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/tuition/admissions/years/{year_id}/students</code></td><td>Tuition roster; map a list in (this is also the rollover — no class promotion in tuition)</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/tuition/admissions/students/unassigned</code></td><td>Tuition students with no year yet</td></tr>
+</table>
+</div>
+
+<p><code>is_current</code> on a tuition year rolls over the <em>tuition</em> calendar only;
+the school's current year is untouched, and vice versa. The two products keep separate
+calendars by design.</p>
+
+<p><span class="chip changed">Changed</span> <code>POST /admin/tuition/students</code> now
+admits a new student into the current <strong>tuition</strong> year when
+<code>academic_year_id</code> is omitted, and accepts <code>admission_category_id</code>.
+<code>GET /admin/tuition/users</code> takes <code>academic_year_id</code> and
+<code>admission_category_id</code> filters, and <code>TuitionUserSummary</code> now carries
+both ids.</p>
+
+<h3><span class="chip changed">Changed</span> The currency switcher now carries each currency's charges and total</h3>
+
+<p>Every fee breakdown (<code>GET /tuition/students/fees/me</code>,
+<code>GET /admin/tuition/students/{id}/fee-breakdown</code>, and the school's
+<code>/finance/me</code>, <code>/parent/children/{id}/fees</code> and admin breakdown) now
+returns two extra fields beside <code>available_currencies</code>:</p>
+
+<div class="scroll">
+<table>
+  <tr><th>Field</th><th>Shape</th><th>Use</th></tr>
+  <tr><td><code>recommended_currency</code></td><td>string</td><td>The base currency — the one the fees were set in. Preselect it and label it <em>Recommended</em></td></tr>
+  <tr><td><code>currency_options[]</code></td><td>list</td><td>One row per offered currency: <code>code</code>, <code>symbol</code>, <code>recommended</code>, <code>rate_from_base</code>, the tax rule (<code>tax_enabled</code>, <code>tax_percent</code>, <code>tax_label</code>, <code>tax_inclusive</code>), the surcharge (<code>convenience_percent</code>, <code>convenience_amount</code>), <code>rounding</code>, and a ready-made <code>charges_summary</code> such as <em>"GST 18% + 2% convenience"</em></td></tr>
+</table>
+</div>
+
+<p>On the <strong>tuition</strong> breakdown each option also carries <code>subtotal</code>,
+<code>tax_total</code>, <code>convenience_total</code> and <code>total_amount</code> — the same
+classes priced in that currency with its own rules — so the switcher can show
+"INR ₹12,006 (recommended) · AED 475.20 · USD 124.19" before the payer picks. Pass the chosen
+code back as <code>?currency=</code>; the response then applies that currency's tax and
+surcharge, not just its rate. <code>GET /admin/finance/currencies</code> returns the same
+<code>options</code> (without totals) for the settings screen.</p>
+
+<h2 id="settings">16. Admin settings reference</h2>
+
+<p>All of these are runtime-editable per program, no redeploy.
+<code>GET|PUT /admin/finance/settings?program=LMS</code> covers the money keys;
+<code>GET|PUT /admin/tuition/settings/{program}</code> covers the rest.</p>
+
+<div class="scroll">
+<table>
+  <tr><th>Key</th><th>Default</th><th>Effect</th></tr>
+  <tr><td><code>currency</code></td><td>INR</td><td>Both products</td></tr>
+  <tr><td><code>tax_enabled</code> / <code>tax_percent</code> / <code>tax_label</code></td><td class="num">false / 0 / "Tax"</td><td>Computed on the discounted taxable base</td></tr>
+  <tr><td><code>tax_inclusive</code></td><td>false</td><td>Whether entered amounts already include tax</td></tr>
+  <tr><td><code>late_fee_enabled</code> / <code>_percent</code> / <code>_amount</code> / <code>_grace_days</code></td><td class="num">false / 0 / 0 / 7</td><td>Never taxed</td></tr>
+  <tr><td><code>convenience_percent</code> / <code>convenience_amount</code></td><td class="num">0 / 0</td><td>Added after tax</td></tr>
+  <tr><td><code>invoice_prefix</code> / <code>invoice_due_days</code></td><td>INV / 15</td><td></td></tr>
+  <tr><td><code>rounding</code></td><td>NONE</td><td>NONE, NEAREST, UP, DOWN — final payable only</td></tr>
+  <tr><td><code>gateway_enabled</code> / <code>gateway_provider</code></td><td>false / null</td><td>Drives "Pay online" visibility</td></tr>
+  <tr><td><code>admission_id_mode</code> / <code>admission_id_prefix</code></td><td>AUTO / ADM</td><td>AUTO fills blanks only</td></tr>
+  <tr><td><code>employee_id_mode</code> / <code>employee_id_prefix</code></td><td>AUTO / EMP</td><td></td></tr>
+  <tr><td><code>auto_start_class</code></td><td>false</td><td>Classes open on the timetable</td></tr>
+  <tr><td><code>join_open_minutes_before</code></td><td class="num">5</td><td>How early the join button opens</td></tr>
+  <tr><td><code>default_class_minutes</code> / <code>join_grace_minutes</code></td><td class="num">45 / 15</td><td></td></tr>
+  <tr><td><code>extra_class_needs_approval</code></td><td>true</td><td>Off makes requests auto-approve</td></tr>
+  <tr><td><code>student_library_uploads_enabled</code></td><td>true</td><td>Read-only library</td></tr>
+  <tr><td><code>student_library_downloads_enabled</code></td><td>true</td><td></td></tr>
+  <tr><td><code>library_syllabus_filter</code></td><td>false</td><td>Narrow students to their own syllabus</td></tr>
+</table>
+</div>
+
+<h2 id="billing-rework">17. Billing rework — terms, packages and family auto-mapping</h2>
+
+<p><span class="chip changed">Changed</span> Three things changed together on 22 September:
+the academic year now carries two terms, tuition fees are packages rather than per-subject
+rates, and sibling households build themselves from guardian details. All existing billing
+data was cleared when this shipped, so every fee screen starts from empty.</p>
+
+<h3>The year is April to March, in two terms</h3>
+
+<p>Every <code>AcademicYearOut</code> (school and tuition) now carries
+<code>terms[]</code> — two entries with <code>key</code> (<code>TERM_1</code> /
+<code>TERM_2</code>), <code>name</code>, <code>start_date</code>, <code>end_date</code> and
+<code>is_current</code> — plus <code>current_term</code>, the key today falls in. Years
+created before this carry the derived default: Term 1 from the year's start to 31 October,
+Term 2 from 1 November to the year's end.</p>
+
+<div class="scroll">
+<table>
+  <tr><th>Field</th><th>On</th><th>Change</th></tr>
+  <tr><td><code>start_date</code>, <code>end_date</code></td><td><code>POST …/years</code></td><td>Now optional. Omit both and a name like <em>"2026-27"</em> resolves to 1 April 2026 – 31 March 2027</td></tr>
+  <tr><td><code>terms[]</code></td><td><code>POST</code>, <code>PUT …/years</code></td><td>Optional override: <code>[{key, name?, start_date, end_date}]</code>, both terms, inside the year. Omit for the April–October / November–March split. Changing the year's dates without <code>terms</code> re-derives them</td></tr>
+  <tr><td><code>instalments[]</code></td><td>school <code>FeeBreakdownOut</code>, <code>FeeInvoiceOut</code></td><td>With no instalment plan, a school fee now splits into two instalments, one per term, each carrying <code>term</code>. A plan still overrides this</td></tr>
+</table>
+</div>
+
+<h3><span class="chip new">New</span> Tuition packages replace fee plans</h3>
+
+<p>A package is "so many classes for so much, on any subjects": <code>amount</code> and
+<code>classes_included</code>, with <code>per_class_amount</code> derived. A student is
+put on a package <strong>for a term</strong>; their usage (classes used and remaining) is
+counted from that term's first day. <code>billing_mode</code> decides when the money is
+asked for: <code>PER_CLASS</code> bills the classes attended each period at the per-class
+rate; <code>PACKAGE</code> bills the whole amount on the first invoice of the term and
+thereafter only classes beyond the allowance.</p>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">GET POST</td><td><code>/admin/tuition/packages</code></td><td>List (filters <code>academic_year_id</code>, <code>term</code>, <code>include_inactive</code>) and create. Each row carries <code>students_assigned</code></td></tr>
+  <tr><td class="method">GET PUT DELETE</td><td><code>/admin/tuition/packages/{id}</code></td><td>Delete is 409 while students are on it — mark inactive instead</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/tuition/packages/{id}/students</code></td><td>Who is on it</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/tuition/students/{id}/package?on=</code></td><td><code>PackageStatusOut</code>: the assignment, the package, and <code>classes_used_to_date</code> / <code>classes_remaining</code>. Nulls, not 404, when nothing is assigned</td></tr>
+  <tr><td class="method">PUT</td><td><code>/admin/tuition/students/{id}/package</code></td><td>Assign: <code>{package_id, academic_year_id?, term?, starts_on?, ends_on?}</code>. Year and term default from the package, else from today; dates default to the term's. Same year+term replaces the earlier assignment</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/tuition/students/{id}/packages</code></td><td>History, newest first</td></tr>
+  <tr><td class="method">DELETE</td><td><code>/admin/tuition/students/{id}/packages/{assignment_id}</code></td><td>Ends the assignment (kept for the invoices that reference it)</td></tr>
+  <tr><td class="method">GET</td><td><code>/tuition/students/package/me</code></td><td>The student's own <code>PackageStatusOut</code> — the header of their fee page</td></tr>
+</table>
+</div>
+
+<p><strong>Removed:</strong> <code>/admin/tuition/fee-plans</code> (all four verbs) and
+<code>fee_plan_id</code> on <code>TuitionEnrollmentCreate</code>,
+<code>TuitionEnrollmentUpdate</code>, <code>TuitionEnrollmentOut</code> and
+<code>StudentSubjectAdd</code>. The <code>default_session_fee</code> setting is gone from
+<code>PUT /admin/tuition/settings/TUITION</code>. A package's optional
+<code>max_subjects</code> makes <code>POST …/students/{id}/subjects</code> answer 400 once
+the student is at the cap.</p>
+
+<h3><span class="chip changed">Changed</span> The tuition fee breakdown and invoice</h3>
+
+<p><code>TuitionFeeBreakdownOut</code> (<code>GET /tuition/students/fees/me</code>,
+<code>GET /admin/tuition/students/{id}/fee-breakdown</code>,
+<code>GET /parent/tuition/children/{id}</code>) and <code>InvoiceOut</code> now carry
+<code>term</code>, <code>term_name</code>, <code>package_id</code>,
+<code>package_name</code>, <code>assignment_id</code>, <code>billing_mode</code>,
+<code>classes_included</code>, <code>classes_billed</code>,
+<code>classes_used_to_date</code> and <code>classes_remaining</code> at the top level.
+<code>line_items</code> holds <strong>one line</strong>, the package, and inside it
+<code>subjects[]</code> with each subject's <code>classes_counted</code> and session counts.
+Render the page as: package header with usage → one amount line
+(<code>classes_billed × unit_amount</code>, or <code>package_amount + overage_amount</code>
+under PACKAGE billing, with <code>note</code> / <code>already_billed_on</code> when the
+flat charge was raised earlier in the term) → the subjects table → discount, tax,
+convenience, total, exactly as before. The currency switcher is unchanged.</p>
+
+<p>The <code>lines</code> CSV export is one row per subject with the package columns
+repeated; <code>GET /admin/tuition/invoices/{id}/detail</code> nests the sessions under
+each subject as well as on the line.</p>
+
+<h3><span class="chip new">New</span> Families build themselves</h3>
+
+<p>Students sharing a guardian <strong>phone</strong> (digits compared, so <em>+91 98765
+43210</em> and <em>09876543210</em> match), a guardian <strong>email</strong>, or a
+<strong>parent login</strong> are placed into one household automatically — after
+<code>POST /admin/users</code> and <code>POST /admin/tuition/students</code>, after a
+<code>PUT /admin/users/{id}</code> that touches a guardian field, and after a parent link
+is created. A student already in a household is never moved. A shared guardian
+<em>name</em> alone is only ever a suggestion.</p>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">POST</td><td><code>/admin/families/auto-map</code></td><td><code>{student_ids?: [], dry_run?: bool}</code> → <code>FamilyAutoMapReport</code>: <code>created</code>, <code>added</code>, <code>conflicts</code> (matches sit in different households — fix by hand), <code>unmatched</code> (each with <code>suggestions[]</code>), <code>skipped</code>. Empty <code>student_ids</code> sweeps everyone. Safe to repeat</td></tr>
+  <tr><td class="method">GET</td><td><code>/admin/families/students/{id}/matches</code></td><td><code>strong[]</code> (what the sweep acts on) and <code>suggestions[]</code>, each with the household the other student is already in — feed the manual "add to household" picker from this</td></tr>
+</table>
+</div>
+
+<p><code>SiblingGroupOut</code> gains <code>auto_mapped</code> and <code>matched_by[]</code>
+so the households list can flag the ones nobody typed in. The manual group and member
+endpoints in <a href="#families">section 4</a> are unchanged and remain the way to resolve
+conflicts and suggestions.</p>
+
+<h2 id="checkout">18. Checkout — the payer starts a payment</h2>
+
+<p><span class="chip new">New</span> Until now only an admin could start a payment
+(<code>POST /admin/finance/invoices/{id}/intents</code>), which is why the student's
+Pay button was disabled. The payer now has their own intent endpoints on both billers, and
+an intent carries the method they chose.</p>
+
+<div class="scroll">
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td class="method">POST</td><td><code>/fees/me/invoices/{invoice_id}/intents</code></td><td>School student starts a payment on their own invoice. Body <code>{amount, instalment_label?, method?}</code></td></tr>
+  <tr><td class="method">GET</td><td><code>/fees/me/invoices/{invoice_id}/intents</code></td><td>Their attempts on it, newest first, failures included</td></tr>
+  <tr><td class="method">POST GET</td><td><code>/parent/fees/children/{student_id}/invoices/{invoice_id}/intents</code></td><td>The same for a parent with <code>may_view_fees</code></td></tr>
+  <tr><td class="method">POST GET</td><td><code>/tuition/students/invoices/{invoice_id}/intents</code></td><td>Tuition student, on a tuition invoice</td></tr>
+  <tr><td class="method">POST GET</td><td><code>/parent/fees/tuition/children/{student_id}/invoices/{invoice_id}/intents</code></td><td>Parent, on a child's tuition invoice</td></tr>
+</table>
+</div>
+
+<p><code>method</code> is one of <code>UPI</code>, <code>CARD</code>, <code>NET_BANKING</code>,
+<code>WALLET</code> (online — handed to the gateway adapter when one is connected) or
+<code>BANK_TRANSFER</code>, <code>OFFICE</code> (offline — the intent is the reference the
+payer quotes). <code>PaymentIntentOut</code> now carries <code>requested_method</code>,
+<code>program</code>, <code>invoice_number</code> and <code>reference</code>
+(<em>"PAY-&lt;id&gt;"</em>). Render the result by status: <code>checkout_url</code> set →
+send the payer there; <code>CREATED</code> with a null URL → show <code>detail</code> and
+the reference; <code>SUCCEEDED</code> → paid. A draft, cancelled or settled invoice, or an
+amount over the outstanding balance, is a 400 with the reason. Nobody else's invoice is a
+404.</p>
+
+<p>The tuition <code>InvoiceOut</code> on the student and parent routes now carries
+<code>amount_outstanding</code>, <code>gateway_enabled</code> and
+<code>gateway_provider</code>, so the tuition checkout reads them exactly as the school's
+does. A provider callback on a tuition intent credits the tuition invoice.</p>
+
+<h2 id="database">19. Database backend — nothing changes for the frontend</h2>
+
+<p><span class="chip new">New</span> The backend can now serve the same API from Azure SQL
+instead of Firestore (<code>DATABASE_BACKEND=azuresql</code>). No endpoint, shape or id
+format changes. The one visible difference is that the Firestore free tier's daily read
+quota no longer applies, so the 503 <code>database_quota_exhausted</code> response
+disappears on that backend. <code>GET /health/database</code> reports which backend a
+deployment is on.</p>
+
+<h2 id="admission-fee">20. Admission fee once, tuition by term</h2>
+
+<p><span class="chip changed">Changed</span> <code>UserProfileFields</code> and
+<code>UserOut</code> gain <code>admission_year_id</code>: the year the student first
+joined, set on creation and left alone by promotion. A fee head marked
+<code>is_admission_charge</code> is billed in that year only, so returning students never
+see it again. Each school <code>InstalmentOut</code> now carries
+<code>components[]</code> (<code>{name, amount}</code>): recurring fees split across the
+terms by the plan, and each one-time charge as its own instalment listed first, with
+<code>term: null</code>. A new admission's schedule reads <em>Admission Fee 10,000 · Term 1
+15,000 · Term 2 15,000</em>; a returning student's has only the two terms. The user form offers
+"Admitted in year" next to the session year for students who joined before fees were on
+the system.</p>
+
+<h2 id="collect">21. Collecting fees at the counter, and term-aware plans</h2>
+
+<p><span class="chip new">New</span> <code>POST /admin/finance/students/{student_id}/collect</code>
+takes a payment against a <em>student</em>: body is a <code>PaymentRecord</code> plus
+optional <code>academic_year_id</code>. The year's invoice is built and issued if the
+student has none, then the payment is recorded; the response is the updated
+<code>FeeInvoiceOut</code>. 400 when no structure applies or the amount exceeds what is
+owed. <code>InstalmentLine</code> gains <code>term</code> (<code>TERM_1</code> /
+<code>TERM_2</code>) as an alternative to a due date or day count, and
+<code>InstalmentOut</code> carries <code>term</code>. Every school year now has a default
+"Two terms" plan, so the Instalment plans list is never empty for a year with fees.</p>
+
+<h2 id="reports">22. Fee reports — the roll, the dues, the collections</h2>
+
+<p>Three read-only reports under <code>/admin/finance/reports/</code>, all admin-only and
+all taking <code>program</code> (default <code>LMS</code>). They are computed on request
+from the invoices and the roster and never stored, so a figure here is never a different
+figure from the Invoices tab; each response's <code>summary</code> is built from exactly
+the <code>rows</code> returned, so a filter changes the totals with the list. The admin
+Fees &amp; invoices page shows them under a <strong>Reports</strong> tab with a class
+filter, a status filter on the roll, a period and method filter on collections, and a
+CSV button on each.</p>
+
+<p><span class="chip new">New</span> <code>GET /admin/finance/reports/students</code> —
+every student assigned to the year, <strong>unbilled ones included</strong>. Query:
+<code>academic_year_id</code> (defaults to the current year), <code>class_id</code>,
+<code>status</code>, <code>as_of</code>. Each row carries <code>status</code>
+(<code>NOT_BILLED</code> / <code>DRAFT</code> / <code>ISSUED</code> /
+<code>PARTIALLY_PAID</code> / <code>PAID</code> / <code>OVERDUE</code>, the last one
+derived: an unsettled invoice with an instalment past due), <code>invoice_id</code> and
+<code>invoice_number</code> when there is one, <code>total_amount</code>,
+<code>amount_paid</code>, <code>amount_outstanding</code>, <code>amount_overdue</code>,
+<code>expected_total</code> (only for unbilled students: what the current rules would
+charge them), <code>amount_due</code> (the figure to chase either way),
+<code>next_due</code> (<code>label</code>, <code>term</code>, <code>due_date</code>,
+<code>amount</code>, <code>is_overdue</code>, <code>days_overdue</code>, or null),
+<code>last_payment_at</code> / <code>last_payment_amount</code>, an <code>ageing</code>
+object and the <code>instalments</code> with what each has paid. The <code>status</code>
+filter also accepts <code>DUE</code>, meaning anything owed. <code>summary</code> counts
+students by status and totals <code>total_billed</code>, <code>total_collected</code>,
+<code>total_outstanding</code>, <code>total_overdue</code>,
+<code>expected_unbilled</code> and <code>total_due</code>.</p>
+
+<p><span class="chip new">New</span> <code>GET /admin/finance/reports/dues</code> — the
+same rows restricted to whoever owes, largest overdue balance first. <code>ageing</code>
+on each row and on the summary splits the balance into <code>not_due</code>,
+<code>d0_30</code>, <code>d31_60</code>, <code>d61_90</code> and <code>over_90</code>
+days past due, aged from each instalment's own due date; students not billed yet sit
+under <code>not_due</code> at their expected total.</p>
+
+<p><span class="chip new">New</span> <code>GET /admin/finance/reports/collections</code>
+— every payment received between <code>from_date</code> and <code>to_date</code> (both
+required, inclusive), newest first, across every year unless
+<code>academic_year_id</code> is given; optional <code>class_id</code> and
+<code>method</code>. Rows carry <code>paid_at</code>, <code>amount</code>,
+<code>currency</code>, <code>method</code>, <code>reference</code>, <code>note</code>,
+<code>instalment_label</code>, the invoice and student identifiers,
+<code>class_name</code> and <code>recorded_by_name</code>. <code>summary</code> gives
+<code>count</code>, <code>total</code>, <code>by_method</code>, <code>by_day</code> and
+<code>by_class</code>.</p>
+
+<p><span class="chip changed">Changed</span> Every payment is now <strong>split by fee
+head</strong>, by replaying the invoice's own allocation (a payment naming an instalment
+goes to it, the rest cascade oldest-first, and each instalment's amount is shared across
+its <code>components</code>). A row carries <code>heads</code>
+(<code>[{name, fee_head_id, is_admission_charge, amount}]</code>, admission first),
+<code>admission_fee_amount</code>, and <code>instalments_settled</code>, the labels a
+general payment actually cleared, to show in place of "oldest first". The summary adds
+<code>admission_fees</code>, <code>other_fees</code>, <code>by_head</code>
+(<code>[{name, fee_head_id, is_admission_charge, count, total}]</code>) and, when the new
+<code>head_id</code> query keeps only payments that settled one head, <code>head</code>
+with that head's own <code>count</code> and <code>total</code>. The CSV gains one column
+per fee head after the amount. The Reports tab shows "Admission fees" and "Tuition &amp;
+other fees" cards, a fee filter, and the split on every row.</p>
+
+<p><span class="chip new">New</span> <code>GET /admin/finance/reports/export</code> —
+the same three as CSV, <code>view=students|dues|collections</code> plus the filters
+above. The body is UTF-8 with a BOM and <code>Content-Disposition</code> names the file,
+so the frontend saves it exactly as the tuition billing export does. 400 when the view
+is unknown or a collections export lacks its dates.</p>
+
+<p><span class="chip new">New</span> <strong>Opening-balance receipts.</strong> The
+students already on the roll paid their admission fee before this system existed, and an
+invoice cannot hold that (one invoice per student per year: a "paid admission" invoice
+for 2025-26 would be the year's bill). So money with no invoice is a <em>receipt</em>:
+<code>POST /admin/finance/receipts</code> with <code>student_id</code>,
+<code>fee_head_id</code>, <code>amount</code>, <code>paid_at</code>, <code>method</code>,
+optional <code>reference</code>, <code>note</code> and <code>academic_year_id</code>
+(defaults to the student's admission year); <code>GET /admin/finance/receipts</code>
+lists them (<code>student_id</code>, <code>academic_year_id</code>,
+<code>fee_head_id</code> filters) and <code>DELETE /admin/finance/receipts/{id}</code>
+erases one. Collections rows now carry <code>source</code> (<code>INVOICE</code> or
+<code>OPENING_BALANCE</code>) and <code>receipt_id</code>; a receipt row has no
+<code>invoice_id</code>, its <code>heads</code> is the one head, and it counts in
+<code>admission_fees</code> like any other. The Reports tab has a "Record past payment"
+button for one-offs; the bulk backfill for existing students is a backend script. A
+receipt never changes what a student owes.</p>
+
+<p>One caveat for anyone timing this: the first request after the API restarts fills the
+document cache from the database and can take several seconds. Later requests take well
+under a second, and any payment or invoice change invalidates the reports along with the
+invoices in the frontend's query cache.</p>
+
+<p style="margin-top:40px;color:var(--ink-soft);font-size:0.9rem">
+Questions on any shape here: the live schema at <code>/api/v1/openapi.json</code> is
+authoritative, and every endpoint carries a docstring explaining why it behaves as it does.
+</p>
+
+</div>

@@ -12,29 +12,35 @@ which is what the brief asks for: the same admin, with a separate set of options
 
 import logging
 from datetime import date, datetime
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from app.api.v1.dependencies import require_admin
 from app.core.enums import (
-    Program, TEACHING_ROLE_VALUES, UserRole, normalize_programs,
+    CONDUCTED_SESSION_VALUES, AcademicTerm, Program, TEACHING_ROLE_VALUES,
+    TuitionEnrollmentStatus, UserRole, normalize_programs,
 )
 from app.core.firebase import (
     firestore_tuition_enrollments, firestore_tuition_sessions, firestore_tuition_slots,
     firestore_users, require_document,
 )
 from app.schemas.tuition import (
-    FeePlanCreate, FeePlanOut, FeePlanUpdate, InvoiceBatchGenerate, InvoiceGenerate,
-    InvoiceOut, MeetingLinkUpdate, PaymentRecord, ProgramAccessUpdate, ProgramSettingsUpdate,
+    InvoiceBatchGenerate, InvoiceGenerate,
+    InvoiceOut, MeetingLinkUpdate, PackageAssignmentCreate, PackageAssignmentOut,
+    PackageStatusOut, PaymentRecord, ProgramAccessUpdate, ProgramSettingsUpdate,
     ProgrammeReport, SlotAvailabilityQuery, SlotAvailabilityResult, StudentAttendanceReport,
     TeacherAttendanceReport, TuitionEnrollmentCreate, TuitionEnrollmentOut,
     TuitionEnrollmentUpdate, TuitionSessionCancel, TuitionSessionCreate, TuitionSessionOut,
     TuitionSessionReschedule, TuitionSlotCreate, TuitionSlotOut, TuitionSlotUpdate,
+    StudentSubjectAdd, StudentSubjectOut,
     TuitionStudentCreate, TuitionTeacherCreate, TuitionUserSummary,
+    TuitionFeeBreakdownOut, TuitionPackageCreate, TuitionPackageOut, TuitionPackageUpdate,
 )
 from app.schemas.user import UserOut
 from app.services import accounts as account_service
+from app.services import admissions as admission_service
+from app.services import families as family_service
 from app.services.tuition import (
     enrollments as enrollment_service,
     exports as export_service,
@@ -97,7 +103,7 @@ def update_program_settings(
 @router.post("/students", response_model=TuitionUserSummary,
              status_code=status.HTTP_201_CREATED)
 def add_tuition_student(payload: TuitionStudentCreate,
-                        _: UserOut = Depends(require_admin)):
+                        admin: UserOut = Depends(require_admin)):
     """
     [Admin Only] Add a **new student** to the tuition programme.
 
@@ -114,9 +120,25 @@ def add_tuition_student(payload: TuitionStudentCreate,
     - `timezone` may be omitted: it is detected from the student's browser on their first
       request and saved, which is what makes a student outside India see their own local time.
 
+    - `academic_year_id` may be omitted: the student is admitted into the current **tuition**
+      year (`/admin/tuition/admissions/years`), never the school's. Nothing is defaulted
+      when no tuition year has been created yet.
+    - `admission_category_id` must be a tuition category when given.
+
     To attach subjects and teachers afterwards, create enrollments.
     """
+    admission_service.assert_admission_fields(
+        payload.academic_year_id, payload.admission_category_id
+    )
+    if payload.academic_year_id is None:
+        current = admission_service.current_year(Program.TUITION.value)
+        if current:
+            payload.academic_year_id = int(current["id"])
+
     account = account_service.create_tuition_account(payload, UserRole.STUDENT)
+    # Siblings share a guardian; a new student whose guardian is already on file joins that
+    # household now. Tuition and school students map into the same households.
+    family_service.auto_place(account["id"], admin.id)
     return TuitionUserSummary(**account)
 
 
@@ -144,6 +166,12 @@ def list_tuition_users(
     include_all: bool = Query(
         False, description="Include accounts without tuition access, for granting it"
     ),
+    academic_year_id: Optional[int] = Query(
+        None, description="Students admitted into this tuition year"
+    ),
+    admission_category_id: Optional[int] = Query(
+        None, description="Students admitted under this category"
+    ),
     _: UserOut = Depends(require_admin),
 ):
     """
@@ -151,6 +179,9 @@ def list_tuition_users(
 
     `include_all=true` is how an admin finds an existing school account to grant tuition
     access to, rather than creating a duplicate person with a second login.
+
+    `academic_year_id` and `admission_category_id` narrow to one batch or one basis of
+    admission - the ids come from `/admin/tuition/admissions`.
     """
     people = []
     for user in firestore_users.list_all():
@@ -161,6 +192,10 @@ def list_tuition_users(
             wanted = TEACHING_ROLE_VALUES if role in TEACHING_ROLE_VALUES else {role.value}
             if user.get("role") not in wanted:
                 continue
+        if academic_year_id is not None                 and str(user.get("academic_year_id")) != str(academic_year_id):
+            continue
+        if admission_category_id is not None                 and str(user.get("admission_category_id")) != str(admission_category_id):
+            continue
         people.append({**user, "programs": programs})
 
     people.sort(key=lambda u: str(u.get("full_name") or ""))
@@ -573,45 +608,194 @@ def teacher_attendance_report(
 
 # =======================================================================================
 # Fees - admin only, and on no other router
+#
+# The fee is a package, not a rate per subject: "30 classes for 15,000", spent on whichever
+# subjects the student takes. A package is assigned to a student for a term (the year runs
+# April-March in two terms), and every invoice counts the classes taken against it.
 # =======================================================================================
 
-@router.post("/fee-plans", response_model=FeePlanOut, status_code=status.HTTP_201_CREATED)
-def create_fee_plan(payload: FeePlanCreate, current_user: UserOut = Depends(require_admin)):
+@router.post("/packages", response_model=TuitionPackageOut, status_code=status.HTTP_201_CREATED)
+def create_package(payload: TuitionPackageCreate, current_user: UserOut = Depends(require_admin)):
     """
-    [Admin Only] What a class costs.
+    [Admin Only] Create a package: so many classes for so much, on any subjects.
 
-    Plans resolve most-specific-first: an enrollment's own plan, then a plan for that
-    subject, then a plan with no subject at all as the programme default. That ordering lets
-    a programme set one rate and override it for the one student who negotiated a different
-    one, without a plan per enrollment.
+    `amount` and `classes_included` are what an admin types; `per_class_amount` is derived
+    from them and is the rate every class is priced at. `billing_mode` decides *when* the
+    money is asked for - PER_CLASS bills the classes attended each period, PACKAGE bills the
+    whole amount once per term and then only classes beyond the allowance.
+
+    Scope with `academic_year_id` and `term` for a term-specific offer, or leave both null
+    for a standing one. The year must include TUITION in its programs.
     """
-    return FeePlanOut(**fee_service.create_plan(payload, current_user))
+    return TuitionPackageOut(**fee_service.present_package(
+        fee_service.create_package(payload, current_user)
+    ))
 
 
-@router.get("/fee-plans", response_model=List[FeePlanOut])
-def list_fee_plans(_: UserOut = Depends(require_admin)):
-    from app.core.firebase import firestore_tuition_fee_plans
-    return [FeePlanOut(**p) for p in firestore_tuition_fee_plans.list_all()]
-
-
-@router.put("/fee-plans/{plan_id}", response_model=FeePlanOut)
-def update_fee_plan(plan_id: int, payload: FeePlanUpdate, _: UserOut = Depends(require_admin)):
-    plan = fee_service.require_plan(plan_id)
-    return FeePlanOut(**fee_service.update_plan(plan, payload))
-
-
-@router.delete("/fee-plans/{plan_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_fee_plan(plan_id: int, _: UserOut = Depends(require_admin)):
+@router.get("/packages", response_model=List[TuitionPackageOut])
+def list_packages(
+    academic_year_id: Optional[int] = Query(
+        None, description="Packages offered in this year, standing ones included."
+    ),
+    term: Optional[AcademicTerm] = Query(
+        None, description="Packages offered in this term, unscoped ones included."
+    ),
+    include_inactive: bool = Query(True),
+    _: UserOut = Depends(require_admin),
+):
     """
-    [Admin Only] Remove a fee plan.
+    [Admin Only] Packages on offer, with how many students are on each.
 
-    Invoices already generated keep the figures they were built with, because the price is
-    copied onto the invoice line rather than looked up when the bill is read. Deleting a plan
-    changes what future classes cost, never what a student has already been billed.
+    A package with no year or term appears in every year's and every term's list, because
+    that is what an unscoped package is: the offer that stands unless a narrower one is
+    made.
     """
-    from app.core.firebase import firestore_tuition_fee_plans
-    fee_service.require_plan(plan_id)
-    firestore_tuition_fee_plans.delete_document(str(plan_id))
+    return [
+        TuitionPackageOut(**fee_service.present_package(p))
+        for p in fee_service.list_packages(
+            academic_year_id, term.value if term else None, include_inactive
+        )
+    ]
+
+
+@router.get("/packages/{package_id}", response_model=TuitionPackageOut)
+def get_package(package_id: int, _: UserOut = Depends(require_admin)):
+    return TuitionPackageOut(**fee_service.present_package(fee_service.require_package(package_id)))
+
+
+@router.put("/packages/{package_id}", response_model=TuitionPackageOut)
+def update_package(package_id: int, payload: TuitionPackageUpdate,
+                   _: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Update a package. Partial: omitted fields are left unchanged.
+
+    Changing the price or the class count affects **draft** invoices on their next
+    regeneration only. Issued invoices keep the figures they were issued with. To price a
+    new term differently, create a package scoped to that term rather than editing this one,
+    so last term's invoices stay explicable against what they were built from.
+    """
+    package = fee_service.require_package(package_id)
+    return TuitionPackageOut(**fee_service.present_package(
+        fee_service.update_package(package, payload)
+    ))
+
+
+@router.delete("/packages/{package_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_package(package_id: int, _: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Remove a package nobody is on.
+
+    409 while students are assigned to it - they would silently drop to "no package" and
+    their next bill would price every class at zero. Mark it inactive instead, or reassign
+    them first. Invoices already generated keep their figures either way.
+    """
+    fee_service.delete_package(fee_service.require_package(package_id))
+
+
+@router.get("/packages/{package_id}/students", response_model=List[PackageAssignmentOut])
+def package_students(package_id: int, include_ended: bool = Query(False),
+                     _: UserOut = Depends(require_admin)):
+    """[Admin Only] Who is on a package, current assignments first."""
+    from app.core.firebase import firestore_tuition_package_assignments
+
+    fee_service.require_package(package_id)
+    rows = firestore_tuition_package_assignments.query_documents("package_id", "==", package_id)
+    if not include_ended:
+        rows = [a for a in rows if a.get("is_active", True)]
+    rows.sort(key=lambda a: (not a.get("is_active", True), str(a.get("starts_on") or "")))
+    return [PackageAssignmentOut(**fee_service.present_assignment(a)) for a in rows]
+
+
+@router.get("/students/{student_id}/package", response_model=PackageStatusOut)
+def student_package(
+    student_id: int,
+    on: Optional[date] = Query(None, description="As of this date. Defaults to today."),
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Where a student stands on their package: what they are on, and how many
+    of its classes they have used this term.
+
+    `assignment` and `package` are null when nothing is assigned. That is the normal state
+    of a student admitted this morning, so it is a 200 with nulls rather than a 404.
+    """
+    enrollment_service.require_tuition_user(student_id, UserRole.STUDENT.value, "Student")
+    return PackageStatusOut(**fee_service.package_status(student_id, on))
+
+
+@router.put("/students/{student_id}/package", response_model=PackageAssignmentOut,
+            status_code=status.HTTP_201_CREATED)
+def assign_student_package(
+    student_id: int, payload: PackageAssignmentCreate,
+    current_user: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Put a student on a package for a term.
+
+    Only `package_id` is required. The year and term default from the package's own scope,
+    else from the calendar - a package assigned today lands in the term today falls in - and
+    the assignment's dates default to that term's. Assigning again for the same year and
+    term replaces the earlier assignment; a new term needs a new assignment, which is what
+    starts a fresh allowance.
+    """
+    return PackageAssignmentOut(**fee_service.present_assignment(
+        fee_service.assign_package(student_id, payload, current_user)
+    ))
+
+
+@router.get("/students/{student_id}/packages", response_model=List[PackageAssignmentOut])
+def student_package_history(student_id: int, include_ended: bool = Query(True),
+                            _: UserOut = Depends(require_admin)):
+    """[Admin Only] Every package a student has been on, newest first."""
+    enrollment_service.require_tuition_user(student_id, UserRole.STUDENT.value, "Student")
+    rows = fee_service.assignments_for_student(student_id, include_inactive=include_ended)
+    return [PackageAssignmentOut(**fee_service.present_assignment(a)) for a in rows]
+
+
+@router.delete("/students/{student_id}/packages/{assignment_id}",
+               response_model=PackageAssignmentOut)
+def end_student_package(student_id: int, assignment_id: int,
+                        current_user: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Take a student off a package.
+
+    Ended rather than deleted, so an invoice already raised against it still reads back to
+    the package that priced it. The student is unpriced from here until another package is
+    assigned.
+    """
+    assignment = fee_service.require_assignment(assignment_id)
+    if int(assignment.get("student_id") or -1) != int(student_id):
+        raise HTTPException(status_code=404, detail=f"Package assignment {assignment_id} not found")
+    return PackageAssignmentOut(**fee_service.present_assignment(
+        fee_service.end_assignment(assignment, current_user)
+    ))
+
+
+@router.get("/students/{student_id}/fee-breakdown", response_model=TuitionFeeBreakdownOut)
+def preview_tuition_fees(
+    student_id: int,
+    period_start: date = Query(...),
+    period_end: date = Query(...),
+    currency: Optional[str] = Query(
+        None, description="Preview in this currency. Defaults to the base currency."
+    ),
+    discount_amount: float = Query(
+        0.0, ge=0, description="Manual adjustment for the period, in the base currency."
+    ),
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Tuition Admin] What this student would be billed for a period, without billing them.
+
+    The same computation the student's fee page and the invoice generator use, so the preview
+    is the bill. Shows the classes counted against the package - and which subjects they came
+    from - where the student stands on the allowance, then the discount, tax and convenience
+    charge that produce the total, all at the chosen currency's own rates.
+    """
+    return TuitionFeeBreakdownOut(**fee_service.compute_breakdown(
+        student_id, period_start, period_end,
+        currency=currency, discount_amount=discount_amount,
+    ))
 
 
 @router.post("/invoices/generate", response_model=InvoiceOut,
@@ -620,14 +804,16 @@ def generate_invoice(payload: InvoiceGenerate, current_user: UserOut = Depends(r
     """
     [Admin Only] Build a student's bill for a period from their conducted classes.
 
-    Derived, not typed in: the session counts price the lines, and both the count and the
-    rate are stored on each line so the bill can always be read back as "eight physics
-    classes at 120". Re-running on a draft corrects it; an invoice already issued is refused,
-    because a bill that silently restates itself after it was sent is not a bill.
+    Derived, not typed in: the classes taken in the period are counted against the student's
+    package, and the count, the per-class rate and the per-subject breakdown are all stored
+    on the line so the bill can always be read back as "14 classes at 500 - 6 English, 5
+    Maths, 3 Science". Re-running on a draft corrects it; an invoice already issued is
+    refused, because a bill that silently restates itself after it was sent is not a bill.
     """
     return InvoiceOut(**fee_service.generate_invoice(
         payload.student_id, payload.period_start, payload.period_end, current_user,
         payload.discount_amount, payload.tax_amount, payload.due_date, payload.notes,
+        currency=payload.currency,
     ))
 
 
@@ -808,10 +994,23 @@ def invoice_detail(invoice_id: str, current_user: UserOut = Depends(require_admi
 
     lines = []
     for line in invoice.get("line_items") or []:
-        rows = by_enrollment.get(str(line.get("enrollment_id")), [])
+        # The package line carries its subjects; each subject gets the classes behind its
+        # count, and the line gets all of them. An invoice from before packages had one line
+        # per enrollment, which the same lookup still serves.
+        subjects = []
+        for subject in line.get("subjects") or []:
+            rows = by_enrollment.get(str(subject.get("enrollment_id")), [])
+            subjects.append({
+                **subject,
+                "sessions": session_service.present_many(rows, current_user),
+            })
+        own = by_enrollment.get(str(line.get("enrollment_id")), []) if line.get("enrollment_id") else []
+        all_rows = own + [r for sub in (line.get("subjects") or [])
+                          for r in by_enrollment.get(str(sub.get("enrollment_id")), [])]
         lines.append({
             **line,
-            "sessions": session_service.present_many(rows, current_user),
+            "subjects": subjects,
+            "sessions": session_service.present_many(all_rows, current_user),
         })
 
     total = float(invoice.get("total_amount") or 0)
@@ -978,3 +1177,173 @@ def run_maintenance_now(_: UserOut = Depends(require_admin)):
     reasonably wants them done first.
     """
     return reminder_service.maintenance_pass()
+
+
+# ---------------------------------------------------------------------------------------
+# A student's subjects
+#
+# The same records as `/enrollments`, presented the way the office actually thinks about
+# them: "which subjects does Priya take, and add Chemistry". An enrollment is a (student,
+# subject, teacher) triple, so adding a subject *is* creating an enrollment - but asking an
+# administrator to reach that through a generic enrollment form means they have to already
+# know that, and it is the one screen that gets used daily.
+# ---------------------------------------------------------------------------------------
+
+@router.get("/students/{student_id}/subjects", response_model=List[StudentSubjectOut])
+def list_student_subjects(
+    student_id: int,
+    include_inactive: bool = Query(
+        False, description="Include paused, completed and cancelled subjects."
+    ),
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Tuition Admin] Every subject a student takes, with its teacher and class count.
+
+    The subject-list view of `/enrollments`. Ordered by subject name so the screen is stable
+    between reloads rather than following whatever order Firestore returned.
+    """
+    student = enrollment_service.require_tuition_user(
+        student_id, UserRole.STUDENT.value, "Student"
+    )
+    records = enrollment_service.for_student(student_id, include_inactive=include_inactive)
+
+    rows = []
+    for record in enrollment_service.hydrate_many(records):
+        sessions = firestore_tuition_sessions.query_documents(
+            "enrollment_id", "==", record["id"]
+        )
+        conducted = [s for s in sessions if s.get("status") in CONDUCTED_SESSION_VALUES]
+        rows.append({
+            "enrollment_id": record["id"],
+            "student_id": student_id,
+            "student_name": student.get("full_name"),
+            "subject_id": record.get("subject_id"),
+            "subject_name": (record.get("subject") or {}).get("name"),
+            "subject_code": (record.get("subject") or {}).get("code"),
+            "teacher_id": record.get("teacher_id"),
+            "teacher_name": (record.get("teacher") or {}).get("full_name"),
+            "status": record.get("status"),
+            "syllabus": record.get("syllabus"),
+            "grade_level": record.get("grade_level"),
+            "start_date": record.get("start_date"),
+            "end_date": record.get("end_date"),
+            "session_count": len(sessions),
+            "conducted_count": len(conducted),
+        })
+
+    rows.sort(key=lambda r: str(r["subject_name"] or ""))
+    return [StudentSubjectOut(**r) for r in rows]
+
+
+@router.post("/students/{student_id}/subjects", response_model=StudentSubjectOut,
+             status_code=status.HTTP_201_CREATED)
+def add_student_subject(
+    student_id: int, payload: StudentSubjectAdd,
+    admin: UserOut = Depends(require_admin),
+):
+    """
+    [Tuition Admin] Add a subject for a student, naming the teacher who will take it.
+
+    Creates the enrollment. Refused with 409 if the student already has an active teacher for
+    that subject - one subject has one teacher, and a second active arrangement would give
+    two answers to "who teaches this?". Change the existing enrollment's teacher, or end it
+    first.
+
+    Adding a subject does not schedule anything: create slots under `/slots` afterwards, or
+    the student is enrolled with no classes.
+    """
+    enrollment = enrollment_service.create_enrollment(
+        TuitionEnrollmentCreate(
+            student_id=student_id,
+            subject_id=payload.subject_id,
+            teacher_id=payload.teacher_id,
+            syllabus=payload.syllabus,
+            grade_level=payload.grade_level,
+            default_duration_minutes=payload.default_duration_minutes,
+            start_date=payload.start_date,
+            notes=payload.notes,
+        ),
+        admin,
+    )
+    hydrated = enrollment_service.hydrate_many([enrollment])[0]
+    return StudentSubjectOut(
+        enrollment_id=hydrated["id"],
+        student_id=student_id,
+        student_name=(hydrated.get("student") or {}).get("full_name"),
+        subject_id=hydrated.get("subject_id"),
+        subject_name=(hydrated.get("subject") or {}).get("name"),
+        subject_code=(hydrated.get("subject") or {}).get("code"),
+        teacher_id=hydrated.get("teacher_id"),
+        teacher_name=(hydrated.get("teacher") or {}).get("full_name"),
+        status=hydrated.get("status"),
+        syllabus=hydrated.get("syllabus"),
+        grade_level=hydrated.get("grade_level"),
+        start_date=hydrated.get("start_date"),
+        end_date=hydrated.get("end_date"),
+        session_count=0,
+        conducted_count=0,
+    )
+
+
+@router.delete("/students/{student_id}/subjects/{subject_id}", response_model=StudentSubjectOut)
+def remove_student_subject(
+    student_id: int, subject_id: int,
+    hard_delete: bool = Query(
+        False,
+        description="Delete the enrollment and its classes outright. Off by default.",
+    ),
+    admin: UserOut = Depends(require_admin),
+):
+    """
+    [Tuition Admin] Stop a student taking a subject.
+
+    Cancels the enrollment by default, which keeps the history, the marks and the invoices
+    that refer to it. That is almost always what is wanted: a student who drops chemistry in
+    March still attended chemistry in February, and a fee report that lost those classes is
+    wrong.
+
+    `hard_delete=true` removes the enrollment and its scheduled classes for good. Use it for
+    a mistake - a subject added to the wrong student - not for a student who left.
+    """
+    enrollment_service.require_tuition_user(student_id, UserRole.STUDENT.value, "Student")
+
+    active = enrollment_service.existing_active(student_id, subject_id)
+    if not active:
+        raise HTTPException(
+            status_code=404,
+            detail="This student has no active enrollment for that subject.",
+        )
+
+    if hard_delete:
+        removed = enrollment_service.delete_enrollment(active["id"])
+        return StudentSubjectOut(
+            enrollment_id=active["id"],
+            student_id=student_id,
+            subject_id=subject_id,
+            status="DELETED",
+            session_count=removed.get("sessions", 0),
+            conducted_count=0,
+        )
+
+    updated = enrollment_service.apply_update(
+        active,
+        TuitionEnrollmentUpdate(status=TuitionEnrollmentStatus.CANCELLED),
+        admin,
+    )
+    hydrated = enrollment_service.hydrate_many([updated])[0]
+    return StudentSubjectOut(
+        enrollment_id=hydrated["id"],
+        student_id=student_id,
+        student_name=(hydrated.get("student") or {}).get("full_name"),
+        subject_id=hydrated.get("subject_id"),
+        subject_name=(hydrated.get("subject") or {}).get("name"),
+        subject_code=(hydrated.get("subject") or {}).get("code"),
+        teacher_id=hydrated.get("teacher_id"),
+        teacher_name=(hydrated.get("teacher") or {}).get("full_name"),
+        status=hydrated.get("status"),
+        syllabus=hydrated.get("syllabus"),
+        grade_level=hydrated.get("grade_level"),
+        start_date=hydrated.get("start_date"),
+        end_date=hydrated.get("end_date"),
+    )

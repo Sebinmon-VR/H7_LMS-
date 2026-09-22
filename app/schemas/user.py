@@ -49,6 +49,35 @@ class UserProfileFields(BaseModel):
     guardian_email: str | None = Field(None, max_length=320)
     guardian_relation: str | None = Field(None, max_length=50, description="e.g. Father, Mother")
 
+    # Which intake this student belongs to. Both are ids into `academic_years` and
+    # `admission_categories`, validated against the database rather than here because both
+    # are optional - a school that has not set admissions up must still be able to enroll.
+    academic_year_id: int | None = Field(
+        None, description="Session year admitted into. Defaults to the current year."
+    )
+    admission_category_id: int | None = Field(
+        None, description="Basis of admission; carries any standing concession."
+    )
+    # The year the student FIRST joined. Set on admission and never moved by a promotion,
+    # unlike `academic_year_id`, which follows them up the school. It is what decides whether
+    # a one-time admission charge belongs on a given year's bill: only the bill for this
+    # year carries it, and a student promoted into next year is not a new admission there.
+    admission_year_id: int | None = Field(
+        None, description="The year the student was first admitted in. Defaults to the year "
+                          "they are created into and stays put when they are promoted.",
+    )
+
+    # What the student is studying, for the syllabus-scoped library and the timetable.
+    # Free text rather than an id: schools name these inconsistently (CBSE, ICSE, 'State
+    # Board Plus Two') and a reference table nobody maintains is worse than a label.
+    syllabus: str | None = Field(
+        None, max_length=100, description="e.g. CBSE, ICSE, IGCSE, State Board"
+    )
+    academic_stream: str | None = Field(
+        None, max_length=100, description="e.g. Science, Commerce, Humanities"
+    )
+    medium: str | None = Field(None, max_length=50, description="Language of instruction")
+
     # Teacher and staff detail.
     employee_id: str | None = Field(None, max_length=50, description="Unique per school")
     designation: str | None = Field(None, max_length=100)
@@ -211,6 +240,13 @@ class UserOut(BaseModel):
     guardian_phone: str | None = None
     guardian_email: str | None = None
     guardian_relation: str | None = None
+
+    academic_year_id: int | None = None
+    admission_category_id: int | None = None
+    admission_year_id: int | None = None
+    syllabus: str | None = None
+    academic_stream: str | None = None
+    medium: str | None = None
 
     employee_id: str | None = None
     designation: str | None = None

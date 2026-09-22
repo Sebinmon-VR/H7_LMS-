@@ -13,20 +13,26 @@ convenience of a shared endpoint.
 
 import logging
 from datetime import date
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.v1.dependencies import require_tuition_student
+from app.core.enums import InvoiceStatus, Program
 from app.schemas.exam import ExamOut
+from app.schemas.finance import PaymentIntentCreate, PaymentIntentOut
 from app.schemas.tuition import (
-    StudentAttendanceReport, TuitionEnrollmentOut, TuitionSessionOut, TuitionSlotOut,
+    InvoiceOut, PackageStatusOut, StudentAttendanceReport, TuitionEnrollmentOut,
+    TuitionSessionOut, TuitionSlotOut,
+    TuitionFeeBreakdownOut,
 )
 from app.schemas.user import UserOut
+from app.services import billing
 from app.services.exams import hydrate_exam_for_student, prefetch_exams
 from app.services.tuition import (
     assessments as assessment_service,
     enrollments as enrollment_service,
+    fees as fee_service,
     reports as report_service,
     scheduling as schedule_service,
     sessions as session_service,
@@ -201,3 +207,146 @@ def my_attendance_report(
     missed does not count against me. Defaults to the last 30 days.
     """
     return report_service.student_report(current_user.id, from_date, to_date)
+
+
+# =======================================================================================
+# My fees
+#
+# The billing engine itself is admin-only and stays that way: generating, issuing, pricing
+# and recording payment are the office's job. What was missing was the other half - a
+# student could be billed and had no way to see it, which is the one thing every family
+# asks for first.
+#
+# Both endpoints below are scoped to the caller and take no student id. There is nothing to
+# tamper with: the invoice is looked up and then checked against `current_user.id`, so a
+# guessed id answers 404 rather than somebody else's bill.
+# =======================================================================================
+
+@router.get("/package/me", response_model=PackageStatusOut)
+def my_package(
+    on: Optional[date] = Query(None, description="As of this date. Defaults to today."),
+    current_user: UserOut = Depends(require_tuition_student),
+):
+    """
+    [Tuition Student] The package I am on, and how many of its classes I have used this term.
+
+    The header of the fee page: "Standard - 30 classes: 14 used, 16 remaining". Nulls, not
+    an error, when nothing has been assigned yet.
+    """
+    return PackageStatusOut(**fee_service.package_status(current_user.id, on))
+
+
+@router.get("/fees/me", response_model=TuitionFeeBreakdownOut)
+def my_tuition_fees(
+    period_start: date = Query(..., description="First day of the billing period."),
+    period_end: date = Query(..., description="Last day of the billing period."),
+    currency: Optional[str] = Query(
+        None, description="Show in this currency, e.g. AED. Defaults to the base currency."
+    ),
+    current_user: UserOut = Depends(require_tuition_student),
+):
+    """
+    [Tuition Student] **The payment page.** What I owe for a period, fully derived.
+
+    Every line carries the classes it was priced from - "eight physics classes at 120" -
+    followed by the discount, the tax and the convenience charge, and the total those add up
+    to. The same computation the office's preview and the invoice generator use, so this
+    cannot disagree with the bill that follows.
+
+    Pass `currency` to switch; `available_currencies` is what the switcher should offer.
+    Switching is more than a conversion - each currency carries its own tax and convenience
+    charge, so the total moves by more than the exchange rate. `exchange_rate` and
+    `base_currency` are returned so the page can show the conversion rather than leaving a
+    payer wondering why the number changed.
+
+    Nothing here is owed yet: it is what the period has accrued. The bill is the invoice.
+    """
+    return TuitionFeeBreakdownOut(**fee_service.compute_breakdown(
+        current_user.id, period_start, period_end, currency=currency
+    ))
+
+
+@router.get("/invoices", response_model=List[InvoiceOut])
+def my_invoices(
+    status: str | None = Query(None, description="DRAFT, ISSUED, PARTIALLY_PAID, PAID, CANCELLED"),
+    current_user: UserOut = Depends(require_tuition_student),
+):
+    """
+    [Tuition Student] My tuition invoices, newest period first.
+
+    Drafts are EXCLUDED. A draft is the office's working copy - it is re-priced every time
+    it is regenerated and nothing on it is owed yet, so showing one to a student invites them
+    to pay a figure that may still change. They appear the moment they are issued.
+    """
+    invoices = [
+        invoice for invoice in fee_service.list_invoices(student_id=current_user.id, status=status)
+        if invoice.get("status") != InvoiceStatus.DRAFT.value
+    ]
+    invoices.sort(key=lambda i: str(i.get("period_start") or ""), reverse=True)
+    return [InvoiceOut(**fee_service.present_invoice(invoice)) for invoice in invoices]
+
+
+@router.get("/invoices/{invoice_id}", response_model=InvoiceOut)
+def my_invoice(invoice_id: str, current_user: UserOut = Depends(require_tuition_student)):
+    """
+    [Tuition Student] One of my invoices, with its lines and payments.
+
+    404 rather than 403 when it belongs to somebody else: a 403 confirms the invoice exists,
+    which is more than a student needs to learn from guessing at ids.
+    """
+    invoice = fee_service.require_invoice(invoice_id)
+    if int(invoice.get("student_id") or 0) != int(current_user.id):
+        raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
+    if invoice.get("status") == InvoiceStatus.DRAFT.value:
+        raise HTTPException(
+            status_code=404,
+            detail="That invoice has not been issued yet.",
+        )
+    return InvoiceOut(**fee_service.present_invoice(invoice))
+
+
+# ---------------------------------------------------------------------------------------
+# The checkout
+#
+# The same intent record the school's biller uses, on the tuition invoice. The student can
+# only reach an invoice of their own - a 404, not a 403, for anybody else's - and the intent
+# carries `program: TUITION` so a provider callback credits the right collection.
+# ---------------------------------------------------------------------------------------
+
+def _my_issued_invoice(invoice_id: str, student_id: int) -> dict:
+    invoice = fee_service.require_invoice(invoice_id)
+    if int(invoice.get("student_id") or 0) != int(student_id):
+        raise HTTPException(status_code=404, detail=f"Invoice {invoice_id} not found")
+    if invoice.get("status") == InvoiceStatus.DRAFT.value:
+        raise HTTPException(status_code=404, detail="That invoice has not been issued yet.")
+    return invoice
+
+
+@router.post("/invoices/{invoice_id}/intents", response_model=PaymentIntentOut,
+             status_code=201)
+def start_my_payment(
+    invoice_id: str, payload: PaymentIntentCreate,
+    current_user: UserOut = Depends(require_tuition_student),
+):
+    """
+    [Tuition Student] Start paying one of my invoices - the checkout page's "Pay" button.
+
+    `method` is what I chose. For UPI, card, net banking or a wallet the intent waits for a
+    gateway adapter and `checkout_url` says where to go (null while no provider is
+    connected, with `detail` saying so). For a bank transfer or a payment at the office the
+    response is the `reference` to quote; the office records the money and the invoice
+    updates. Refused for more than is outstanding, and for a settled or cancelled invoice.
+    """
+    invoice = _my_issued_invoice(invoice_id, current_user.id)
+    intent = billing.create_intent(
+        invoice, payload.amount, current_user.id, None, Program.TUITION.value,
+        getattr(payload.method, "value", payload.method),
+    )
+    return PaymentIntentOut(**intent)
+
+
+@router.get("/invoices/{invoice_id}/intents", response_model=List[PaymentIntentOut])
+def my_payment_attempts(invoice_id: str, current_user: UserOut = Depends(require_tuition_student)):
+    """[Tuition Student] Every payment I have started on this invoice, newest first."""
+    _my_issued_invoice(invoice_id, current_user.id)
+    return [PaymentIntentOut(**i) for i in billing.intents_for_invoice(invoice_id)]

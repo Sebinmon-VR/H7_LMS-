@@ -191,10 +191,14 @@ def register_download(item_id: int, current_user: UserOut = Depends(require_tuit
 
     The count is a popularity signal for the library view, not an audit trail - the file is
     served from storage directly, so this records intent to open rather than proof of it.
+
+    403 for a student when downloads have been disabled in settings. That is the enforceable
+    half of read-only mode: hiding the button is a courtesy, refusing here is the rule.
     """
     item = library_service.require_item(item_id)
     if not library_service.may_view_item(item, current_user):
         raise HTTPException(status_code=404, detail="Library item not found")
+    library_service.assert_downloads_allowed(current_user)
     updated = library_service.record_download(item)
     return LibraryItemOut(**library_service.hydrate_many([updated])[0])
 
@@ -254,6 +258,17 @@ def my_tuition_profile(current_user: UserOut = Depends(require_tuition_user)):
         "default_session_minutes": programme["default_session_minutes"],
         "reminder_minutes_before": programme["reminder_minutes_before"],
         "server_timezone": str(program_timezone()),
+        # Library policy, so a student's client can hide the upload and download
+        # controls instead of offering buttons that answer 403.
+        #
+        # These live on the settings store, which only an admin may read - so
+        # without them here a student has no way to learn the library is
+        # read-only until they have already tried to use it. The flags say what
+        # is allowed, never what is enforced: `assert_uploads_allowed` and
+        # `assert_downloads_allowed` remain the only gate.
+        "student_library_uploads_enabled": programme["student_library_uploads_enabled"],
+        "student_library_downloads_enabled": programme["student_library_downloads_enabled"],
+        "library_syllabus_filter": programme["library_syllabus_filter"],
     }
 
 

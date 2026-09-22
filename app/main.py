@@ -5,10 +5,45 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from google.api_core.exceptions import GoogleAPICallError, ResourceExhausted
+
+from app.core import firebase
+from app.core.sqldb import DatabaseUnavailable
 
 from app.api.v1.auth import router as auth_router
 from app.api.v1.admin import router as admin_router
+from app.api.v1.admissions import router as admissions_router
+from app.api.v1.families import (
+    admin_router as families_admin_router,
+    parent_router as parent_router,
+)
+from app.api.v1.academics import (
+    academics_router,
+    homework_router,
+    leave_router,
+    reports_router as parent_reports_router,
+)
+from app.api.v1.classes import (
+    calendar_router,
+    extra_router as extra_classes_router,
+    router as live_classes_router,
+)
+from app.api.v1.finance import (
+    admin_router as finance_admin_router,
+    parent_router as parent_fees_router,
+    student_router as student_fees_router,
+)
+from app.api.v1.support import (
+    admin_router as support_admin_router,
+    me_router as me_router,
+    router as support_router,
+)
+from app.api.v1.notices import (
+    admin_router as notices_admin_router,
+    router as notices_router,
+)
 from app.api.v1.exams import (
     report_router as report_card_router,
     router as exam_router,
@@ -18,7 +53,12 @@ from app.api.v1.teachers import router as teacher_router
 from app.api.v1.students import router as student_router
 from app.api.v1.storage import router as storage_router
 from app.api.v1.tuition_admin import router as tuition_admin_router
+from app.api.v1.tuition_admissions import router as tuition_admissions_router
 from app.api.v1.tuition_library import router as tuition_library_router
+from app.api.v1.tuition_notices import (
+    admin_router as tuition_notices_admin_router,
+    router as tuition_notices_router,
+)
 from app.api.v1.tuition_students import router as tuition_student_router
 from app.api.v1.tuition_teachers import router as tuition_teacher_router
 from app.core.config import settings
@@ -26,6 +66,7 @@ from app.db.init_db import init_db
 from app.services.recordings import get_scheduler as get_recording_scheduler
 from app.services.reminders import get_scheduler
 from app.services.tuition.reminders import get_scheduler as get_tuition_scheduler
+from app.services.live_classes import get_scheduler as get_class_scheduler
 
 logger = logging.getLogger("lms_app")
 
@@ -40,10 +81,21 @@ async def lifespan(app: FastAPI):
     start is strictly worse off than one whose reminders are late or whose class recordings
     are filed on the next restart.
     """
+    if firebase.database_backend() == "azuresql":
+        # Tables are also created lazily on first use; doing it here makes a fresh
+        # deployment's first request fast and surfaces a bad connection string at startup.
+        try:
+            from app.core import sqldb
+
+            sqldb.prepare_schema([c.collection_name for c in firebase.all_collections()])
+            logger.info("Azure SQL backend ready: %s", sqldb.health())
+        except Exception as exc:
+            logger.warning("Azure SQL schema preparation skipped: %s", exc)
+
     try:
         init_db()
     except Exception as exc:
-        logger.warning("Initial Firestore seeding skipped: %s", exc)
+        logger.warning("Initial database seeding skipped: %s", exc)
 
     scheduler = get_scheduler()
     try:
@@ -67,7 +119,22 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Tuition scheduler could not start: %s", exc)
 
+    # School class housekeeping: opening due classes, closing ones nobody ended, and the
+    # parent digests. Like the schedulers above it is a convenience - `class_started_at`
+    # derives whether a class has begun without it, so a school whose sweep failed to start
+    # still teaches and still lets students in on time.
+    class_scheduler = get_class_scheduler()
+    try:
+        class_scheduler.start()
+    except Exception as exc:
+        logger.warning("Class maintenance scheduler could not start: %s", exc)
+
     yield
+
+    try:
+        class_scheduler.stop()
+    except Exception as exc:
+        logger.warning("Class maintenance scheduler did not stop cleanly: %s", exc)
 
     try:
         scheduler.stop()
@@ -128,6 +195,58 @@ logger.info(
 )
 
 
+# ---------------------------------------------------------------------------------------
+# When the database says no
+#
+# Every request here ends in Firestore, and Firestore fails in two ways worth telling the
+# caller apart: it is over quota, or it is unreachable. Left unhandled either surfaces as a
+# bare "Internal Server Error" with no body, which the frontend renders verbatim and the
+# person reading it takes for a bug in the app. A 503 with the reason - and, for quota, when
+# it lifts - is the same failure made actionable.
+# ---------------------------------------------------------------------------------------
+
+QUOTA_EXHAUSTED_DETAIL = (
+    "The database's daily read quota is used up, so nothing can be loaded until it resets. "
+    "On the Firebase Spark plan that is 50,000 document reads a day, resetting at midnight "
+    "Pacific time (12:30 pm IST). Upgrade the Firebase project to the Blaze plan to lift "
+    "the limit."
+)
+
+
+@app.exception_handler(ResourceExhausted)
+async def firestore_quota_exhausted(request: Request, exc: ResourceExhausted):
+    logger.error("Firestore quota exhausted on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "3600"},
+        content={"detail": QUOTA_EXHAUSTED_DETAIL, "code": "database_quota_exhausted"},
+    )
+
+
+@app.exception_handler(DatabaseUnavailable)
+async def sql_unavailable(request: Request, exc: DatabaseUnavailable):
+    logger.error("Azure SQL failed on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "30"},
+        content={"detail": f"The database is not responding. {exc}", "code": "database_unavailable"},
+    )
+
+
+@app.exception_handler(GoogleAPICallError)
+async def firestore_unavailable(request: Request, exc: GoogleAPICallError):
+    logger.error("Firestore call failed on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "30"},
+        content={
+            "detail": f"The database is not responding ({exc.__class__.__name__}). "
+                      "Try again in a moment.",
+            "code": "database_unavailable",
+        },
+    )
+
+
 @app.middleware("http")
 async def add_timing_header(request: Request, call_next):
     """
@@ -174,6 +293,31 @@ app.include_router(tuition_admin_router, prefix=settings.API_V1_STR)
 app.include_router(tuition_teacher_router, prefix=settings.API_V1_STR)
 app.include_router(tuition_student_router, prefix=settings.API_V1_STR)
 app.include_router(tuition_library_router, prefix=settings.API_V1_STR)
+app.include_router(tuition_admissions_router, prefix=settings.API_V1_STR)
+app.include_router(tuition_notices_admin_router, prefix=settings.API_V1_STR)
+app.include_router(tuition_notices_router, prefix=settings.API_V1_STR)
+
+# Shared modules. These belong to neither product: a school running both announces one set of
+# term dates, bills one household and keeps one set of session years. Each router carries its
+# own role guards, and where a record concerns one product it says so with a `program` field.
+app.include_router(admissions_router, prefix=settings.API_V1_STR)
+app.include_router(families_admin_router, prefix=settings.API_V1_STR)
+app.include_router(parent_router, prefix=settings.API_V1_STR)
+app.include_router(notices_admin_router, prefix=settings.API_V1_STR)
+app.include_router(notices_router, prefix=settings.API_V1_STR)
+app.include_router(finance_admin_router, prefix=settings.API_V1_STR)
+app.include_router(student_fees_router, prefix=settings.API_V1_STR)
+app.include_router(parent_fees_router, prefix=settings.API_V1_STR)
+app.include_router(live_classes_router, prefix=settings.API_V1_STR)
+app.include_router(extra_classes_router, prefix=settings.API_V1_STR)
+app.include_router(calendar_router, prefix=settings.API_V1_STR)
+app.include_router(homework_router, prefix=settings.API_V1_STR)
+app.include_router(leave_router, prefix=settings.API_V1_STR)
+app.include_router(academics_router, prefix=settings.API_V1_STR)
+app.include_router(parent_reports_router, prefix=settings.API_V1_STR)
+app.include_router(support_router, prefix=settings.API_V1_STR)
+app.include_router(support_admin_router, prefix=settings.API_V1_STR)
+app.include_router(me_router, prefix=settings.API_V1_STR)
 
 
 @app.get("/", tags=["Health Check"])
@@ -240,6 +384,23 @@ def firestore_health():
         "credentials_json_env_set": bool(settings.FIREBASE_CREDENTIALS_JSON),
         "service_account": client_email,
     }
+
+
+@app.get("/health/database", tags=["Health Check"])
+def database_health():
+    """
+    Which document backend is in use, and whether it answers.
+
+    `firestore` is the original; `azuresql` is the same collections as JSON-document tables
+    inside one schema of an Azure SQL database. The rest of the API cannot tell them apart,
+    which is the point - this is where somebody checks which one a deployment is on.
+    """
+    backend = firebase.database_backend()
+    if backend == "azuresql":
+        from app.core import sqldb
+
+        return {"backend": backend, **sqldb.health()}
+    return {"backend": backend, "see": "/health/firestore"}
 
 
 @app.get("/health/cache", tags=["Health Check"])

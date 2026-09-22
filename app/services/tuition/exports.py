@@ -117,9 +117,11 @@ def invoices_csv(invoices: list[dict]) -> str:
 
 INVOICE_LINE_HEADER = [
     "Invoice ID", "Student ID", "Student", "Admission Number", "Period Start", "Period End",
-    "Invoice Status", "Subject", "Teacher", "Fee Plan", "Basis", "Unit Amount", "Quantity",
-    "Unit", "Classes Conducted", "Classes Billed", "Classes Attended", "Classes Missed",
-    "Teacher No-Show", "Taught Minutes", "Currency", "Line Amount",
+    "Invoice Status", "Term", "Package", "Billing Mode", "Classes Included", "Per-Class Rate",
+    "Classes Billed (period)", "Classes Used To Date", "Classes Remaining", "Package Charge",
+    "Overage Classes", "Overage Amount", "Subject", "Teacher", "Subject Classes Counted",
+    "Classes Conducted", "Classes Attended", "Classes Missed", "Teacher No-Show",
+    "Taught Minutes", "Currency", "Line Amount",
 ]
 
 
@@ -127,24 +129,35 @@ def invoice_lines_csv(invoices: list[dict]) -> str:
     """
     One row per subject per invoice - the workings behind every total.
 
-    This is the export an accountant actually wants and the one a parent's query is answered
-    from: it says which subject, which teacher, how many classes, at what rate, and how many
-    of those classes the student actually attended.
+    The package is the line; the subjects are the rows inside it. Each row repeats the
+    package's figures beside its own subject's counts, so the file reads as "14 classes at
+    500 on the Standard package: 6 English, 5 Maths, 3 Science" without a second sheet.
+    A package line with no subjects (a flat charge in a period with no classes) still gets
+    one row, or the charge would vanish from the accountant's file.
     """
     rows = []
     for invoice in invoices:
         for line in invoice.get("line_items") or []:
-            rows.append([_cell(v) for v in [
+            package_cells = [
                 invoice.get("id"), invoice.get("student_id"), invoice.get("student_name"),
                 invoice.get("admission_number"), invoice.get("period_start"),
                 invoice.get("period_end"), invoice.get("status"),
-                line.get("subject_name"), line.get("teacher_name"), line.get("fee_plan_name"),
-                line.get("basis"), line.get("unit_amount"), line.get("quantity"),
-                line.get("unit_label"), line.get("sessions_conducted"),
-                line.get("sessions_billable"), line.get("sessions_attended"),
-                line.get("sessions_missed"), line.get("teacher_no_show"),
-                line.get("taught_minutes"), invoice.get("currency"), line.get("amount"),
-            ]])
+                line.get("term_name") or line.get("term"), line.get("package_name"),
+                line.get("billing_mode"), line.get("classes_included"),
+                line.get("unit_amount"), line.get("classes_billed"),
+                line.get("classes_used_to_date"), line.get("classes_remaining"),
+                line.get("package_amount"), line.get("overage_classes"),
+                line.get("overage_amount"),
+            ]
+            subjects = line.get("subjects") or [{}]
+            for subject in subjects:
+                rows.append([_cell(v) for v in package_cells + [
+                    subject.get("subject_name"), subject.get("teacher_name"),
+                    subject.get("classes_counted"), subject.get("sessions_conducted"),
+                    subject.get("sessions_attended"), subject.get("sessions_missed"),
+                    subject.get("teacher_no_show"), subject.get("taught_minutes"),
+                    invoice.get("currency"), line.get("amount"),
+                ]])
     return _write(rows, INVOICE_LINE_HEADER)
 
 
@@ -230,6 +243,24 @@ def sessions_csv(sessions: list[dict], viewer=None) -> str:
     return _write(rows, SESSION_HEADER)
 
 
+def line_enrollment_ids(invoice: dict) -> set[str]:
+    """
+    Every enrollment an invoice's lines were counted from.
+
+    A package line carries its subjects inside it; an invoice from before packages carried
+    one line per enrollment. Both shapes are read, so an old invoice's detail view keeps
+    working after the change.
+    """
+    ids: set[str] = set()
+    for line in invoice.get("line_items") or []:
+        if line.get("enrollment_id") is not None:
+            ids.add(str(line["enrollment_id"]))
+        for subject in line.get("subjects") or []:
+            if subject.get("enrollment_id") is not None:
+                ids.add(str(subject["enrollment_id"]))
+    return ids
+
+
 def sessions_for_invoice(invoice: dict) -> list[dict]:
     """
     Every class that fell inside an invoice's period, for the arrangements it bills.
@@ -241,9 +272,7 @@ def sessions_for_invoice(invoice: dict) -> list[dict]:
     """
     start = parse_date(invoice.get("period_start"))
     end = parse_date(invoice.get("period_end"))
-    enrollment_ids = {
-        str(line.get("enrollment_id")) for line in invoice.get("line_items") or []
-    }
+    enrollment_ids = line_enrollment_ids(invoice)
     if not enrollment_ids:
         return []
 

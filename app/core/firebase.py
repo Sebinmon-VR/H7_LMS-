@@ -1,4 +1,5 @@
 import os
+import copy
 import logging
 import threading
 import time
@@ -8,8 +9,11 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Type, TypeVar, get_args, get_origin
 
+from google.api_core.exceptions import GoogleAPICallError, ResourceExhausted
+
 from app.core.config import settings
 from app.core.enums import UserRole
+from app.core.sqldb import DatabaseUnavailable
 
 logger = logging.getLogger("firebase_db")
 
@@ -94,6 +98,74 @@ class _DocumentCache:
 
 
 document_cache = _DocumentCache()
+
+
+# ---------------------------------------------------------------------------------------
+# The quota circuit breaker
+#
+# When Firestore says the daily quota is gone, every further call for the rest of the day
+# says the same - after a network round trip and the client library's own retries. Four
+# background sweeps and every request were each finding that out separately, at a traceback
+# apiece. So the first refusal is remembered, and for the next few minutes every read fails
+# at once, from here, with the same exception the caller already handles. The block lapses
+# on its own so a lifted quota is noticed without a restart.
+# ---------------------------------------------------------------------------------------
+
+QUOTA_BACKOFF_SECONDS = 300.0
+_quota_blocked_until = 0.0
+_quota_lock = threading.Lock()
+
+
+def quota_blocked_for() -> float:
+    """Seconds until Firestore is tried again, or 0 when it is not being backed off."""
+    with _quota_lock:
+        return max(0.0, _quota_blocked_until - time.monotonic())
+
+
+def _note_quota_exhausted() -> None:
+    global _quota_blocked_until
+    with _quota_lock:
+        _quota_blocked_until = time.monotonic() + QUOTA_BACKOFF_SECONDS
+    logger.error(
+        "Firestore quota exhausted; failing reads fast for the next %.0f seconds.",
+        QUOTA_BACKOFF_SECONDS,
+    )
+
+
+def _assert_quota() -> None:
+    remaining = quota_blocked_for()
+    if remaining > 0:
+        raise ResourceExhausted(
+            f"Quota exceeded (not retrying for another {remaining:.0f}s)."
+        )
+
+
+class _quota_guard:
+    """`with _quota_guard():` around a Firestore call - fails fast while backed off,
+    and starts the back-off when the call itself is refused for quota."""
+
+    def __enter__(self):
+        _assert_quota()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc is not None and isinstance(exc, ResourceExhausted):
+            _note_quota_exhausted()
+        return False
+
+
+def log_backend_failure(log: logging.Logger, label: str, exc: BaseException) -> None:
+    """
+    How a background sweep reports a failure.
+
+    A database refusal - over quota, unreachable - is one line, because the traceback says
+    nothing the message does not and four sweeps print it every cycle. Anything else keeps
+    the traceback: that is a bug, and the stack is how it gets found.
+    """
+    if isinstance(exc, (GoogleAPICallError, DatabaseUnavailable)):
+        log.warning("%s: database unavailable - %s", label, getattr(exc, "message", exc))
+    else:
+        log.exception("%s", label)
 
 
 def serialize_model(instance: Any) -> dict[str, Any]:
@@ -285,7 +357,9 @@ class FirestoreService:
         Creates or updates a Firestore document using merge semantics.
         """
         if self.cacheable:
-            document_cache.invalidate(self.collection_name, doc_id)
+            # The whole collection, not just the document: a cached list or query
+            # result for this collection is now wrong too.
+            document_cache.invalidate(self.collection_name)
 
         if not self.is_available:
             logger.warning(f"Firestore unavailable. Mocking add to collection '{self.collection_name}'.")
@@ -294,7 +368,8 @@ class FirestoreService:
             return normalized
 
         doc_ref = self._db.collection(self.collection_name).document(str(doc_id))
-        doc_ref.set(data, merge=True)
+        with _quota_guard():
+            doc_ref.set(data, merge=True)
         normalized = self._normalize_document(dict(data))
         normalized["id"] = doc_id
         return normalized
@@ -340,7 +415,8 @@ class FirestoreService:
                 return cached
 
         doc_ref = self._db.collection(self.collection_name).document(str(doc_id))
-        doc = doc_ref.get()
+        with _quota_guard():
+            doc = doc_ref.get()
 
         result = None
         if doc.exists:
@@ -433,10 +509,41 @@ class FirestoreService:
         """
         return generate_id()
 
+    # Cached list and query results live in the same store as documents, under ids no
+    # document can have. Every write to a cacheable collection drops the whole collection,
+    # so a caller never reads back a list that predates its own write.
+    _LIST_KEY = "__list__"
+
+    def _cached_rows(self, key: str) -> list[dict] | None:
+        if not self.cacheable:
+            return None
+        cached = document_cache.get(self.collection_name, key, self._ttl)
+        if cached is _MISS or cached is None:
+            return None
+        # A copy, because callers mutate what they are handed - a planner appending to a
+        # group's member list must not append to the cache.
+        return copy.deepcopy(cached)
+
+    def _store_rows(self, key: str, rows: list[dict]) -> None:
+        if self.cacheable:
+            document_cache.put(self.collection_name, key, copy.deepcopy(rows))
+
     def query_documents(self, field: str, op: str, value: Any) -> list[dict]:
-        """Queries Firestore collection matching field conditions."""
+        """
+        Queries Firestore collection matching field conditions.
+
+        Served from the cache for reference collections, like `get_document`. Firestore
+        bills every document a query returns as a read, and the same "students in this
+        class" or "packages on offer" query runs on every screen that lists them - which is
+        what burnt through the free tier's daily read quota before this was cached.
+        """
         if not self.is_available:
             return []
+
+        key = f"__query__:{field}:{op}:{value!r}"
+        cached = self._cached_rows(key)
+        if cached is not None:
+            return cached
 
         collection = self._db.collection(self.collection_name)
         try:
@@ -446,36 +553,45 @@ class FirestoreService:
             # Older client libraries only support the positional form.
             query = collection.where(field, op, value)
 
-        docs = query.stream()
         results = []
-        for doc in docs:
-            d = doc.to_dict()
-            d["id"] = doc.id
-            results.append(self._normalize_document(d))
+        with _quota_guard():
+            for doc in query.stream():
+                d = doc.to_dict()
+                d["id"] = doc.id
+                results.append(self._normalize_document(d))
+
+        self._store_rows(key, results)
         return results
 
     def list_all(self) -> list[dict]:
-        """Lists all documents in a Firestore collection."""
+        """Lists all documents in a Firestore collection. Cached for reference collections."""
         if not self.is_available:
             return []
 
-        docs = self._db.collection(self.collection_name).stream()
+        cached = self._cached_rows(self._LIST_KEY)
+        if cached is not None:
+            return cached
+
         results = []
-        for doc in docs:
-            d = doc.to_dict()
-            d["id"] = doc.id
-            results.append(self._normalize_document(d))
+        with _quota_guard():
+            for doc in self._db.collection(self.collection_name).stream():
+                d = doc.to_dict()
+                d["id"] = doc.id
+                results.append(self._normalize_document(d))
+
+        self._store_rows(self._LIST_KEY, results)
         return results
 
     def delete_document(self, doc_id: str) -> bool:
         """Deletes a document from Firestore."""
         if self.cacheable:
-            document_cache.invalidate(self.collection_name, doc_id)
+            document_cache.invalidate(self.collection_name)
 
         if not self.is_available:
             return False
 
-        self._db.collection(self.collection_name).document(str(doc_id)).delete()
+        with _quota_guard():
+            self._db.collection(self.collection_name).document(str(doc_id)).delete()
         return True
 
     def _normalize_document(self, data: dict) -> dict:
@@ -842,44 +958,66 @@ def hydrate_exam_grade(grade: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------------------
+# The collections
+#
+# Declared once, here, on whichever backend `DATABASE_BACKEND` names. The variables keep
+# their `firestore_` names whatever is underneath: fifty files import them, and the point
+# of the Azure SQL backend (`app.core.sqldb`) is that none of those files can tell the
+# difference. Firebase Auth still signs people in either way.
+# ---------------------------------------------------------------------------------------
+
+def _service(collection_name: str, cacheable: bool = False):
+    if settings.DATABASE_BACKEND.strip().lower() == "azuresql":
+        from app.core.sqldb import SqlDocumentService
+
+        return SqlDocumentService(
+            collection_name, cacheable=cacheable,
+            cache=document_cache, miss=_MISS,
+            ttl=lambda: settings.REFERENCE_CACHE_TTL_SECONDS,
+            id_factory=generate_id,
+        )
+    return FirestoreService(collection_name, cacheable=cacheable)
+
+
 # Global Firestore Collection Helper Services.
 # `cacheable=True` marks small, slow-changing reference data that hydration reads over and
 # over; writes invalidate the affected key immediately.
-firestore_users = FirestoreService("users", cacheable=True)
-firestore_classes = FirestoreService("class_rooms", cacheable=True)
-firestore_subjects = FirestoreService("subjects", cacheable=True)
-firestore_teacher_mappings = FirestoreService("teacher_subject_class_mappings")
+firestore_users = _service("users", cacheable=True)
+firestore_classes = _service("class_rooms", cacheable=True)
+firestore_subjects = _service("subjects", cacheable=True)
+firestore_teacher_mappings = _service("teacher_subject_class_mappings")
 # Which teacher is answerable for a class as a whole. Small and slow-changing, but read on
 # every authorization check a class teacher makes, so it is queried rather than fetched by id
 # and does not benefit from the document cache.
-firestore_class_teacher_mappings = FirestoreService("class_teacher_mappings")
-firestore_student_enrollments = FirestoreService("student_enrollments")
-firestore_attendance = FirestoreService("attendance_records")
-firestore_topics = FirestoreService("topics_covered")
-firestore_meetings = FirestoreService("live_meetings")
-firestore_materials = FirestoreService("study_materials")
-firestore_grades = FirestoreService("exam_grades")
+firestore_class_teacher_mappings = _service("class_teacher_mappings")
+firestore_student_enrollments = _service("student_enrollments", cacheable=True)
+firestore_attendance = _service("attendance_records")
+firestore_topics = _service("topics_covered")
+firestore_meetings = _service("live_meetings")
+firestore_materials = _service("study_materials")
+firestore_grades = _service("exam_grades")
 # Timetables change rarely and are read on every reminder sweep and every student's
 # "today" view, so they earn the reference cache.
-firestore_timetable = FirestoreService("timetable_entries", cacheable=True)
+firestore_timetable = _service("timetable_entries", cacheable=True)
 # One document per reminder actually sent, so a restart or an overlapping sweep cannot
 # email the same student about the same period twice.
-firestore_reminder_log = FirestoreService("reminder_log")
+firestore_reminder_log = _service("reminder_log")
 # One document per (meeting, Meet recording), claimed atomically before the video is moved.
 # It is what stops two server workers filing the same recording twice, and it doubles as the
 # audit trail for where each class recording ended up.
-firestore_recording_log = FirestoreService("recording_log")
+firestore_recording_log = _service("recording_log")
 
 # The exam module. An exam document carries its own question form inline, so a student
 # opening a paper and a teacher valuing it both cost one read rather than one per question.
-firestore_exams = FirestoreService("exams")
+firestore_exams = _service("exams")
 # One document per (exam, student), with the id derived from both - see
 # `app.services.exams.submission_id`. That makes a double submit an update rather than a
 # second script, without a read-then-write race between two tabs.
-firestore_exam_submissions = FirestoreService("exam_submissions")
+firestore_exam_submissions = _service("exam_submissions")
 # Issued report cards. Snapshots, so they are never cached: a card read back must be the
 # version the class teacher last saved, including a remark added seconds ago.
-firestore_report_cards = FirestoreService("report_cards")
+firestore_report_cards = _service("report_cards")
 
 # The exam hydrators live in `app.services.exams` and `app.services.report_cards` rather
 # than here beside `hydrate_exam_grade`. They are not plain reference-resolution: an exam's
@@ -903,28 +1041,112 @@ firestore_report_cards = FirestoreService("report_cards")
 # The spine of the product: one document per (student, subject) arrangement, naming the one
 # teacher who takes it. Read on nearly every tuition request to answer "may this person see
 # this?", and changed only when an admin re-maps a subject, so it earns the reference cache.
-firestore_tuition_enrollments = FirestoreService("tuition_enrollments", cacheable=True)
+firestore_tuition_enrollments = _service("tuition_enrollments", cacheable=True)
 # Recurring weekly slots, one per enrollment per weekday-and-time. Cached for the same
 # reason the LMS timetable is: every conflict check and every "what have I got today" reads
 # the whole set for a person.
-firestore_tuition_slots = FirestoreService("tuition_slots", cacheable=True)
+firestore_tuition_slots = _service("tuition_slots", cacheable=True)
 # Concrete classes on concrete dates, materialized from the slots. Never cached: join times,
 # attendance and status change during the class itself, and a stale read here would show a
 # teacher a class as not started while they are sitting in it.
-firestore_tuition_sessions = FirestoreService("tuition_sessions")
+firestore_tuition_sessions = _service("tuition_sessions")
 # Books, notes and recordings shared by admins, teachers and students.
-firestore_tuition_library = FirestoreService("tuition_library")
-# What a class costs, per enrollment or per subject.
-firestore_tuition_fee_plans = FirestoreService("tuition_fee_plans", cacheable=True)
+firestore_tuition_library = _service("tuition_library")
+# What a student buys - "30 classes for 15,000" - and who is on which package for which
+# term. Reference data, cached: both are read on every fee computation.
+firestore_tuition_packages = _service("tuition_packages", cacheable=True)
+firestore_tuition_package_assignments = _service(
+    "tuition_package_assignments", cacheable=True
+)
+# The per-subject fee plans this collection held were replaced by packages. Nothing reads
+# it any more; it stays defined so the reset scripts can clear what an older deployment
+# left behind.
+firestore_tuition_fee_plans = _service("tuition_fee_plans", cacheable=True)
 # Generated bills. Never cached - an issued invoice is read back immediately after a payment
 # is recorded against it.
-firestore_tuition_invoices = FirestoreService("tuition_invoices")
+firestore_tuition_invoices = _service("tuition_invoices")
 # One document per reminder sent, claimed atomically, exactly as the LMS reminder log works.
-firestore_tuition_reminder_log = FirestoreService("tuition_reminder_log")
+firestore_tuition_reminder_log = _service("tuition_reminder_log")
 # Runtime configuration an administrator edits without a redeploy: reminder lead times,
 # class length, the school timezone. Shared by both products, keyed by program. Small,
 # read on every reminder sweep, so it is cached.
-firestore_app_settings = FirestoreService("app_settings", cacheable=True)
+firestore_app_settings = _service("app_settings", cacheable=True)
+
+
+# ---------------------------------------------------------------------------------------
+# Shared collections
+#
+# These belong to neither product. A family, a session year and a notice board are facts
+# about the institution, and a school running both products announces one set of term dates
+# and bills one household. Where a record needs to know which product it concerns it carries
+# a `program` field, which is cheap here precisely because these collections are small - the
+# reasoning that kept the teaching collections apart does not apply to them.
+# ---------------------------------------------------------------------------------------
+
+# Session years ("2025-26"). A handful of documents, read by nearly every admissions and fee
+# query to resolve "the current year", so they earn the reference cache.
+firestore_academic_years = _service("academic_years", cacheable=True)
+# The basis a student was admitted on, and the concession that comes with it. Same shape and
+# same access pattern as the years above.
+firestore_admission_categories = _service("admission_categories", cacheable=True)
+# Billing households. Cached: every fee calculation resolves a student's family, and the
+# membership changes only when a sibling is admitted or leaves.
+firestore_sibling_groups = _service("sibling_groups", cacheable=True)
+# Which parent login may see which student. Read on every single request a parent makes, and
+# always by query rather than by id, so the document cache cannot help it.
+firestore_parent_links = _service("parent_links")
+# The notice board, shared by both products and every audience.
+firestore_notices = _service("notices")
+# Read receipts, keyed `{notice_id}:{user_id}` so a second read overwrites rather than
+# duplicating. Never cached: the unread badge must reflect a notice opened a second ago.
+firestore_notice_reads = _service("notice_reads")
+
+# ---------------------------------------------------------------------------------------
+# School finance
+#
+# A second billing domain alongside the tuition one, not a widening of it. Tuition bills a
+# count of classes that happened; a school bills a structure agreed in advance, in
+# instalments, whether or not anybody turned up. See `app.models.finance`.
+# ---------------------------------------------------------------------------------------
+
+# The catalogue of what can be charged. Tiny, read on every fee calculation, cached.
+firestore_fee_heads = _service("fee_heads", cacheable=True)
+# What each cohort is charged. Read whenever a bill is built or previewed; changes only when
+# the year's fees are set, so it earns the cache.
+firestore_fee_structures = _service("fee_structures", cacheable=True)
+# When the money falls due. Same shape and access pattern as the structures.
+firestore_instalment_plans = _service("instalment_plans", cacheable=True)
+# Sibling, multi-registration and category concessions. Cached for the same reason.
+firestore_discount_rules = _service("discount_rules", cacheable=True)
+# Issued bills. Never cached - an invoice is read back immediately after a payment lands
+# against it, and a stale total here is money.
+firestore_fee_invoices = _service("fee_invoices")
+# Money received with no invoice on this system - fees paid before it existed, entered as
+# opening balances so the collections report can show them. See services/receipts.py.
+firestore_fee_receipts = _service("fee_receipts")
+# Gateway payment attempts, most of which fail or are abandoned. Never cached, and kept out
+# of the invoice's own payments list so a failed attempt never reaches a receipt.
+firestore_payment_intents = _service("payment_intents")
+
+# ---------------------------------------------------------------------------------------
+# Approval workflows and coursework
+# ---------------------------------------------------------------------------------------
+
+# Requests to teach outside the timetable, awaiting an admin decision. Small, and read by
+# the admin queue rather than by id, so the cache would not help.
+firestore_extra_classes = _service("extra_class_requests")
+# Staff leave applications and their decisions.
+firestore_leave_requests = _service("leave_requests")
+# Support tickets, with their message threads held inline.
+firestore_support_tickets = _service("support_tickets")
+# Per-product support contact details, edited by an admin. One document per program, tiny,
+# read on every support screen.
+firestore_support_contacts = _service("support_contacts", cacheable=True)
+# Homework set for classes, and one submission document per (assignment, student) with the
+# id derived from both - the same trick exam submissions use to make a double submit an
+# update rather than a second script.
+firestore_homework = _service("homework_assignments")
+firestore_homework_submissions = _service("homework_submissions")
 
 
 def hydrate_tuition_enrollment(enrollment: dict) -> dict:
@@ -984,3 +1206,15 @@ def prefetch_tuition(records: list[dict]) -> None:
         ("uploaded_by", firestore_users),
         ("subject_id", firestore_subjects),
     )
+
+
+def all_collections() -> list:
+    """Every declared collection service, in declaration order."""
+    return [
+        value for name, value in globals().items()
+        if name.startswith("firestore_") and hasattr(value, "collection_name")
+    ]
+
+
+def database_backend() -> str:
+    return "azuresql" if settings.DATABASE_BACKEND.strip().lower() == "azuresql" else "firestore"

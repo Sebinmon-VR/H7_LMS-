@@ -32,6 +32,7 @@ from app.core.firebase import (
     firestore_student_enrollments, firestore_subjects, firestore_timetable, firestore_users,
 )
 from app.core.mailer import is_configured as mail_is_configured, send_class_reminder_email
+from app.core.firebase import log_backend_failure
 from app.services.timetable import (
     entry_active_on, now_local, parse_time, school_timezone,
 )
@@ -417,7 +418,7 @@ class ReminderScheduler:
                 # A sweep failure must never kill the thread, or reminders stop silently
                 # until someone restarts the server.
                 self.last_error = str(exc)
-                logger.exception("Reminder sweep failed")
+                log_backend_failure(logger, "Reminder sweep failed", exc)
             finally:
                 self.last_run_at = datetime.utcnow()
                 self.run_count += 1

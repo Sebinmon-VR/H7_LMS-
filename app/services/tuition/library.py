@@ -105,6 +105,10 @@ def visible_items(user, subject_id: int | None = None, enrollment_id=None,
     flag rather than a widening of the rules themselves.
     """
     scope = _viewer_scope(user)
+    config = tuition_settings()
+    syllabus_filter = config["library_syllabus_filter"]
+    viewer_syllabus = _syllabus_of(user) if syllabus_filter else None
+
     results = []
     for item in firestore_tuition_library.list_all():
         if include_pending:
@@ -113,6 +117,16 @@ def visible_items(user, subject_id: int | None = None, enrollment_id=None,
             if item.get("approval_status") != LibraryApprovalStatus.PENDING.value:
                 continue
         elif not may_view_item(item, user, scope):
+            continue
+
+        # Syllabus narrowing, for students only and only when the school has turned it on.
+        # Teachers and admins always see the whole library: somebody has to be able to find
+        # material to re-tag, and a teacher who cannot see an item cannot fix it.
+        if (
+            syllabus_filter
+            and not is_admin(user) and not is_teacher(user)
+            and not matches_syllabus(item, viewer_syllabus)
+        ):
             continue
 
         if subject_id is not None and item.get("subject_id") != subject_id:
@@ -171,6 +185,82 @@ def hydrate_many(items: list[dict]) -> list[dict]:
 # Uploading
 # ---------------------------------------------------------------------------------------
 
+def assert_uploads_allowed(user) -> None:
+    """
+    Refuses a student upload when the library has been put into read-only mode.
+
+    Distinct from the approval requirement, which lets a student upload and holds it for
+    review. This is the harder switch: a school that wants a curated library turns uploads
+    off entirely, and a student never sees a pending item that will never be approved.
+
+    Teachers and admins are unaffected - a read-only library still has to be filled by
+    somebody.
+    """
+    if is_admin(user) or is_teacher(user):
+        return
+    if not tuition_settings()["student_library_uploads_enabled"]:
+        raise HTTPException(
+            status_code=403,
+            detail="The library is read-only for students. Ask a teacher to share material "
+                   "on your behalf.",
+        )
+
+
+def assert_downloads_allowed(user) -> None:
+    """
+    Refuses a student download when downloads have been turned off.
+
+    The other half of read-only mode, and independently useful: a school worried about
+    material leaving the platform turns this off and leaves students reading in the browser,
+    while still letting them upload their own work.
+    """
+    if is_admin(user) or is_teacher(user):
+        return
+    if not tuition_settings()["student_library_downloads_enabled"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Downloads are disabled for students. You can still open this material "
+                   "in the library.",
+        )
+
+
+def _syllabus_of(user) -> str | None:
+    """
+    The syllabus recorded on a viewer's profile, normalized for comparison.
+
+    Read from the profile rather than trusted from the request: a student cannot ask to see
+    another syllabus's material by changing a query parameter.
+    """
+    syllabus = getattr(user, "syllabus", None)
+    if syllabus is None:
+        from app.core.firebase import firestore_users
+        profile = firestore_users.get_document(str(user_id_of(user))) or {}
+        syllabus = profile.get("syllabus")
+    return str(syllabus).strip().upper() if syllabus else None
+
+
+def matches_syllabus(item: dict, viewer_syllabus: str | None) -> bool:
+    """
+    Whether an item belongs to a viewer's syllabus.
+
+    An item with no syllabus tag is shown to everybody. That is the choice that makes the
+    feature adoptable: turning the filter on must not blank out a library that was built
+    before anybody was tagging, so untagged means general rather than hidden.
+
+    A viewer with no syllabus on their profile sees everything, for the same reason - the
+    filter narrows for students the school has actually classified, and does not punish the
+    ones the office has not got round to.
+    """
+    if not viewer_syllabus:
+        return True
+    tags = item.get("syllabus") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    if not tags:
+        return True
+    return viewer_syllabus in {str(t).strip().upper() for t in tags}
+
+
 def _initial_approval(user, visibility: str) -> str:
     """
     Whether an upload is live immediately or waits for review.
@@ -214,6 +304,7 @@ async def store_upload(file: UploadFile, payload, user) -> dict:
     disk with a warning, exactly as LMS materials do - a teacher whose Drive is misconfigured
     still gets their book saved, and the warning says why it is not where they expected.
     """
+    assert_uploads_allowed(user)
     visibility = payload.visibility.value if hasattr(payload.visibility, "value") else str(payload.visibility)
     _assert_may_target(user, payload.enrollment_id, visibility)
 
@@ -240,6 +331,7 @@ def store_link(payload, user) -> dict:
     already. Uploading a copy of something that is already on the web is worse for everybody:
     it goes stale, it costs storage, and it loses the source.
     """
+    assert_uploads_allowed(user)
     visibility = payload.visibility.value if hasattr(payload.visibility, "value") else str(payload.visibility)
     _assert_may_target(user, payload.enrollment_id, visibility)
     if not payload.external_url:
@@ -264,6 +356,13 @@ def _persist(payload, user, visibility: str, **extra) -> dict:
         "approved_by": user_id_of(user) if approval == LibraryApprovalStatus.APPROVED.value else None,
         "approved_at": store_dt(now_utc()) if approval == LibraryApprovalStatus.APPROVED.value else None,
         "tags": [t.strip() for t in (payload.tags or []) if str(t).strip()],
+        # Which syllabus this material belongs to. A list, because one worksheet genuinely
+        # serves CBSE and ICSE, and an empty list means "general" rather than "hidden".
+        "syllabus": [
+            str(sy).strip().upper()
+            for sy in (getattr(payload, "syllabus", None) or [])
+            if str(sy).strip()
+        ],
         "uploaded_by": user_id_of(user),
         "uploader_role": role.value if isinstance(role, UserRole) else str(role or ""),
         "download_count": 0,

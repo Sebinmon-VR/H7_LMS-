@@ -7,7 +7,7 @@ from app.core import google_drive, google_meet, meet_recordings
 from app.core.concurrency import run_parallel
 from app.core.config import settings
 from app.core.enums import (
-    UserRole, AttendanceStatus, DayOfWeek,
+    UserRole, AttendanceStatus, DayOfWeek, Program,
     TEACHING_ROLE_VALUES, TEACHING_OR_ADMIN_VALUES, normalize_programs,
 )
 from app.core.gcp_services import storage_service
@@ -25,12 +25,14 @@ from app.core.firebase import (
     firestore_attendance, firestore_topics, firestore_meetings,
     firestore_materials, firestore_grades, firestore_timetable, firestore_reminder_log,
     firestore_recording_log, firestore_exams, firestore_exam_submissions,
-    firestore_report_cards,
+    firestore_report_cards, firestore_parent_links,
     hydrate_teacher_mapping, hydrate_class_teacher_mapping, hydrate_student_enrollment,
     hydrate_live_meeting, hydrate_study_material, hydrate_timetable_entry,
     require_document, delete_with_dependencies, prefetch_references, prefetch_academic
 )
 from app.services import accounts as account_service
+from app.services import admissions as admission_service
+from app.services import families as family_service
 from app.services import timetable as timetable_service
 from app.services.content import (
     active_students_in_class, resolve_teacher, schedule_meeting, store_material
@@ -61,6 +63,10 @@ from app.schemas.reports import (
     TeacherActivityReport, StudentPerformanceReport
 )
 
+# The profile fields a sibling match is made from. An edit touching any of them re-runs
+# the household placement for a student not yet in one.
+GUARDIAN_FIELDS = ("guardian_name", "guardian_phone", "guardian_email")
+
 router = APIRouter(prefix="/admin", tags=["Admin Module"])
 
 
@@ -73,7 +79,7 @@ _profile_fields = account_service.profile_fields
 
 
 @router.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-def create_user(user_in: UserCreate, _: UserOut = Depends(require_admin)):
+def create_user(user_in: UserCreate, admin: UserOut = Depends(require_admin)):
     """
     [Admin Only] Create a new system user (Student, Teacher, or Admin) and sync to Firebase.
 
@@ -84,23 +90,82 @@ def create_user(user_in: UserCreate, _: UserOut = Depends(require_admin)):
     Every profile field (phone, address, guardian and admission detail for students,
     employee and qualification detail for teachers) is optional, so the minimal
     `{full_name, role}` payload still works. `admission_number` and `employee_id` are
-    rejected if already held by another user.
+    rejected if already held by another user, and are generated for you when the school's
+    identifier mode is AUTO and you leave them blank - see
+    `PUT /admin/settings/LMS` to switch between AUTO and MANUAL or change the prefix.
+
+    A student with no `academic_year_id` is admitted into the current session year, so the
+    usual case needs no extra field. Nothing is defaulted when no year has been created yet.
     """
-    return UserOut(**account_service.create_account(user_in))
+    admission_service.assert_admission_fields(
+        user_in.academic_year_id, user_in.admission_category_id
+    )
+    account_service.issue_school_identifier(user_in, user_in.role)
+
+    if user_in.role == UserRole.STUDENT and user_in.academic_year_id is None:
+        current = admission_service.current_year(Program.LMS.value)
+        if current:
+            user_in.academic_year_id = int(current["id"])
+
+    account = account_service.create_account(user_in)
+    if user_in.role == UserRole.STUDENT:
+        # A new student whose guardian is already on file joins that household now, rather
+        # than waiting for the office to remember the sibling discount at invoice time.
+        family_service.auto_place(account["id"], admin.id)
+    return UserOut(**account)
 
 
 @router.get("/users", response_model=List[UserOut])
 def list_users(
-    role: Optional[UserRole] = Query(None, description="Filter by role: STUDENT, TEACHER, ADMIN"),
+    role: Optional[UserRole] = Query(None, description="Filter by role: STUDENT, TEACHER, ADMIN, PARENT"),
+    academic_year_id: Optional[int] = Query(
+        None, description="Students admitted into this session year."
+    ),
+    admission_category_id: Optional[int] = Query(None),
+    class_id: Optional[int] = Query(
+        None, description="Students enrolled in this class."
+    ),
+    search: Optional[str] = Query(
+        None, description="Match on name, email or admission number."
+    ),
     _: UserOut = Depends(require_admin)
 ):
     """
-    [Admin Only] List all users with optional role filter.
+    [Admin Only] List users, with optional filters.
+
+    `class_id` resolves through the enrollment rows rather than the profile, because class
+    membership lives there - a student's class is a record of enrollment, not a field on the
+    person.
     """
     if role:
         users = firestore_users.query_documents("role", "==", role.value)
     else:
         users = firestore_users.list_all()
+
+    if academic_year_id is not None:
+        users = [u for u in users
+                 if str(u.get("academic_year_id")) == str(academic_year_id)]
+    if admission_category_id is not None:
+        users = [u for u in users
+                 if str(u.get("admission_category_id")) == str(admission_category_id)]
+
+    if class_id is not None:
+        enrolled = {
+            int(e["student_id"]) for e in firestore_student_enrollments.list_all()
+            if int(e.get("class_id", -1)) == int(class_id) and e.get("student_id") is not None
+        }
+        users = [u for u in users if int(u.get("id", -1)) in enrolled]
+
+    if search:
+        needle = search.strip().lower()
+        users = [
+            u for u in users
+            if needle in " ".join(
+                str(u.get(f) or "") for f in ("full_name", "email", "admission_number")
+            ).lower()
+        ]
+
+    users.sort(key=lambda u: str(u.get("full_name") or ""))
     return [UserOut(**u) for u in users]
 
 
@@ -108,7 +173,7 @@ def list_users(
 def update_user(
     user_id: int,
     user_in: UserUpdate,
-    _: UserOut = Depends(require_admin)
+    admin: UserOut = Depends(require_admin)
 ):
     """
     [Admin Only] Update user details, profile fields, role, or active status.
@@ -118,6 +183,10 @@ def update_user(
     data the editor never looked at.
     """
     user = require_document(firestore_users, user_id, "User")
+
+    admission_service.assert_admission_fields(
+        user_in.academic_year_id, user_in.admission_category_id
+    )
 
     updated = _profile_fields(user_in)
 
@@ -146,6 +215,13 @@ def update_user(
 
     updated["updated_at"] = datetime.utcnow().isoformat()
     firestore_users.add_document(str(user_id), updated)
+
+    # A guardian detail that now matches another student's makes them siblings. Only a
+    # student not yet in a household is placed; an existing membership is never moved by an
+    # edit, because that is a decision the office made and an edit is not a request to undo it.
+    if (updated.get("role", user.get("role")) == UserRole.STUDENT.value
+            and any(key in updated for key in GUARDIAN_FIELDS)):
+        family_service.auto_place(user_id, admin.id)
 
     # Mirror profile changes onto the linked Firebase Auth account.
     firebase_uid = user.get("firebase_uid")
@@ -180,6 +256,11 @@ def _user_dependencies(user_id: int) -> list[tuple[str, object, str]]:
         ("exam(s) set", firestore_exams, "teacher_id"),
         ("exam submission(s)", firestore_exam_submissions, "student_id"),
         ("report card(s)", firestore_report_cards, "student_id"),
+        # Both directions of a family link. A parent deleted without these keeps granting
+        # access from a row nobody can see, and a student deleted without them leaves their
+        # parent staring at a child that no longer resolves.
+        ("parent link(s) as parent", firestore_parent_links, "parent_id"),
+        ("parent link(s) as child", firestore_parent_links, "student_id"),
     ]
 
 

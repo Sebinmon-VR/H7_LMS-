@@ -29,7 +29,7 @@ from fastapi import HTTPException
 
 from app.core.config import settings
 from app.core.credentials import generate_email
-from app.core.enums import Program, UserRole, normalize_programs
+from app.core.enums import TEACHING_ROLES, Program, UserRole, normalize_programs
 from app.core.firebase import firestore_users
 from app.core.firebase_auth import create_auth_user, delete_auth_user, set_role_claims
 from app.schemas.user import UserProfileFields
@@ -142,6 +142,13 @@ def create_account(payload, role: UserRole | None = None,
     profile = profile_fields(payload)
     assert_identifiers_free(profile)
 
+    # A student created into a year was admitted in it. Recorded separately from the year
+    # they are *in*, because promotion moves the latter every July and the admission charge
+    # must not follow them.
+    if effective_role == UserRole.STUDENT and profile.get("academic_year_id") is not None \
+            and not profile.get("admission_year_id"):
+        profile["admission_year_id"] = int(profile["academic_year_id"])
+
     firebase_uid = create_auth_user(email, payload.password, payload.full_name)
 
     user_id = firestore_users.get_next_numeric_id()
@@ -215,6 +222,38 @@ def next_identifier(field: str, prefix: str) -> str:
         status_code=500,
         detail=f"Could not allocate a free {field} after 1000 attempts. Supply one explicitly.",
     )
+
+
+def issue_school_identifier(payload, role: UserRole) -> None:
+    """
+    Fills a blank admission or staff number on a school account, when the admin asked for it.
+
+    Mutates the payload in place, before `create_account` reads it, so the generated value
+    goes through the same uniqueness check as one typed in by hand.
+
+    Only ever fills a blank. That is what makes AUTO safe to leave on during a migration: a
+    record that arrives carrying its historical number keeps it, and only the genuinely new
+    student gets a fresh one. Under MANUAL nothing is issued and the field simply stays
+    empty, which is a valid state everywhere - both identifiers have always been optional.
+
+    Roles other than student and teacher are ignored: a parent has no admission number and no
+    staff number, and inventing one for them would put a meaningless value into the same
+    uniqueness namespace the real ones live in.
+    """
+    from app.services.tuition.settings_store import lms_settings
+
+    config = lms_settings()
+
+    if role == UserRole.STUDENT:
+        if config["admission_id_mode"] == "AUTO" and not getattr(payload, "admission_number", None):
+            payload.admission_number = next_identifier(
+                "admission_number", config["admission_id_prefix"]
+            )
+    elif role in TEACHING_ROLES:
+        if config["employee_id_mode"] == "AUTO" and not getattr(payload, "employee_id", None):
+            payload.employee_id = next_identifier(
+                "employee_id", config["employee_id_prefix"]
+            )
 
 
 def create_tuition_account(payload, role: UserRole) -> dict:

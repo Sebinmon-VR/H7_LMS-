@@ -91,6 +91,26 @@ class Settings(BaseSettings):
     USE_LOCAL_STORAGE: bool = False
     LOCAL_STORAGE_DIR: str = "./uploads"
 
+    # ------------------------------------------------------------------------------
+    # Which database holds the documents.
+    #
+    # `firestore` is the original. `azuresql` keeps the same document model - one JSON
+    # document per row, one table per collection - inside an Azure SQL database, in a
+    # schema of its own so it can share a server with other applications without touching
+    # their tables. Every service reads and writes through the same interface either way;
+    # see `app.core.sqldb`. Firebase Auth still issues logins whichever is chosen.
+    # ------------------------------------------------------------------------------
+    DATABASE_BACKEND: str = "firestore"       # firestore | azuresql
+    DB_SERVER: str = ""                       # e.g. myserver.database.windows.net
+    DB_NAME: str = ""
+    DB_USER: str = ""
+    DB_PASSWORD: str = ""
+    # The schema every table lives in. Nothing outside it is ever created, altered or read.
+    DB_SCHEMA: str = "h7lms"
+    DB_DRIVER: str = "ODBC Driver 18 for SQL Server"
+    # A full ODBC connection string overrides the five fields above when set.
+    DB_CONNECTION_STRING: str = ""
+
     # Google Workspace integration settings (requires domain-wide delegation)
     GOOGLE_WORKSPACE_DOMAIN: str = ""
     GOOGLE_IMPERSONATION_FALLBACK: str = ""  # Workspace user impersonated when a teacher email is unusable
@@ -169,7 +189,11 @@ class Settings(BaseSettings):
     CLASS_REMINDER_MINUTES_BEFORE: str = "15"
     # How often the background sweep looks for periods entering a reminder window. Must be
     # smaller than the tightest reminder offset or a window can be stepped over entirely.
-    REMINDER_SCAN_INTERVAL_SECONDS: float = 120.0
+    # Five minutes rather than two. Each sweep reads the timetable and the enrolments of
+    # every class in its window, and on Firestore's free tier that alone was most of the
+    # day's read quota. The lead time is measured from the class, so a slower sweep only
+    # moves when a reminder goes out by up to the interval, never whether it goes out.
+    REMINDER_SCAN_INTERVAL_SECONDS: float = 300.0
     # Also email the teacher taking the period, not just the enrolled students.
     REMIND_TEACHERS: bool = True
     # Reminders for a period more than this many minutes in the past are never sent, so a
@@ -317,14 +341,139 @@ class Settings(BaseSettings):
     TUITION_SESSION_HORIZON_DAYS: int = 30
     # Whether a student may upload to the shared library without a teacher approving it.
     TUITION_STUDENT_UPLOADS_NEED_APPROVAL: bool = True
-    # Default per-class fee used when an enrollment carries no fee plan of its own.
-    TUITION_DEFAULT_SESSION_FEE: float = 0.0
     TUITION_CURRENCY: str = "INR"
     # Prefixes for the identifiers issued to tuition accounts when none is supplied, as
     # PREFIX-YEAR-0001. Every tuition student carries a unique admission number; leaving an
     # administrator to invent one per student is how blanks and duplicates get into the data.
     TUITION_ADMISSION_PREFIX: str = "TUI"
     TUITION_EMPLOYEE_PREFIX: str = "TUT"
+
+    # The same identifiers for the school side, and whether they are issued at all.
+    #
+    # AUTO fills a blank admission or staff number on creation; MANUAL leaves it blank and
+    # expects the office to type one. Both are legitimate: a new school wants them generated,
+    # while a school migrating years of paper records already has numbers, and being handed
+    # different ones corrupts the very records it is trying to import. AUTO only ever fills a
+    # blank, so a mixed intake needs no setting change.
+    SCHOOL_ADMISSION_PREFIX: str = "ADM"
+    SCHOOL_EMPLOYEE_PREFIX: str = "EMP"
+    SCHOOL_ADMISSION_ID_MODE: str = "AUTO"
+    SCHOOL_EMPLOYEE_ID_MODE: str = "AUTO"
+
+    # How often the school maintenance sweep runs: opening due classes, closing abandoned
+    # ones, and sending any parent digest that has come due. Every action it takes is
+    # idempotent or claimed, so the interval is a cost/latency trade rather than a
+    # correctness one.
+    CLASS_MAINTENANCE_INTERVAL_SECONDS: int = 300
+    # Weekly or monthly progress digests, emailed to parents. Off by default: a deployment
+    # that turns this on starts mailing real families, which is not something a default
+    # should decide.
+    ENABLE_PARENT_REPORTS: bool = False
+    PARENT_REPORT_PERIOD: str = "WEEKLY"
+
+    # --- Library ------------------------------------------------------------------------
+    #
+    # Read-only mode for students, in two independently useful halves. A school that wants a
+    # curated library turns uploads off; one worried about material leaving the platform
+    # turns downloads off and leaves students reading in the browser.
+    #
+    # Both default to OFF. The brief asks for a student library that is read-only, so that
+    # is what a fresh deployment gets: a school that wants students contributing turns it on
+    # deliberately, under Admin -> School Settings -> Library access. The previous permissive
+    # default meant every new deployment shipped with student uploads live, which is the
+    # opposite of what was asked for and is not something anybody notices until a student
+    # has already uploaded something.
+    STUDENT_LIBRARY_UPLOADS_ENABLED: bool = False
+    STUDENT_LIBRARY_DOWNLOADS_ENABLED: bool = False
+    # Whether a student's library is narrowed to material tagged for their own syllabus.
+    # Off by default: a school with one syllabus would otherwise have to tag every item
+    # before anybody could see anything.
+    LIBRARY_SYLLABUS_FILTER: bool = False
+
+    # --- Live classes (school) ---------------------------------------------------------
+    #
+    # The school equivalents of the tuition settings above. The tuition product already has
+    # auto-start and a class clock; these give the same behaviour to school meetings, because
+    # "can I join yet?" and "how long is left?" are the same questions in both and a student
+    # who takes both should not meet two different answers.
+    SCHOOL_AUTO_START_CLASS: bool = False
+    # How early the join button opens. Zero means exactly on the hour, which in practice
+    # means every student presses a dead button for the minute before class.
+    SCHOOL_JOIN_OPEN_MINUTES_BEFORE: int = 5
+    SCHOOL_DEFAULT_CLASS_MINUTES: int = 45
+    # How long after the scheduled end a class is still joinable, for the teacher who
+    # overruns. Past this the meeting is closed and the link stops working.
+    SCHOOL_JOIN_GRACE_MINUTES: int = 15
+    # Whether a class scheduled outside the timetable has to be approved before it happens.
+    EXTRA_CLASS_NEEDS_APPROVAL: bool = True
+
+    # --- Finance -----------------------------------------------------------------------
+    #
+    # Defaults only. Every one of these is editable per program from the admin settings
+    # screen, because they are decisions the bursar makes and changes, not facts about the
+    # machine - a school that has to raise a ticket to change its late-fee grace period will
+    # simply stop charging one.
+    SCHOOL_CURRENCY: str = "INR"
+
+    # --- Multi-currency ------------------------------------------------------------------
+    #
+    # Fees are entered once, in the base currency, and converted for display. The alternative
+    # - an amount per currency on every fee structure line - means a school that raises its
+    # tuition has to remember to raise it twice, and the day they forget the two currencies
+    # quietly disagree about what the same class costs.
+    #
+    # Rates are administrator-set, not fetched live. A school's published fee in a second
+    # currency is a commercial decision they make and hold for a term; a bill that moved with
+    # the spot rate would differ between the day a parent looked and the day they paid.
+    FINANCE_BASE_CURRENCY: str = "INR"
+    FINANCE_SUPPORTED_CURRENCIES: str = "INR,AED"
+
+    # Live exchange rates.
+    #
+    # On by default, but never load-bearing: a currency set to MANUAL ignores them entirely,
+    # and every failure path falls back to the administrator's own configured rate. See
+    # `app.core.fx` for why a live rate must never re-price an invoice that has been issued.
+    #
+    # open.er-api.com needs no API key, which matters: a school deploying this should not
+    # have to sign up for a currency service before their fee page works. Any provider
+    # returning {"rates": {"AED": 0.044}} against /<BASE> will do.
+    FINANCE_FX_ENABLED: bool = True
+    FINANCE_FX_PROVIDER_URL: str = "https://open.er-api.com/v6/latest"
+    # One fetch per this many minutes serves every request. Rates move by fractions of a
+    # percent in an hour, and a fee page is not a trading screen.
+    FINANCE_FX_CACHE_MINUTES: int = 360
+    FINANCE_FX_TIMEOUT_SECONDS: float = 6.0
+    # Tax is off by default. A school that does not charge it must not have a 0% line
+    # appearing on every bill, and one that does will set the rate deliberately.
+    FINANCE_TAX_ENABLED: bool = False
+    FINANCE_TAX_PERCENT: float = 0.0
+    FINANCE_TAX_LABEL: str = "Tax"
+    # Whether the amounts entered on a fee structure already include tax. Changes which way
+    # the arithmetic runs, so it must be stated rather than assumed.
+    FINANCE_TAX_INCLUSIVE: bool = False
+
+    FINANCE_LATE_FEE_ENABLED: bool = False
+    FINANCE_LATE_FEE_PERCENT: float = 0.0
+    FINANCE_LATE_FEE_AMOUNT: float = 0.0
+    FINANCE_LATE_FEE_GRACE_DAYS: int = 7
+    # Convenience surcharge, the gateway's cut passed on to the payer. Percent and flat are
+    # both supported because providers price both ways and schools pass on whichever they
+    # were charged.
+    FINANCE_CONVENIENCE_PERCENT: float = 0.0
+    FINANCE_CONVENIENCE_AMOUNT: float = 0.0
+
+    FINANCE_INVOICE_PREFIX: str = "INV"
+    FINANCE_INVOICE_DUE_DAYS: int = 15
+    # NONE, NEAREST, UP or DOWN. Applied to the final payable only - rounding each line
+    # instead makes the lines stop summing to the total, which is the first thing a parent
+    # checking a bill notices.
+    FINANCE_ROUNDING: str = "NONE"
+
+    # No gateway is wired yet. The switch exists so the payment page can render "pay online"
+    # or not without the frontend hardcoding the answer, and so the adapter that arrives
+    # later has a flag to turn on.
+    FINANCE_GATEWAY_ENABLED: bool = False
+    FINANCE_GATEWAY_PROVIDER: str = ""
 
     @property
     def resolved_tuition_timezone(self) -> str:

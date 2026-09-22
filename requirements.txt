@@ -10,6 +10,9 @@ pydantic-settings>=2.2.0
 # so passlib/bcrypt are no longer required.
 python-jose[cryptography]>=3.3.0
 python-multipart>=0.0.9
+# Azure SQL document backend (DATABASE_BACKEND=azuresql). Needs "ODBC Driver 18 for SQL
+# Server" on the host; Azure App Service's Python image ships it.
+pyodbc>=5.2.0
 python-dotenv>=1.0.1
 httpx>=0.27.0
 google-cloud-storage>=2.14.0

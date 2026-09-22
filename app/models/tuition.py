@@ -12,8 +12,9 @@ skin on it:
     the same teacher or the same room. Two tuition slots clash when they need the same
     teacher *or the same student* - a student with maths and physics at 17:00 on a Tuesday
     is as broken as a double-booked teacher, and only one of those is a problem the LMS has.
-  * Billing is by the class. The admin's reports count conducted sessions, so a session's
-    status is financial data, not just a display state.
+  * Billing is by the class, against a package. A student buys "30 classes for 15,000" and
+    spends them on whichever subjects they take; the admin's reports count conducted
+    sessions, so a session's status is financial data, not just a display state.
 
 As elsewhere in this codebase these dataclasses are descriptive: the routers read and write
 plain dicts, and these are the reference for what is actually stored.
@@ -24,8 +25,8 @@ from datetime import date, datetime
 from typing import Any
 
 from app.core.enums import (
-    AttendanceStatus, DayOfWeek, FeeBasis, InvoiceStatus, LibraryApprovalStatus,
-    LibraryVisibility, TuitionEnrollmentStatus, TuitionSessionStatus,
+    AcademicTerm, AttendanceStatus, DayOfWeek, InvoiceStatus, LibraryApprovalStatus,
+    LibraryVisibility, PackageBillingMode, TuitionEnrollmentStatus, TuitionSessionStatus,
 )
 
 
@@ -54,8 +55,6 @@ class TuitionEnrollment:
     grade_level: str | None = None
     # Default length for classes on this arrangement; falls back to the programme default.
     default_duration_minutes: int | None = None
-    # Overrides the fee plan resolved from the subject, when this student's rate differs.
-    fee_plan_id: int | None = None
 
     start_date: date | None = None
     end_date: date | None = None
@@ -257,25 +256,36 @@ class TuitionLibraryItem:
 
 
 @dataclass(slots=True)
-class TuitionFeePlan:
+class TuitionPackage:
     """
-    What a tuition class costs.
+    What a student buys: so many classes for so much, spent on any subjects.
 
-    Resolved most-specific-first: the enrollment's own plan, then a plan for the subject,
-    then the programme default. Admin-only in every direction - teachers and students never
-    read this collection, which is why fee data lives here rather than on the enrollment.
+    The fee is not per subject. A package of 15,000 for 30 classes covers maths on Monday and
+    physics on Thursday alike, and the invoice counts classes across every enrollment the
+    student holds. That is why there is no `subject_id` here and why an enrollment carries
+    no price of its own.
+
+    `classes_included` is the allowance. Under PER_CLASS billing it sets the per-class rate
+    (`amount / classes_included`) and the usage is reported against it; under PACKAGE
+    billing it is the number of classes the flat amount buys before overage applies.
+
+    Scoped, optionally, to one session year and one term - a "Term 1 2026-27" package - or
+    left unscoped as a standing offer. Admin-only in every direction, like the invoices.
     """
     name: str
-    basis: FeeBasis = FeeBasis.PER_SESSION
     amount: float = 0.0
-    currency: str = "AED"
-    # Set to scope a plan to one subject; null makes it a programme-wide default.
-    subject_id: int | None = None
-    # Charged for a class the student missed without notice. Null bills the full amount.
-    no_show_amount: float | None = None
-    # Whether a class the *teacher* missed is billable. Almost never true; present so the
-    # answer is recorded rather than assumed.
-    charge_teacher_no_show: bool = False
+    classes_included: int = 30
+    currency: str = "INR"
+    billing_mode: PackageBillingMode = PackageBillingMode.PER_CLASS
+
+    academic_year_id: int | None = None
+    term: AcademicTerm | None = None
+    # Cap on concurrent subjects a student on this package may take. Null is no cap.
+    max_subjects: int | None = None
+    # Whether a class the student missed without notice still uses up one of the package's
+    # classes. True by default: the teacher turned up and the slot was spent.
+    count_missed_classes: bool = True
+
     is_active: bool = True
     notes: str | None = None
 
@@ -286,23 +296,63 @@ class TuitionFeePlan:
 
 
 @dataclass(slots=True)
+class TuitionPackageAssignment:
+    """
+    One student on one package for one term.
+
+    Kept as its own record rather than a field on the student, because a student changes
+    packages between terms and the invoice for last term has to be read back against the
+    package that was in force then. `starts_on` / `ends_on` are the term's dates by default,
+    which is what the class usage is counted within.
+
+    One active assignment per student per (year, term); assigning again replaces it.
+    """
+    student_id: int
+    package_id: int
+
+    academic_year_id: int | None = None
+    term: AcademicTerm | None = None
+    starts_on: date | None = None
+    ends_on: date | None = None
+
+    is_active: bool = True
+    notes: str | None = None
+
+    assigned_by: int | None = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime | None = None
+    id: int | None = None
+
+
+@dataclass(slots=True)
 class TuitionInvoice:
     """
-    A student's bill for a period, built from counted sessions.
+    A student's bill for a period, built from counted sessions against their package.
 
-    `line_items` carries one row per enrollment with the session count it was priced from, so
-    an invoice can always be explained back to the classes that produced it. A DRAFT is
-    recomputed on every regeneration; once ISSUED the numbers are frozen, because a bill that
-    silently changes after it was sent is not a bill.
+    `line_items` carries one row for the package with the class count it was priced from and,
+    inside it, the per-subject counts those classes came from, so an invoice can always be
+    explained back to the classes that produced it. A DRAFT is recomputed on every
+    regeneration; once ISSUED the numbers are frozen, because a bill that silently changes
+    after it was sent is not a bill.
     """
     student_id: int
     period_start: date
     period_end: date
 
     status: InvoiceStatus = InvoiceStatus.DRAFT
-    currency: str = "AED"
-    # [{"enrollment_id", "subject_id", "subject_name", "teacher_id", "sessions_counted",
-    #   "sessions_attended", "sessions_missed", "basis", "unit_amount", "amount"}]
+    currency: str = "INR"
+    # Which package and term the bill was priced against, frozen with the figures.
+    package_id: int | None = None
+    package_name: str | None = None
+    assignment_id: int | None = None
+    term: AcademicTerm | None = None
+    classes_included: int | None = None
+    classes_billed: int = 0
+    classes_used_to_date: int = 0
+    classes_remaining: int | None = None
+    # [{"package_id", "package_name", "billing_mode", "per_class_amount", "classes_billed",
+    #   "classes_used_to_date", "classes_remaining", "overage_classes", "amount",
+    #   "subjects": [{"enrollment_id", "subject_name", "teacher_name", "sessions_*"}]}]
     line_items: list[dict[str, Any]] = field(default_factory=list)
     subtotal: float = 0.0
     discount_amount: float = 0.0

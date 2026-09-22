@@ -174,6 +174,40 @@ def existing_active(student_id: int, subject_id: int, exclude_id=None) -> dict |
 # Writing
 # ---------------------------------------------------------------------------------------
 
+def _assert_within_package(student_id, student: dict) -> None:
+    """
+    Refuses a subject the student's package has no room for.
+
+    A package may cap concurrent subjects (`max_subjects`); the check is here, at the moment
+    a subject is added, because that is the only moment the count changes and the only one
+    at which the admin can do something about it. Students on no package, or on one with no
+    cap, take any number - the package is what students *choose subjects within*, and a cap
+    it does not set is not a cap.
+    """
+    from datetime import date
+
+    from app.core.firebase import firestore_tuition_packages
+    from app.services.tuition.fees import resolve_assignment
+
+    assignment = resolve_assignment(student_id, date.today())
+    if not assignment:
+        return
+    package = firestore_tuition_packages.get_document(str(assignment.get("package_id"))) or {}
+    cap = package.get("max_subjects")
+    if not cap:
+        return
+    taking = len(for_student(student_id))
+    if taking >= int(cap):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{student.get('full_name')} already takes {taking} subject(s), the most "
+                f"their package '{package.get('name')}' allows. Move them to a larger "
+                "package, or end a subject first."
+            ),
+        )
+
+
 def create_enrollment(payload, actor) -> dict:
     """
     Assigns a teacher to a student for a subject.
@@ -199,6 +233,7 @@ def create_enrollment(payload, actor) -> dict:
                 f"teacher, or end it first."
             ),
         )
+    _assert_within_package(payload.student_id, student)
 
     enrollment_id = firestore_tuition_enrollments.get_next_numeric_id()
     document = {
@@ -210,7 +245,6 @@ def create_enrollment(payload, actor) -> dict:
         "goals": payload.goals,
         "grade_level": payload.grade_level,
         "default_duration_minutes": payload.default_duration_minutes,
-        "fee_plan_id": payload.fee_plan_id,
         "start_date": payload.start_date.isoformat() if payload.start_date else None,
         "end_date": payload.end_date.isoformat() if payload.end_date else None,
         "notes": payload.notes,
@@ -261,8 +295,7 @@ def apply_update(enrollment: dict, payload, actor) -> dict:
                            f"for that subject. End it before re-activating this one.",
                 )
 
-    for field in ("syllabus", "goals", "grade_level", "notes", "default_duration_minutes",
-                  "fee_plan_id"):
+    for field in ("syllabus", "goals", "grade_level", "notes", "default_duration_minutes"):
         if field in changed:
             updates[field] = changed[field]
 

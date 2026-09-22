@@ -2,8 +2,8 @@
 Clears out tuition activity data, keeping the people.
 
 DESTRUCTIVE, and deliberately narrow. This removes the records you create *while testing* -
-enrollments, timetable slots, classes, library items, fee plans, invoices, and tuition
-homework and report cards - and leaves alone the two things you would be sorry to lose:
+enrollments, timetable slots, classes, library items, packages and package assignments,
+invoices, and tuition homework and report cards - and leaves alone the two things you would be sorry to lose:
 
   * **Users.** Every account stays, tuition access included. That is the whole point of this
     script over `reset_data.py`: onboarding people is the slow part, and there is no reason
@@ -21,7 +21,7 @@ Usage:
     # Delete it
     python -m scripts.reset_tuition_data --confirm
 
-    # Keep the fee plans and programme settings you have configured
+    # Keep the packages and programme settings you have configured
     python -m scripts.reset_tuition_data --confirm --keep-config
 
     # Restrict to one student's data (useful when only some of it was test data)
@@ -50,6 +50,8 @@ from app.core.firebase import (  # noqa: E402
     firestore_tuition_fee_plans,
     firestore_tuition_invoices,
     firestore_tuition_library,
+    firestore_tuition_package_assignments,
+    firestore_tuition_packages,
     firestore_tuition_reminder_log,
     firestore_tuition_sessions,
     firestore_tuition_slots,
@@ -62,6 +64,7 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 # so these are emptied wholesale.
 ACTIVITY_COLLECTIONS = [
     ("tuition_invoices", firestore_tuition_invoices),
+    ("tuition_package_assignments", firestore_tuition_package_assignments),
     ("tuition_sessions", firestore_tuition_sessions),
     ("tuition_slots", firestore_tuition_slots),
     ("tuition_library", firestore_tuition_library),
@@ -69,10 +72,12 @@ ACTIVITY_COLLECTIONS = [
     ("tuition_reminder_log", firestore_tuition_reminder_log),
 ]
 
-# Configuration rather than test data: the rates and the programme settings an admin has
+# Configuration rather than test data: the packages and the programme settings an admin has
 # tuned. Cleared only when `--keep-config` is absent, because retyping them is annoying and
-# they are rarely what you meant by "the test records".
+# they are rarely what you meant by "the test records". The fee-plans collection is the
+# pre-package price list; nothing reads it now, so it is cleared alongside.
 CONFIG_COLLECTIONS = [
+    ("tuition_packages", firestore_tuition_packages),
     ("tuition_fee_plans", firestore_tuition_fee_plans),
 ]
 
@@ -123,9 +128,10 @@ def _narrow_to_student(contents: dict[str, list], student_id: int) -> dict[str, 
     """
     Keeps only documents belonging to one student.
 
-    Fee plans and the reminder log are dropped from a per-student run entirely: a fee plan
-    belongs to a subject, not a person, and deleting one because a single student's test data
-    was wrong would silently change what every other student is charged.
+    Packages and the reminder log are dropped from a per-student run entirely: a package is
+    an offer, not a person's record, and deleting one because a single student's test data
+    was wrong would silently change what every other student on it is charged. The student's
+    own package *assignment* goes, as their other records do.
     """
     enrollment_ids = {
         str(e.get("id")) for e in contents.get("tuition_enrollments", [])
@@ -134,7 +140,7 @@ def _narrow_to_student(contents: dict[str, list], student_id: int) -> dict[str, 
 
     narrowed: dict[str, list] = {}
     for name, documents in contents.items():
-        if name in {"tuition_fee_plans", "tuition_reminder_log"}:
+        if name in {"tuition_packages", "tuition_fee_plans", "tuition_reminder_log"}:
             narrowed[name] = []
             continue
         narrowed[name] = [
@@ -202,7 +208,7 @@ def main() -> int:
     print("  class_rooms      shared with the school LMS")
     print("  every LMS collection (attendance, timetable, exams, materials, ...)")
     if args.keep_config:
-        print("  tuition_fee_plans and app_settings (--keep-config)")
+        print("  tuition_packages, tuition_fee_plans and app_settings (--keep-config)")
 
     if args.dry_run:
         print("\nDry run - nothing was deleted.")

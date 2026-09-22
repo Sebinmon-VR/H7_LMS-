@@ -19,6 +19,91 @@ The implementation avoids SQLAlchemy and relational databases entirely, relying 
 
 ---
 
+
+## Database backends
+
+The application stores documents, not rows: every service reads and writes plain dicts
+through one small interface (`get`, `get many`, `query by a field`, `list`, `add`, `create`,
+`delete`), declared once in `app/core/firebase.py`. Two backends implement it:
+
+| `DATABASE_BACKEND` | Where the data lives | Notes |
+| --- | --- | --- |
+| `firestore` | Firebase Cloud Firestore | The original. Subject to the free tier's 50,000 reads a day, after which every request answers 503 until midnight Pacific. |
+| `azuresql` | Azure SQL, one JSON-document table per collection | No read quota. Lives entirely inside the `DB_SCHEMA` schema (`h7lms`), so it can share a database with other applications without touching their tables. Fields the code queries by are indexed computed columns. |
+
+Firebase Auth signs people in on either backend; only the data moves. The fifty-odd files
+that use the collections do not change, and neither does the API.
+
+```bash
+# .env
+DATABASE_BACKEND=azuresql
+DB_SERVER=myserver.database.windows.net
+DB_NAME=mydb
+DB_USER=...
+DB_PASSWORD=...
+DB_SCHEMA=h7lms
+```
+
+Tables are created on first use and at startup. To move existing data across once:
+
+```bash
+python -m scripts.migrate_firestore_to_sql --dry-run   # count what would be copied
+python -m scripts.migrate_firestore_to_sql             # copy (re-runnable; overwrites by id)
+python -m scripts.migrate_firestore_to_sql --verify    # compare counts afterwards
+```
+
+`GET /health/database` says which backend a deployment is on and whether it answers.
+Setting `DATABASE_BACKEND=firestore` switches back; nothing Firestore-side is removed.
+
+## School fees: heads, structures and the admission charge
+
+A fee head is one thing the school charges for; a structure is what a year's cohort is
+charged. The one-time admission charge (a head with `is_admission_charge`) is billed in a
+student's **admission year only**: `admission_year_id` is set when a student is created and
+fixed by their first promotion, and a student promoted into a year is not a new admission in
+it. The year's fee splits into the two terms, recurring heads by the plan's percentages, while
+each one-time head is an instalment of its own due on joining, so "30,000 tuition + 10,000
+admission" bills as Admission Fee 10,000, Term 1 15,000 and Term 2 15,000. Each instalment
+carries `components` saying which fee contributed what.
+
+Every school year gets a default **"Two terms"** instalment plan when it is created (or when
+its first structure is), visible and editable under Instalment plans; a plan line tied to a
+term falls due at that term's start. To take money at the counter use
+`POST /admin/finance/students/{id}/collect` (the Invoices tab's **Collect fee** button): it
+builds and issues the year's invoice if the student has none, then records the payment.
+
+### Fee reports
+
+Three reports answer the office's questions in order: where does everyone stand, who do I
+chase, what came in. They are computed on request from the invoices and the roster, never
+stored, so they cannot disagree with the Invoices tab, and each `summary` is built from
+exactly the rows returned. The admin **Fees & invoices** page shows them under **Reports**.
+
+| Method | Endpoint | What it returns |
+|--------|----------|-----------------|
+| `GET` | `/admin/finance/reports/students` | Every student in the year with their status (`NOT_BILLED`, `DRAFT`, `ISSUED`, `PARTIALLY_PAID`, `PAID`, `OVERDUE`), invoice totals, `amount_due`, next instalment due, last payment and an ageing split. Unbilled students carry `expected_total`, what the rules would charge them. Filters: `academic_year_id` (defaults to current), `class_id`, `status` (also `DUE` for anything owed), `as_of`. |
+| `GET` | `/admin/finance/reports/dues` | The same rows restricted to whoever owes, largest overdue balance first, with `not_due` / `d0_30` / `d31_60` / `d61_90` / `over_90` buckets. |
+| `GET` | `/admin/finance/reports/collections` | Every payment received between `from_date` and `to_date` (required), newest first, with totals by method, day, class and fee head. Each payment is split by what it settled (`heads`, `admission_fee_amount`), and the summary carries `admission_fees`, `other_fees` and `by_head`. Optional `academic_year_id`, `class_id`, `method`, and `head_id` to keep only payments that settled one head, such as the admission fee. |
+| `GET` | `/admin/finance/reports/export` | The same three as CSV: `view=students|dues|collections` plus the filters above. UTF-8 with a BOM so Excel renders names correctly. |
+
+The first request after a restart fills the document cache from the database and can take
+several seconds; later requests take well under a second.
+
+### Opening balances: fees paid before the system
+
+An invoice is what the rules say a student owes for a year, one per student per year, so it
+cannot hold the admission fee that a student on the roll paid years before the fee module
+existed. That money is a **receipt**: `POST /admin/finance/receipts` (`student_id`,
+`fee_head_id`, `amount`, `paid_at`, `method`, `reference`, `note`, optional
+`academic_year_id`), listed with `GET /admin/finance/receipts` and erased with
+`DELETE /admin/finance/receipts/{id}`. Receipts appear in the collections report and its CSV
+with `source` = `OPENING_BALANCE` (invoice payments say `INVOICE`) and never change what a
+student owes. `python -m scripts.backfill_admission_receipts` records one for every student
+whose admission category waives the admission charge, dated from the profile's admission
+date, a CSV, `--paid-on`, or the admission year's start, in that order; it prints the plan
+and writes nothing without `--apply`, skips students who already have one, and `--undo`
+removes them again.
+
 ## What's New
 
 ### Online Tuition Module (new)
@@ -35,7 +120,7 @@ about what the unit of teaching *is*:
 | Unit of teaching | a class, many students | an **enrollment**: one student, one subject, **one** teacher |
 | Timetable clash | two periods want the same teacher | two classes want the same teacher **or the same student** |
 | Attendance | a roster per period | one student per session; attendance *is* the session outcome |
-| Billing | not modelled | per conducted class, derived from the counts |
+| Billing | a fee structure per April-March year, collected by term | a class package - "30 classes for 15,000", any subjects - counted per class |
 | Access | `role` | `role` **and** `programs` |
 
 **Access control.** Every profile carries a `programs` list. A teacher or student needs
@@ -223,11 +308,21 @@ the library, fees.
 
 #### Fees and billing (admin only)
 
-Not exposed on the teacher or student routers at all. An invoice is **derived**, not typed
-in: conducted-class counts price the lines, and both the count and the rate are stored on
-each line so a bill can always be read back as "eight physics classes at ₹500". Fee plans
-resolve enrollment → subject → programme default. A draft is recomputed on every
-regeneration; once issued the figures are frozen.
+The fee is a **package, not a rate per subject**: a student buys "30 classes for ₹15,000"
+and spends them on whichever subjects they take. Packages are assigned per **term** - the
+year runs April to March, Term 1 to the end of October and Term 2 from November - and every
+invoice counts the classes taken in the period against the student's package, reporting
+where they stand on the allowance ("18 of 30 used, 12 remaining").
+
+Two billing modes, chosen per package. `PER_CLASS` bills the classes attended each period
+at the package's per-class rate (`amount / classes_included`). `PACKAGE` bills the whole
+amount once per term and thereafter only classes beyond the allowance. Either way an
+invoice is **derived**, not typed in: the count, the rate and the per-subject breakdown are
+stored on the line, so a bill always reads back as "14 classes at ₹500 - 6 English, 5 Maths,
+3 Science". A draft is recomputed on every regeneration; once issued the figures are frozen.
+
+The pricing engine stays admin-only; a student can read their own package usage
+(`GET /tuition/students/package/me`) and their issued invoices.
 
 **Nothing is emailed.** Invoices are generated, issued and read in the admin module; there
 is no delivery step, by design — how a bill reaches a family is left to whoever runs the
@@ -297,14 +392,24 @@ item, so it follows a student's current enrollments instead of going stale silen
 | `POST` | `/sessions/{id}/reschedule` `/cancel` `/billable` | Move one class; call it off; override whether it is billed |
 | `PUT` | `/sessions/{id}/meeting-link` | Point at Zoom / Teams / a standing room |
 | `GET` | `/reports/overview` `/reports/students/{id}` `/reports/teachers/{id}` | Class and attendance counts |
-| `POST` `GET` `PUT` `DELETE` | `/fee-plans`, `/fee-plans/{id}` | What a class costs |
-| `POST` | `/invoices/generate` `/invoices/generate-batch` | Bill from conducted-class counts |
+| `POST` `GET` `PUT` `DELETE` | `/packages`, `/packages/{id}` | What a student buys: so many classes for so much. 409 on deleting one with students on it |
+| `GET` | `/packages/{id}/students` | Who is on a package |
+| `GET` `PUT` | `/students/{id}/package` | Where a student stands on their package; put them on one for a term |
+| `GET` `DELETE` | `/students/{id}/packages`, `/students/{id}/packages/{assignment_id}` | Package history; take them off one |
+| `POST` | `/invoices/generate` `/invoices/generate-batch` | Bill the period's classes against the package |
 | `GET` | `/invoices`, `/invoices/{id}`, `/fees/summary` | Bills, and billed-vs-collected |
 | `GET` | `/billing`, `/billing/students/{id}` | Filtered ledger with totals; one student's account |
 | `GET` | `/invoices/{id}/detail` | An invoice down to the individual classes behind each line |
 | `GET` | `/billing/export`, `/invoices/{id}/export`, `/reports/export` | CSV downloads — summary, lines, payments, sessions |
 | `POST` | `/invoices/{id}/issue` `/payments` `/cancel` | Freeze and send; record money; void |
 | `GET` `POST` | `/reminders/status` `/preview` `/run`, `/maintenance/run` | Reminder sweep and housekeeping |
+| `GET` `POST` | `/admissions/years`, `/admissions/categories` | **Tuition's own session years and admission categories**, separate from the school's. Created here they are TUITION records by default; `is_current` rolls over the tuition calendar only |
+| `GET` `PUT` `DELETE` | `/admissions/years/{id}`, `/admissions/categories/{id}` | 404 for a school-only record - it is not on this board |
+| `GET` | `/admissions/years/current` | The current tuition year; readable by anyone in the programme |
+| `GET` `POST` | `/admissions/years/{id}/students`, `/admissions/students/unassigned` | Tuition roster for a year; who is mapped to none. `POST` maps a list in (the tuition rollover - there are no classes to promote through) |
+| `POST` `GET` | `/notices`, `/notices/{id}` | **Post to the tuition board.** Always TUITION notices, so they reach tuition accounts only. Audience `EVERYONE`, `ROLE` or `USER`; `CLASS` is refused |
+| `PUT` `DELETE` | `/notices/{id}` | Edit; remove (prefer archive) |
+| `POST` | `/notices/{id}/publish` `/archive` | Go live (returns `recipient_count`); take down keeping the record |
 
 **Teacher** — `/api/v1/tuition/teachers/…`
 
@@ -330,6 +435,10 @@ item, so it follows a student's current enrollments instead of going stale silen
 | `POST` | `/sessions/{id}/join` | Join and get the link. Joining late does not shorten the class |
 | `GET` | `/assessments`, `/report-cards` | Work set for me (answer keys stripped); published cards |
 | `GET` | `/reports/me` | My own attendance, by subject |
+| `GET` | `/package/me` | The package I am on and how many of its classes I have used this term |
+| `GET` | `/fees/me?period_start&period_end&currency=` | **The fee page.** The period's classes counted against my package, with the per-subject breakdown, then this currency's own tax and convenience charge. `currency_options` lists every offered currency with its charges and what the period comes to in it; `recommended_currency` (the base, INR) is what to preselect |
+| `GET` | `/invoices`, `/invoices/{id}` | Issued bills only, with payments and `amount_outstanding` |
+| `POST` `GET` | `/invoices/{id}/intents` | **The checkout.** Start a payment (`method`: UPI, CARD, NET_BANKING, WALLET, BANK_TRANSFER, OFFICE) and get a `checkout_url` or a reference to quote; list my attempts |
 
 **Library & preferences** — `/api/v1/tuition/…` (all three roles)
 
@@ -341,6 +450,7 @@ item, so it follows a student's current enrollments instead of going stale silen
 | `GET` `PUT` `DELETE` | `/library/{id}` | One item; edit or remove my own |
 | `POST` | `/library/{id}/download` | Count an access and get the URL |
 | `GET` `PUT` | `/me`, `/me/timezone` | Who I am here; `effective_timezone` and `timezone_source`. `PUT` pins a zone, `null` unpins back to browser detection |
+| `GET` `POST` | `/notices/feed`, `/notices/{id}`, `/notices/{id}/dismiss` | The tuition notice board: feed with `unread_count`; open one (records a read); clear from the badge. Tuition notices only |
 
 
 ### Public registration removed (security fix)
@@ -1184,6 +1294,25 @@ It authenticates over the dev password endpoint, so it requires `FIREBASE_WEB_AP
 ---
 
 ## Seed Data
+
+### Payment-page demo (tuition)
+
+`scripts/seed_payment_demo.py` gives one tuition student a month of conducted classes so the
+payment page has real figures to show: three subjects on three fee bases (per class, per class
+with a missed-class rate, hourly), a tuition session year and two admission categories, three
+currencies with their own tax and convenience rules (INR base with GST 18% + 2%, AED with VAT
+5% + 2.9% + 1, USD with 3.5% + 0.30), an issued September invoice and a part-payment against it.
+
+```bash
+python -m scripts.seed_payment_demo --dry-run          # print the plan
+python -m scripts.seed_payment_demo                    # student@tution.com
+python -m scripts.seed_payment_demo --student x@y.com  # any tuition student
+```
+
+Additive and idempotent: run it twice and nothing changes. Every figure is chosen so the
+arithmetic checks by hand (subtotal 9,975 INR; total ₹12,006). Undo with
+`python -m scripts.reset_tuition_data --confirm --student <id>`.
+
 
 `app/db/init_db.py` seeds demo data at startup when absent. Credentials are created in Firebase Auth, not stored locally:
 

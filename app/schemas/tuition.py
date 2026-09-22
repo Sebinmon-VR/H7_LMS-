@@ -22,10 +22,12 @@ from typing import Any, List
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.enums import (
-    AttendanceStatus, DayOfWeek, ExamMode, ExamStatus, FeeBasis, GradingScheme,
-    InvoiceStatus, LibraryVisibility, Program, TuitionEnrollmentStatus, TuitionSessionStatus,
+    AcademicTerm, AttendanceStatus, DayOfWeek, ExamMode, ExamStatus, GradingScheme,
+    InvoiceStatus, LibraryVisibility, PackageBillingMode, Program, TuitionEnrollmentStatus,
+    TuitionSessionStatus,
 )
 from app.schemas.academic import SubjectOut
+from app.schemas.finance import CurrencyOptionOut
 from app.schemas.user import UserProfileFields
 
 
@@ -127,6 +129,10 @@ class TuitionUserSummary(BaseModel):
     programs: List[str] = Field(default_factory=lambda: ["LMS"])
     admission_number: str | None = None
     employee_id: str | None = None
+    # Which tuition batch and basis of admission a student was taken in under. Ids into
+    # `/admin/tuition/admissions`; null for teachers and for students mapped to no year yet.
+    academic_year_id: int | None = None
+    admission_category_id: int | None = None
     phone: str | None = None
     timezone: str | None = Field(None, description="Explicitly chosen zone, if any")
     detected_timezone: str | None = Field(
@@ -162,7 +168,6 @@ class TuitionEnrollmentCreate(BaseModel):
         None, ge=10, le=480, description="Class length for this arrangement. Falls back to "
                                          "the programme default."
     )
-    fee_plan_id: int | None = Field(None, description="Overrides the subject's fee plan")
     start_date: date | None = None
     end_date: date | None = None
     notes: str | None = Field(None, max_length=2000)
@@ -176,7 +181,6 @@ class TuitionEnrollmentUpdate(BaseModel):
     goals: str | None = Field(None, max_length=2000)
     grade_level: str | None = Field(None, max_length=50)
     default_duration_minutes: int | None = Field(None, ge=10, le=480)
-    fee_plan_id: int | None = None
     start_date: date | None = None
     end_date: date | None = None
     notes: str | None = Field(None, max_length=2000)
@@ -196,7 +200,6 @@ class TuitionEnrollmentOut(BaseModel):
     goals: str | None = None
     grade_level: str | None = None
     default_duration_minutes: int | None = None
-    fee_plan_id: int | None = None
     start_date: date | None = None
     end_date: date | None = None
     notes: str | None = None
@@ -493,6 +496,14 @@ class LibraryItemBase(BaseModel):
         default_factory=list, description="Named individuals this reaches regardless of visibility"
     )
     tags: List[str] = Field(default_factory=list, max_length=20)
+    # Which syllabus this material is for - CBSE, ICSE, IGCSE. A list, because one worksheet
+    # genuinely serves two boards. Empty means general: when an admin turns on syllabus
+    # filtering, untagged material stays visible to everybody rather than disappearing, so a
+    # library built before anybody was tagging does not go blank.
+    syllabus: List[str] = Field(
+        default_factory=list, max_length=10,
+        description="e.g. [\"CBSE\"]. Empty means it is shown to every syllabus.",
+    )
 
 
 class LibraryLinkCreate(LibraryItemBase):
@@ -519,6 +530,7 @@ class LibraryItemUpdate(BaseModel):
     visibility: LibraryVisibility | None = None
     shared_with_user_ids: List[int] | None = None
     tags: List[str] | None = None
+    syllabus: List[str] | None = None
     external_url: str | None = Field(None, max_length=2048)
 
 
@@ -546,6 +558,7 @@ class LibraryItemOut(BaseModel):
     storage_provider: str | None = None
     storage_warning: str | None = None
     tags: List[str] = Field(default_factory=list)
+    syllabus: List[str] = Field(default_factory=list)
     shared_with_user_ids: List[int] = Field(default_factory=list)
 
     uploaded_by: int
@@ -631,57 +644,177 @@ class TuitionReportCardCreate(BaseModel):
 # Fees
 # ---------------------------------------------------------------------------------------
 
-class FeePlanCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=150)
-    basis: FeeBasis = FeeBasis.PER_SESSION
-    amount: float = Field(..., ge=0)
-    currency: str | None = Field(None, max_length=8)
-    subject_id: int | None = Field(None, description="Scopes to one subject; null is the default plan")
-    no_show_amount: float | None = Field(
-        None, ge=0, description="Charged for a class the student missed. Null bills in full."
+class TuitionPackageCreate(BaseModel):
+    """
+    What a student buys: so many classes for so much, on any subjects.
+
+    `POST /admin/tuition/packages`. "15,000 for 30 classes" is `amount=15000,
+    classes_included=30`; the per-class rate (500) is derived, never typed. Scope the
+    package to a year and a term for a "Term 1 2026-27" offer, or leave both null for a
+    standing one.
+    """
+    name: str = Field(..., min_length=1, max_length=150, description='e.g. "Standard - 30 classes"')
+    amount: float = Field(..., ge=0, description="The package price, in the base currency.")
+    classes_included: int = Field(
+        ..., ge=1, description="Classes the package buys, across every subject."
     )
-    charge_teacher_no_show: bool = False
+    currency: str | None = Field(None, max_length=8)
+    billing_mode: PackageBillingMode = Field(
+        PackageBillingMode.PER_CLASS,
+        description="PER_CLASS bills the classes attended each period at amount / "
+                    "classes_included. PACKAGE bills the whole amount once per term, then "
+                    "only classes beyond the allowance.",
+    )
+    academic_year_id: int | None = Field(
+        None, description="Scopes to one academic year; null offers it in every year. "
+                          "The year must include TUITION in its programs.",
+    )
+    term: AcademicTerm | None = Field(
+        None, description="Scopes to Term 1 or Term 2; null offers it in both."
+    )
+    max_subjects: int | None = Field(
+        None, ge=1, description="Cap on concurrent subjects for a student on this package."
+    )
+    count_missed_classes: bool = Field(
+        True, description="Whether a class the student missed without notice still uses "
+                          "one of the package's classes.",
+    )
     is_active: bool = True
     notes: str | None = Field(None, max_length=1000)
 
 
-class FeePlanUpdate(BaseModel):
+class TuitionPackageUpdate(BaseModel):
+    """Partial update; omitted fields are left unchanged."""
     name: str | None = Field(None, min_length=1, max_length=150)
-    basis: FeeBasis | None = None
     amount: float | None = Field(None, ge=0)
+    classes_included: int | None = Field(None, ge=1)
     currency: str | None = Field(None, max_length=8)
-    subject_id: int | None = None
-    no_show_amount: float | None = Field(None, ge=0)
-    charge_teacher_no_show: bool | None = None
+    billing_mode: PackageBillingMode | None = None
+    academic_year_id: int | None = None
+    term: AcademicTerm | None = None
+    max_subjects: int | None = Field(None, ge=1)
+    count_missed_classes: bool | None = None
     is_active: bool | None = None
     notes: str | None = Field(None, max_length=1000)
 
 
-class FeePlanOut(BaseModel):
+class TuitionPackageOut(BaseModel):
     id: int
     name: str
-    basis: str
     amount: float
+    classes_included: int
+    # amount / classes_included. What one class of the allowance costs.
+    per_class_amount: float = 0.0
     currency: str
-    subject_id: int | None = None
-    no_show_amount: float | None = None
-    charge_teacher_no_show: bool = False
+    billing_mode: str
+    academic_year_id: int | None = None
+    academic_year_name: str | None = None
+    term: str | None = None
+    term_name: str | None = None
+    max_subjects: int | None = None
+    count_missed_classes: bool = True
     is_active: bool = True
     notes: str | None = None
+    # How many students are currently on it, so the list can say which are in use.
+    students_assigned: int = 0
     created_at: datetime | None = None
+    updated_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True, extra="ignore")
+
+
+class PackageAssignmentCreate(BaseModel):
+    """
+    Puts a student on a package for a term. `PUT /admin/tuition/students/{id}/package`.
+
+    Everything but `package_id` defaults: the year and term from the package's own scope,
+    else from the calendar (today's term), and the dates from that term. Assigning again
+    for the same year and term replaces the earlier assignment.
+    """
+    package_id: int
+    academic_year_id: int | None = Field(
+        None, description="Defaults to the package's year, else the tuition year today is in."
+    )
+    term: AcademicTerm | None = Field(
+        None, description="Defaults to the package's term, else the term today is in."
+    )
+    starts_on: date | None = Field(None, description="Defaults to the term's first day.")
+    ends_on: date | None = Field(None, description="Defaults to the term's last day.")
+    notes: str | None = Field(None, max_length=1000)
+
+    @model_validator(mode="after")
+    def _dates_in_order(self):
+        if self.starts_on and self.ends_on and self.ends_on < self.starts_on:
+            raise ValueError("ends_on cannot be earlier than starts_on")
+        return self
+
+
+class PackageAssignmentOut(BaseModel):
+    id: int
+    student_id: int
+    student_name: str | None = None
+    package_id: int
+    package_name: str | None = None
+    package_amount: float = 0.0
+    classes_included: int = 0
+    billing_mode: str | None = None
+    currency: str | None = None
+    academic_year_id: int | None = None
+    academic_year_name: str | None = None
+    term: str | None = None
+    term_name: str | None = None
+    starts_on: date | None = None
+    ends_on: date | None = None
+    is_active: bool = True
+    notes: str | None = None
+    assigned_by: int | None = None
+    created_at: datetime | None = None
+    ended_at: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True, extra="ignore")
+
+
+class PackageStatusOut(BaseModel):
+    """
+    Where a student stands on their package as of a date: what they are on, and how much of
+    it they have used. `assignment` and `package` are null when nothing is assigned - the
+    normal state of a student admitted this morning, not an error.
+    """
+    student_id: int
+    as_of: date
+    assignment: PackageAssignmentOut | None = None
+    package: TuitionPackageOut | None = None
+    usage_from: date | None = None
+    usage_to: date | None = None
+    classes_included: int | None = None
+    classes_used_to_date: int = 0
+    classes_remaining: int | None = None
+    classes_over: int = 0
 
 
 class InvoiceGenerate(BaseModel):
     """
     Builds a bill from counted classes. Refuses to overwrite one that has already been issued.
+
+    Tax and the convenience charge are computed from the chosen currency's own settings.
+    `tax_amount` overrides the computed figure for the period an administrator has to
+    reconcile by hand - it is null by default, because a default of zero would read as
+    "charge no tax" and silently switch the setting off for every bill.
     """
     student_id: int
     period_start: date
     period_end: date
-    discount_amount: float = Field(0.0, ge=0)
-    tax_amount: float = Field(0.0, ge=0)
+    discount_amount: float = Field(
+        0.0, ge=0, description="Manual adjustment for the period, in the base currency."
+    )
+    tax_amount: float | None = Field(
+        None, ge=0,
+        description="Overrides the computed tax. Omit to use the currency's tax settings.",
+    )
+    currency: str | None = Field(
+        None, max_length=8,
+        description="Bill in this currency. The rate is frozen when the invoice is issued.",
+    )
     due_date: date | None = None
     notes: str | None = Field(None, max_length=1000)
 
@@ -714,12 +847,40 @@ class InvoiceOut(BaseModel):
     period_end: date
     status: str = InvoiceStatus.DRAFT.value
     currency: str
+    currency_symbol: str | None = None
+    base_currency: str | None = None
+    # Frozen when the invoice is issued, so a bill does not re-convert at today's rate.
+    exchange_rate: float = 1.0
+    available_currencies: List[str] = Field(default_factory=list)
+    # Which session year, term and package produced these figures.
+    academic_year_id: int | None = None
+    academic_year_name: str | None = None
+    term: str | None = None
+    term_name: str | None = None
+    package_id: int | None = None
+    package_name: str | None = None
+    assignment_id: int | None = None
+    billing_mode: str | None = None
+    classes_included: int | None = None
+    classes_billed: int = 0
+    classes_used_to_date: int = 0
+    classes_remaining: int | None = None
+    tax_label: str | None = None
+    # True when an administrator typed the tax figure rather than letting the currency's
+    # settings compute it.
+    tax_is_manual: bool = False
+    taxable_base: float = 0.0
+    convenience_amount: float = 0.0
     line_items: List[dict] = Field(default_factory=list)
     subtotal: float = 0.0
     discount_amount: float = 0.0
     tax_amount: float = 0.0
     total_amount: float = 0.0
     amount_paid: float = 0.0
+    # Attached by `present_invoice` on the payer's routes; zero and off on the raw record.
+    amount_outstanding: float = 0.0
+    gateway_enabled: bool = False
+    gateway_provider: str | None = None
     payments: List[dict] = Field(default_factory=list)
     issued_at: datetime | None = None
     due_date: date | None = None
@@ -828,7 +989,6 @@ class ProgramSettingsUpdate(BaseModel):
     session_horizon_days: int | None = Field(None, ge=1, le=365)
     student_uploads_need_approval: bool | None = None
     currency: str | None = Field(None, max_length=8)
-    default_session_fee: float | None = Field(None, ge=0)
     auto_create_meet: bool | None = None
 
 
@@ -840,3 +1000,190 @@ class TimezoneUpdate(BaseModel):
     An empty value clears it and puts them back on programme time.
     """
     timezone: str | None = Field(None, description="IANA zone, e.g. 'Europe/London'. Null clears it.")
+
+
+class StudentSubjectAdd(BaseModel):
+    """
+    Adds a subject for a student. `POST /admin/tuition/students/{id}/subjects`.
+
+    The student-centric face of `TuitionEnrollmentCreate` - same record, minus the
+    `student_id` that is already in the path. `teacher_id` is required because a subject with
+    nobody teaching it is not an arrangement, and leaving it to be filled in later is how a
+    student ends up enrolled in a class that never happens.
+    """
+    subject_id: int
+    teacher_id: int
+    syllabus: str | None = Field(None, max_length=5000)
+    grade_level: str | None = Field(None, max_length=50)
+    default_duration_minutes: int | None = Field(None, ge=10, le=480)
+    start_date: date | None = None
+    notes: str | None = Field(None, max_length=2000)
+
+
+class StudentSubjectOut(BaseModel):
+    """One subject a student takes, with its teacher and how many classes have run."""
+    enrollment_id: int
+    student_id: int
+    student_name: str | None = None
+    subject_id: int | None = None
+    subject_name: str | None = None
+    subject_code: str | None = None
+    teacher_id: int | None = None
+    teacher_name: str | None = None
+    status: str | None = None
+    syllabus: str | None = None
+    grade_level: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    # Scheduled classes, and the subset that actually took place. The pair is what tells an
+    # admin whether an enrollment is running or merely exists.
+    session_count: int = 0
+    conducted_count: int = 0
+
+    model_config = ConfigDict(from_attributes=True, extra="ignore")
+
+
+class SubjectUsageOut(BaseModel):
+    """
+    One subject's share of the classes on a package line.
+
+    Counts only - the money is on the package, not the subject - but these are what let a
+    parent check "14 classes" against the timetable: 6 English, 5 Maths, 3 Science.
+    """
+    enrollment_id: int | str
+    subject_id: int | None = None
+    subject_name: str | None = None
+    subject_code: str | None = None
+    teacher_id: int | None = None
+    teacher_name: str | None = None
+    # Classes this subject spent from the package in the period.
+    classes_counted: int = 0
+    sessions_conducted: int = 0
+    sessions_billable: int = 0
+    sessions_attended: int = 0
+    sessions_missed: int = 0
+    sessions_cancelled: int = 0
+    teacher_no_show: int = 0
+    taught_minutes: float = 0.0
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class TuitionBreakdownLine(BaseModel):
+    """
+    The package line on a tuition bill, with the counts it was priced from.
+
+    One line per bill: the package, how many classes were counted in the period, where the
+    student stands on the allowance, and the subjects those classes came from. Under
+    PER_CLASS billing `amount` is `classes_billed x unit_amount`; under PACKAGE billing it
+    is `package_amount + overage_amount`.
+    """
+    package_id: int | None = None
+    package_name: str | None = None
+    assignment_id: int | None = None
+    billing_mode: str | None = None
+    term: str | None = None
+    term_name: str | None = None
+
+    classes_included: int | None = None
+    # The per-class rate, `amount / classes_included`, in the displayed currency.
+    unit_amount: float | None = None
+    unit_label: str | None = "class"
+    quantity: float = 0.0
+    classes_billed: int = 0
+    classes_used_before_period: int = 0
+    classes_used_to_date: int = 0
+    classes_remaining: int | None = None
+    usage_from: date | None = None
+
+    # PACKAGE billing only: the flat charge (zero when already billed this term) and the
+    # classes beyond the allowance charged at the per-class rate.
+    package_amount: float = 0.0
+    overage_classes: int = 0
+    overage_amount: float = 0.0
+    already_billed_on: str | None = None
+    note: str | None = None
+
+    # The same figures before conversion, so a payer switching currency can see where the
+    # number came from.
+    base_amount: float | None = None
+    base_unit_amount: float | None = None
+
+    sessions_conducted: int = 0
+    sessions_billable: int = 0
+    sessions_attended: int | None = None
+    sessions_missed: int | None = None
+    sessions_cancelled: int = 0
+    teacher_no_show: int = 0
+    taught_minutes: float | None = None
+    subjects: List[SubjectUsageOut] = Field(default_factory=list)
+
+    amount: float = 0.0
+    taxable: bool = False
+    discount_amount: float = 0.0
+    tax_amount: float = 0.0
+    net_amount: float = 0.0
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class TuitionFeeBreakdownOut(BaseModel):
+    """
+    The tuition payment page's data.
+
+    Same shape and same guarantees as the school's `FeeBreakdownOut`: one computation serves
+    the student's page, the parent's, the admin's preview and the invoice generator, so a
+    preview cannot disagree with the bill.
+
+    The totals relate as:
+
+        subtotal - discount_total + tax_total + convenience_total
+          (+/- rounding_adjustment) = total_amount
+    """
+    student_id: int
+    student_name: str | None = None
+    admission_number: str | None = None
+    period_start: date
+    period_end: date
+    academic_year_id: int | None = None
+    academic_year_name: str | None = None
+    term: str | None = None
+    term_name: str | None = None
+
+    # The package the period was priced against, and where the student stands on it. Null
+    # package fields mean nothing is assigned: the classes are counted but unpriced.
+    package_id: int | None = None
+    package_name: str | None = None
+    assignment_id: int | None = None
+    billing_mode: str | None = None
+    classes_included: int | None = None
+    classes_billed: int = 0
+    classes_used_to_date: int = 0
+    classes_remaining: int | None = None
+    subjects: List[SubjectUsageOut] = Field(default_factory=list)
+
+    currency: str
+    currency_symbol: str | None = None
+    base_currency: str | None = None
+    exchange_rate: float = 1.0
+    available_currencies: List[str] = Field(default_factory=list)
+    # The switcher. Each option carries its own tax and surcharge rules **and** what this
+    # period would come to in it, so the page can show "INR (recommended) / AED / USD" with
+    # the totals before the payer picks. The base currency is the recommended one.
+    recommended_currency: str | None = None
+    currency_options: List[CurrencyOptionOut] = Field(default_factory=list)
+
+    line_items: List[TuitionBreakdownLine] = Field(default_factory=list)
+    subtotal: float = 0.0
+    discount_total: float = 0.0
+    taxable_base: float = 0.0
+    tax_total: float = 0.0
+    tax_label: str = "Tax"
+    convenience_total: float = 0.0
+    total_amount: float = 0.0
+    rounding_adjustment: float = 0.0
+
+    sessions_conducted: int = 0
+    gateway_enabled: bool = False
+    gateway_provider: str | None = None
+    detail: str | None = None
