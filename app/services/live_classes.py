@@ -367,11 +367,64 @@ def sweep(reference: datetime | None = None) -> dict:
     now = reference or _now()
     result = {
         "ran_at": now.isoformat(),
+        "rooms_created": 0,
+        "rooms_failed": 0,
+        "teachers_invited": 0,
+        "attendance_synced": 0,
         "auto_started": 0,
         "closed_stale": 0,
         "parent_reports_sent": 0,
         "errors": [],
     }
+
+    # The class rooms first, so a room exists before the period it is for auto-starts.
+    # Imported here: class_rooms reads this module's timing helpers, and a top-level import
+    # either way would be circular.
+    try:
+        from app.services import class_rooms
+
+        rooms = class_rooms.ensure_rooms_for_today()
+        result["rooms_created"] = len(rooms["created"])
+        result["rooms_failed"] = len(rooms["failed"])
+        result["rooms_opened"] = len(rooms["opened"])
+        for failure in rooms["failed"]:
+            result["errors"].append(f"room for {failure['class']}: {failure['error']}")
+        for failure in rooms["open_failed"]:
+            result["errors"].append(f"open access for {failure['class']}: {failure['error']}")
+    except Exception as exc:  # pragma: no cover - a sweep must never kill its thread
+        log_backend_failure(logger, "Class room sweep failed", exc)
+        result["errors"].append(f"class_rooms: {exc}")
+
+    # Meet's own attendance for today's rooms, copied every few minutes. Costs nothing but
+    # one refused token every half hour until the school authorises the Meet read scope.
+    try:
+        from app.services import class_rooms
+
+        attendance = class_rooms.sync_attendance_for_today()
+        result["attendance_synced"] = len(attendance["synced"])
+        # Reported once, not per class: every class fails the same way when the scope is
+        # the problem, and the sweep stops after the first.
+        if attendance["failed"]:
+            result["errors"].append(
+                f"attendance for {attendance['failed'][0]['class']}: {attendance['failed'][0]['error']}"
+            )
+    except Exception as exc:  # pragma: no cover
+        log_backend_failure(logger, "Attendance sync failed", exc)
+        result["errors"].append(f"attendance: {exc}")
+
+    # Teachers who would otherwise knock on their own upcoming sessions. Stamped once per
+    # session, so this is a handful of Calendar calls after a deploy and nothing after.
+    try:
+        from app.services.content import repair_teacher_access
+
+        repaired = repair_teacher_access(days_ahead=2)
+        result["teachers_invited"] = repaired["invited"]
+        result["sessions_opened"] = repaired["opened"]
+        for failure in repaired["failures"]:
+            result["errors"].append(f"invite for '{failure['title']}': {failure['error']}")
+    except Exception as exc:  # pragma: no cover
+        log_backend_failure(logger, "Teacher invite sweep failed", exc)
+        result["errors"].append(f"teacher_access: {exc}")
 
     # Each step is caught separately. A failure in one must not stop the others, or a bad
     # meeting record silently stops every class in the school from being closed.

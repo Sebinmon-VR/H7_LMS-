@@ -26,9 +26,12 @@ from app.core.firebase import firestore_meetings
 from app.schemas.calendar import CalendarDay, CalendarEvent, CalendarOut
 from app.schemas.user import UserOut
 from app.schemas.workflow import (
-    ClassTimingOut, ExtraClassCreate, ExtraClassDecision, ExtraClassOut, JoinClassOut,
+    ClassRoomAccessOut, ClassTimingOut, ExtraClassCreate, ExtraClassDecision, ExtraClassOut,
+    JoinClassOut, JoinRoomOut,
 )
+from app.schemas.workflow import RoomPresenceOut
 from app.services import calendar as calendar_service
+from app.services import class_rooms
 from app.services import extra_classes as extra_service
 from app.services import live_classes
 from app.services import permissions
@@ -98,6 +101,12 @@ def join_class(meeting_id: int, user: UserOut = Depends(require_any_authenticate
     _assert_may_see(meeting, user)
     timing = live_classes.assert_may_join(meeting, user)
 
+    if meeting.get("class_id") is not None:
+        class_rooms.log_event(
+            meeting["class_id"], class_rooms.EVENT_JOINED_SESSION, user,
+            meeting_id=meeting["id"], detail=meeting.get("title"),
+        )
+
     return JoinClassOut(
         meeting_id=int(meeting["id"]),
         title=meeting.get("title") or "Live class",
@@ -120,6 +129,11 @@ def start_class(meeting_id: int, teacher: UserOut = Depends(require_teacher)):
     meeting = live_classes.require_meeting(meeting_id)
     _assert_may_see(meeting, teacher)
     started = live_classes.start_meeting(meeting, teacher.id)
+    if meeting.get("class_id") is not None and started is not meeting:
+        class_rooms.log_event(
+            meeting["class_id"], class_rooms.EVENT_STARTED, teacher,
+            meeting_id=meeting["id"], detail=meeting.get("title"),
+        )
     return ClassTimingOut(**live_classes.timing_view(started))
 
 
@@ -131,6 +145,11 @@ def end_class(meeting_id: int, teacher: UserOut = Depends(require_teacher)):
     meeting = live_classes.require_meeting(meeting_id)
     _assert_may_see(meeting, teacher)
     ended = live_classes.end_meeting(meeting, teacher.id)
+    if meeting.get("class_id") is not None and ended is not meeting:
+        class_rooms.log_event(
+            meeting["class_id"], class_rooms.EVENT_ENDED, teacher,
+            meeting_id=meeting["id"], detail=meeting.get("title"),
+        )
     return ClassTimingOut(**live_classes.timing_view(ended))
 
 
@@ -182,6 +201,80 @@ def my_live_classes(user: UserOut = Depends(require_any_authenticated)):
 
     live.sort(key=lambda m: str(m["timing"]["scheduled_start_at"] or ""))
     return live
+
+
+# ---------------------------------------------------------------------------------------
+# Class rooms: the one standing Meet room per class
+#
+# The classroom model. A session (above) is one teacher's period; the room is where the
+# whole class sits all day and where every period happens. Students are let in while any
+# period is on; teachers and admins may always enter their class's room.
+# ---------------------------------------------------------------------------------------
+
+@router.get("/rooms/mine", response_model=List[ClassRoomAccessOut])
+def my_class_rooms(user: UserOut = Depends(require_any_authenticated)):
+    """
+    The rooms this user belongs to, with today's periods and whether they may enter now.
+
+    A student gets their class; a teacher every class they teach or lead; an admin all of
+    them. Bind the join button to `may_join` and show `join_blocked_reason` when it is
+    false. `room_link` is present only when the caller may enter.
+    """
+    return [
+        ClassRoomAccessOut(**class_rooms.access_for(c, user))
+        for c in class_rooms.visible_classes(user)
+    ]
+
+
+@router.get("/rooms/{class_id}", response_model=ClassRoomAccessOut)
+def class_room_access(class_id: int, user: UserOut = Depends(require_any_authenticated)):
+    """One class's room as this user sees it right now. Poll it for the day's clock."""
+    class_room = class_rooms.require_class(class_id)
+    class_rooms.assert_may_see(class_room, user)
+    return ClassRoomAccessOut(**class_rooms.access_for(class_room, user))
+
+
+@router.post("/rooms/{class_id}/join", response_model=JoinRoomOut)
+def join_class_room(class_id: int, user: UserOut = Depends(require_any_authenticated)):
+    """
+    Enter the class's room, returning the link only if you actually may.
+
+    A student is let in while any period of the class is on (from the join window before it
+    to the grace period after) or any scheduled session is live; otherwise 409 with a
+    readable reason. A teacher or admin may always enter, and if the class has no room yet
+    one is created for them on the way in.
+    """
+    class_room = class_rooms.require_class(class_id)
+    class_rooms.assert_may_see(class_room, user)
+    return JoinRoomOut(**class_rooms.join_room(class_room, user))
+
+
+@router.post("/rooms/{class_id}/leave", response_model=ClassRoomAccessOut)
+def leave_class_room(class_id: int, user: UserOut = Depends(require_any_authenticated)):
+    """
+    Record that you have left the room.
+
+    The LMS cannot see a Meet tab close, so leaving is something you tell it; the class's
+    log then carries your join and leave times. Nothing is done to the Meet call itself.
+    """
+    class_room = class_rooms.require_class(class_id)
+    class_rooms.assert_may_see(class_room, user)
+    return ClassRoomAccessOut(**class_rooms.leave_room(class_room, user))
+
+
+@router.get("/rooms/{class_id}/presence", response_model=RoomPresenceOut)
+def class_room_presence(class_id: int, user: UserOut = Depends(require_any_authenticated)):
+    """
+    Who is in the room right now, by name - for the teachers of the class and the office.
+
+    From the LMS log: a student is in when their last word today was a join. Poll it while
+    a teacher's panel is open. A student may not see who else is in.
+    """
+    class_room = class_rooms.require_class(class_id)
+    class_rooms.assert_may_see(class_room, user)
+    if user.role == UserRole.STUDENT:
+        raise HTTPException(status_code=403, detail="Only teachers and the office can see who is in the room.")
+    return RoomPresenceOut(**class_rooms.presence_for_class(class_room))
 
 
 # ---------------------------------------------------------------------------------------

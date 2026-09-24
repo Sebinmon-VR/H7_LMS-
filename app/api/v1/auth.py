@@ -20,6 +20,7 @@ from app.core.firebase import firestore_users
 from app.core.firebase_auth import sign_in_with_password
 from app.schemas.auth import Token, LoginRequest
 from app.schemas.user import UserOut
+from app.services import presence
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -95,3 +96,15 @@ def get_current_user_profile(current_user: UserOut = Depends(get_current_user)):
     Get details of the currently logged in user profile.
     """
     return current_user
+
+
+@router.post("/heartbeat")
+def heartbeat(current_user: UserOut = Depends(get_current_user)):
+    """
+    A sign of life from an open tab.
+
+    The frontend sends one a minute while a page is visible, so somebody reading without
+    clicking still shows as online to the office. Every authenticated request counts as
+    well; this is for the quiet stretches. Resolving the user already recorded the touch.
+    """
+    return {"ok": True, "online_window_seconds": presence.ONLINE_WINDOW_SECONDS}

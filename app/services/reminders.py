@@ -132,7 +132,12 @@ class _SweepContext:
                 when = when.replace(tzinfo=starts_at.tzinfo)
             if window_start <= when <= window_end:
                 return meeting["meeting_link"]
-        return None
+
+        # No session scheduled for the slot, but the class may have its standing room - the
+        # link every period of the day uses - which is exactly what the reminder should
+        # carry when the school runs the classroom model.
+        class_room = firestore_classes.get_document(str(class_id)) or {}
+        return class_room.get("room_link") or None
 
 
 def _wants_reminders(user: dict) -> bool:

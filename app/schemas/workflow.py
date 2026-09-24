@@ -139,6 +139,173 @@ class JoinClassOut(BaseModel):
     timing: ClassTimingOut
 
 
+class ClassRoomAccessOut(BaseModel):
+    """
+    A class's standing room, as one person sees it right now.
+
+    The school runs one Google Meet room per class: students join it and stay, and each
+    subject teacher joins at their period. `may_join` is the single flag a join button
+    binds to - for a student it is true while any period of the class is on (within the
+    join window) or any scheduled session is live; a teacher or admin may always enter.
+    `join_blocked_reason` is the sentence to show when it is false.
+    """
+    class_id: int
+    class_name: str
+    class_code: str | None = None
+
+    has_room: bool = False
+    # GOOGLE_MEET or MANUAL.
+    room_provider: str | None = None
+    # NONE, CREATED, MANUAL or FAILED; `room_error` explains FAILED.
+    room_status: str | None = None
+    room_error: str | None = None
+    room_recording_status: str | None = None
+    # Whether the school shares rooms per class at all (the admin setting).
+    class_room_mode: bool = True
+    is_host: bool = False
+
+    now: datetime
+    may_join: bool = False
+    join_blocked_reason: str | None = None
+
+    current_period: Any | None = None
+    next_period: Any | None = None
+    periods_today: list[Any] = Field(default_factory=list)
+    # The day's window: a student joins once at `day_opens_at` and stays until
+    # `day_closes_at`, breaks included.
+    day_opens_at: datetime | None = None
+    day_closes_at: datetime | None = None
+    # This person's own window: a teacher's runs around their period (current or next), a
+    # student's is the day, an admin has none. `my_*_period` are a teacher's own periods.
+    window_opens_at: datetime | None = None
+    window_closes_at: datetime | None = None
+    my_current_period: Any | None = None
+    my_next_period: Any | None = None
+    # The caller is this class's class teacher: they get the students' whole-day window.
+    leads_class: bool = False
+    # Admins may always enter; every other host is bound to their own periods.
+    is_admin: bool = False
+    live_meeting_ids: list[int] = Field(default_factory=list)
+
+    # The caller's own last movement today (JOINED_ROOM / LEFT_ROOM ...), for "you joined
+    # at 9:02" and the leave button. `in_room` is true when that last word was a join.
+    my_last_action: str | None = None
+    my_last_at: datetime | None = None
+    in_room: bool = False
+
+    # Present only when the caller may enter, the same rule the session join applies.
+    room_link: str | None = None
+
+
+class JoinRoomOut(BaseModel):
+    class_id: int
+    class_name: str
+    room_link: str | None = None
+    access: ClassRoomAccessOut
+
+
+class ClassRoomEventOut(BaseModel):
+    """
+    One line of a class's room log: a join the LMS handed a link out for, a period a teacher
+    opened or closed, a room made or removed. What the LMS itself saw - Google does not
+    report who is inside a Meet to this app.
+    """
+    id: int | None = None
+    class_id: int
+    meeting_id: int | None = None
+    user_id: int | None = None
+    user_name: str | None = None
+    role: str | None = None
+    # JOINED_ROOM, JOINED_SESSION, STARTED, ENDED, ROOM_CREATED, ROOM_REPLACED,
+    # ROOM_LINK_SET, ROOM_CLEARED.
+    action: str
+    detail: str | None = None
+    at: datetime
+
+
+class LiveSessionOut(BaseModel):
+    meeting_id: int
+    title: str | None = None
+    subject_name: str | None = None
+    teacher_name: str | None = None
+    timing: ClassTimingOut
+
+
+class LiveClassBoardRow(ClassRoomAccessOut):
+    """
+    One class on the admin's live board: the room and today's clock, plus who has come in.
+
+    `students_joined_today` counts distinct students the LMS let into the room or a session
+    today; `teacher_present` says a teacher came in since the current period opened.
+    Neither can see somebody who left, so they are attendance as the LMS knows it, not as
+    Google does.
+    """
+    enrolled_count: int = 0
+    students_joined_today: int = 0
+    teachers_joined_today: list[str] = Field(default_factory=list)
+    teacher_present: bool = False
+    # In the room right now by the LMS's reckoning: their last word today was a join.
+    students_in_now: list[str] = Field(default_factory=list)
+    teachers_in_now: list[str] = Field(default_factory=list)
+    live_sessions: list[LiveSessionOut] = Field(default_factory=list)
+    last_event: ClassRoomEventOut | None = None
+    is_live: bool = False
+    # Meet's own attendance record: when it was last copied, or why it cannot be yet.
+    room_attendance_synced_at: datetime | None = None
+    room_attendance_error: str | None = None
+
+
+class RoomPresenceRow(BaseModel):
+    user_id: int
+    name: str
+    in_room: bool = False
+    last_action: str | None = None
+    last_at: datetime | None = None
+
+
+class RoomPresenceOut(BaseModel):
+    """
+    Who is in a class's room right now, by name, from the LMS log: a person is in when
+    their last word today was a join, out when it was a leave. For the teacher in front of
+    the class and for the office; Meet's own record is `ClassRoomAttendanceOut`.
+    """
+    class_id: int
+    class_name: str
+    now: datetime
+    enrolled_count: int = 0
+    in_count: int = 0
+    students: list[RoomPresenceRow] = Field(default_factory=list)
+    teachers_in: list[RoomPresenceRow] = Field(default_factory=list)
+    meet_attendance_synced_at: datetime | None = None
+
+
+class ClassRoomAttendanceOut(BaseModel):
+    """
+    One participant of one Meet conference in a class's room, as Google recorded it: when
+    they joined and left, in sessions. Meet gives a display name, not an email, so
+    `matched_user_*` is the LMS's best match by name and may be empty for a guest.
+    """
+    id: str | None = None
+    class_id: int
+    date: date
+    conference_record: str | None = None
+    conference_start_at: datetime | None = None
+    conference_end_at: datetime | None = None
+    participant: str | None = None
+    display_name: str | None = None
+    # SIGNED_IN, ANONYMOUS or PHONE.
+    user_kind: str | None = None
+    matched_user_id: int | None = None
+    matched_user_name: str | None = None
+    matched_role: str | None = None
+    sessions: list[dict] = Field(default_factory=list)
+    first_joined_at: datetime | None = None
+    last_left_at: datetime | None = None
+    still_in: bool = False
+    minutes: float = 0
+    synced_at: datetime | None = None
+
+
 # ---------------------------------------------------------------------------------------
 # Staff leave
 # ---------------------------------------------------------------------------------------

@@ -139,6 +139,16 @@ class Settings(BaseSettings):
     # account under domain-wide delegation, and a Workspace edition that can record at all
     # (Business Standard/Plus, Enterprise, Education Plus, Teaching & Learning Upgrade).
     ENABLE_MEET_AUTO_RECORDING: bool = True
+    # Who may walk into a generated Meet without asking. OPEN: anyone with the link; TRUSTED
+    # (Google's default): the organiser, invited guests and the school's own Workspace users;
+    # RESTRICTED: invited guests only. Blank leaves Google's default alone.
+    #
+    # OPEN, because teachers and students sign into Google with personal addresses the LMS
+    # does not know, so a guest list cannot let them in and TRUSTED makes them knock on their
+    # own class. Set on the space through the Meet API, which needs the
+    # meetings.space.settings scope authorised under domain-wide delegation - the same grant
+    # recording needs. Until it is, the room's `room_access_error` says exactly what to add.
+    MEET_ACCESS_TYPE: str = "OPEN"
     # Comma-separated override for the Meet OAuth scopes, in the same spirit as
     # GOOGLE_CALENDAR_SCOPES: leave blank to let the client settle on whichever set the
     # delegation grant actually authorizes.
@@ -416,6 +426,14 @@ class Settings(BaseSettings):
     # "can I join yet?" and "how long is left?" are the same questions in both and a student
     # who takes both should not meet two different answers.
     SCHOOL_AUTO_START_CLASS: bool = False
+    # One standing Google Meet room per class, rather than a fresh link per period.
+    #
+    # On (the default), a school class has a single room: students join it and stay, and
+    # each subject teacher joins the same room at their timetabled period. Scheduling a
+    # session reuses the class's room instead of minting a Calendar event per subject.
+    # Off restores the previous behaviour of one Meet link per scheduled session. Editable
+    # from the admin's School Settings; this is only the default.
+    SCHOOL_CLASS_ROOM_MODE: bool = True
     # How early the join button opens. Zero means exactly on the hour, which in practice
     # means every student presses a dead button for the minute before class.
     SCHOOL_JOIN_OPEN_MINUTES_BEFORE: int = 5

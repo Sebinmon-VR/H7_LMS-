@@ -30,6 +30,7 @@ from app.core.firebase import (
 )
 from app.services import accounts as account_service
 from app.services import admissions as admission_service
+from app.services import class_rooms as class_room_service
 from app.services import families as family_service
 from app.services import timetable as timetable_service
 from app.services.content import (
@@ -50,7 +51,7 @@ from app.schemas.user import (
     GenerateCredentialsRequest, CredentialsIssued
 )
 from app.schemas.academic import (
-    ClassRoomCreate, ClassRoomUpdate, ClassRoomOut,
+    ClassRoomCreate, ClassRoomUpdate, ClassRoomOut, ClassRoomSetup,
     SubjectCreate, SubjectUpdate, SubjectOut,
     TeacherMappingCreate, TeacherMappingOut,
     ClassTeacherMappingCreate, ClassTeacherMappingOut,
@@ -60,6 +61,9 @@ from app.schemas.reports import (
     SystemMonitoringReport, OverallStats,
     TeacherActivityReport, StudentPerformanceReport
 )
+from app.schemas.presence import UserPresenceOut
+from app.schemas.workflow import ClassRoomAttendanceOut, ClassRoomEventOut, LiveClassBoardRow
+from app.services import presence
 
 # The profile fields a sibling match is made from. An edit touching any of them re-runs
 # the household placement for a student not yet in one.
@@ -111,6 +115,19 @@ def create_user(user_in: UserCreate, admin: UserOut = Depends(require_admin)):
         # than waiting for the office to remember the sibling discount at invoice time.
         family_service.auto_place(account["id"], admin.id)
     return UserOut(**account)
+
+
+@router.get("/users/presence", response_model=List[UserPresenceOut])
+def list_user_presence(_: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Who is online: every user's last sign of life, online first.
+
+    A user is online when the LMS heard from them in the last three minutes - any request,
+    or the once-a-minute heartbeat an open tab sends. Nobody announces leaving, so offline
+    is silence: a closed laptop shows as offline within about three minutes. Users with no
+    row have not signed in since tracking began. Poll this; it is one small collection.
+    """
+    return [UserPresenceOut(**row) for row in presence.snapshot()]
 
 
 @router.get("/users", response_model=List[UserOut])
@@ -460,6 +477,172 @@ def list_classes(_: UserOut = Depends(require_admin)):
     return [ClassRoomOut(**c) for c in classes]
 
 
+@router.get("/live-classes", response_model=List[LiveClassBoardRow])
+def live_class_board(admin: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Every class as the office sees it right now.
+
+    The room, the current and next period, how many students have come in today, whether
+    a teacher is in, and any scheduled session that is live. Classes in session sort first.
+    Computed on request from the timetable, the sessions and the room log; poll it for a
+    live board. `room_link` is included, so the admin can join or open a preview window.
+    """
+    return [LiveClassBoardRow(**row) for row in class_room_service.live_board(admin)]
+
+
+@router.get("/live-classes/{class_id}/events", response_model=List[ClassRoomEventOut])
+def live_class_events(
+    class_id: int,
+    today_only: bool = Query(True, description="Only today's log (school day)."),
+    limit: int = Query(200, ge=1, le=1000),
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] A class's room log, newest first: joins, periods opened and closed, room
+    changes. What the LMS itself handed out and recorded - Google does not report who is
+    inside a Meet to this app.
+    """
+    require_document(firestore_classes, class_id, "ClassRoom")
+    since = None
+    if today_only:
+        from app.services import timetable as timetable_service
+
+        since = class_room_service._school_day_start_utc(
+            datetime.now(timetable_service.school_timezone())
+        )
+    return [
+        ClassRoomEventOut(**{"id": e.get("id"), **e})
+        for e in class_room_service.events_for_class(class_id, since=since, limit=limit)
+    ]
+
+
+@router.get("/live-classes/{class_id}/attendance", response_model=List[ClassRoomAttendanceOut])
+def live_class_attendance(
+    class_id: int,
+    on_date: Optional[date] = Query(None, description="School day. Defaults to today."),
+    sync: bool = Query(False, description="Ask Google Meet now rather than waiting for the sweep."),
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Who was in the class's room according to Google Meet: each participant
+    with their join and leave times.
+
+    The only true record - the LMS sees people take a link, never hang up. Copied from
+    Meet every few minutes once the `meetings.space.readonly` scope is authorised; until
+    then this is empty and the class's `room_attendance_error` on the live board says so.
+    Meet names participants by display name, so a row is matched to an LMS account by name
+    when it can be.
+    """
+    from app.services import timetable as timetable_service
+
+    class_room = require_document(firestore_classes, class_id, "ClassRoom")
+    day = on_date or datetime.now(timetable_service.school_timezone()).date()
+    if sync:
+        rows, error = class_room_service.sync_room_attendance(class_room, on_date=day, force=True)
+        if error and not rows:
+            raise HTTPException(status_code=502, detail=error)
+    else:
+        rows = class_room_service.attendance_for_class(class_id, day)
+    return [ClassRoomAttendanceOut(**{"id": r.get("id"), **r}) for r in rows]
+
+
+@router.post("/classes/rooms/prepare")
+def prepare_class_rooms(
+    dry_run: bool = Query(False, description="Report what would be created without creating it."),
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Make today's class rooms ready now, rather than waiting for the sweep.
+
+    The maintenance sweep does this on its own every few minutes: a class with lessons today
+    gets its room shortly before the first one. This runs the same pass immediately and
+    returns what it did - useful after switching the classroom model on, or to see why a
+    room was not created.
+    """
+    return class_room_service.ensure_rooms_for_today(dry_run=dry_run)
+
+
+@router.post("/classes/{class_id}/room", response_model=ClassRoomOut)
+def setup_class_room(
+    class_id: int,
+    payload: ClassRoomSetup = ClassRoomSetup(),
+    admin: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Give a class its standing live-class room.
+
+    The school runs one Google Meet room per class: students join it and stay, and each
+    subject teacher joins at their timetabled period. Leave the body empty to create a Meet
+    room on the school's Workspace identity; `owner_id` hosts it on a teacher's calendar
+    instead (whose Drive its recordings then land in); `manual_link` records a link the
+    school already has. An existing room is kept unless `replace` is set.
+
+    Rooms are also created on their own the first time a session is scheduled for a class,
+    so this is for setting one up ahead of time, choosing its owner, or repairing one.
+    """
+    class_room = require_document(firestore_classes, class_id, "ClassRoom")
+    if payload.manual_link:
+        updated = class_room_service.set_manual_room(class_room, payload.manual_link, admin)
+    else:
+        updated, error = class_room_service.create_room(
+            class_room, admin, owner_id=payload.owner_id,
+            auto_record=payload.auto_record, replace=payload.replace,
+        )
+        if error:
+            raise HTTPException(status_code=502, detail=error)
+    return ClassRoomOut(**updated)
+
+
+@router.post("/classes/{class_id}/room/guests", response_model=ClassRoomOut)
+def invite_class_room_teachers(class_id: int, admin: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Put every teacher of the class on its room's guest list.
+
+    Meet lets the organiser and invited guests straight in and makes everybody else ask to
+    join; a teacher on a gmail address is an outsider to a room organised by the school
+    identity. This happens on its own when a room is made and when a teacher is mapped,
+    schedules or joins - run it by hand after fixing a Calendar problem, or to re-send the
+    invitations. A 502 carries Google's reason.
+    """
+    class_room = require_document(firestore_classes, class_id, "ClassRoom")
+    if class_room.get("room_provider") != class_room_service.PROVIDER_MEET:
+        raise HTTPException(
+            status_code=400,
+            detail="Only a Google Meet room made by the LMS has a guest list it can manage.",
+        )
+    updated, error = class_room_service.sync_room_guests(class_room, notify=True)
+    if error:
+        raise HTTPException(status_code=502, detail=error)
+    return ClassRoomOut(**updated)
+
+
+@router.post("/classes/{class_id}/room/open", response_model=ClassRoomOut)
+def open_class_room(class_id: int, admin: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Let anyone with the link into the class's room without asking to join.
+
+    Sets the Meet space's access type to `MEET_ACCESS_TYPE` (OPEN). Done on its own when a
+    room is made and retried by the sweep; run it by hand after authorising the Meet scope
+    in Workspace. A 502 carries Google's reason - including, when the delegation lacks the
+    `meetings.space.settings` scope, exactly what to add and where.
+    """
+    class_room = require_document(firestore_classes, class_id, "ClassRoom")
+    updated, error = class_room_service.open_room_access(class_room)
+    if error:
+        raise HTTPException(status_code=502, detail=error)
+    return ClassRoomOut(**updated)
+
+
+@router.delete("/classes/{class_id}/room", response_model=ClassRoomOut)
+def clear_class_room(class_id: int, admin: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Remove a class's room. Its Calendar event is deleted, so the old link stops
+    working. Sessions already scheduled keep the link they were given.
+    """
+    class_room = require_document(firestore_classes, class_id, "ClassRoom")
+    return ClassRoomOut(**class_room_service.clear_room(class_room, admin))
+
+
 @router.put("/classes/{class_id}", response_model=ClassRoomOut)
 def update_class_room(
     class_id: int,
@@ -498,6 +681,12 @@ def delete_class_room(
     Cascading also removes the class-teacher assignments, and any teacher left leading no
     class at all drops back to the plain `TEACHER` role.
     """
+    # The room's Calendar event goes with the class: a Meet room pointing at a class that no
+    # longer exists is clutter on its owner's calendar. Best-effort, before the cascade.
+    existing = firestore_classes.get_document(str(class_id))
+    if existing:
+        class_room_service.drop_calendar_event(existing)
+
     # Read before the cascade: afterwards there is no record of who used to lead this class,
     # and they would keep a CLASS_TEACHER role pointing at nothing.
     led_by = [
@@ -645,6 +834,14 @@ def map_teacher_to_class(
     }
     firestore_teacher_mappings.add_document(str(mapping_id), mapping_data)
     mapping_data["id"] = mapping_id
+
+    # A newly mapped teacher must be able to walk into the class's room without asking to
+    # join, so they go on its guest list now. Best-effort: a Calendar hiccup is recorded on
+    # the class, not turned into a failed mapping.
+    if class_room_service.has_room(class_room):
+        class_room_service.sync_room_guests(
+            class_room, extra_emails=[teacher.get("email")], notify=True
+        )
     return TeacherMappingOut(**hydrate_teacher_mapping(mapping_data))
 
 
@@ -1314,17 +1511,37 @@ def admin_update_meeting(
     return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
 
 
+@router.post("/meetings/repair-teacher-access")
+def repair_meeting_teacher_access(
+    notify: bool = Query(False, description="Also email each teacher a Calendar invitation."),
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Let teachers into their own sessions without asking to join.
+
+    Meet admits the organiser and invited guests and makes everybody else knock. A session
+    created by a teacher outside the Workspace domain is organised by the school identity,
+    and until now the teacher was not on its guest list. This adds every such teacher to
+    every future session's event, once. The maintenance sweep does the same for the next two
+    days on its own; run this after a deploy to cover everything already scheduled.
+    """
+    from app.services.content import repair_teacher_access
+
+    return repair_teacher_access(days_ahead=None, notify=notify)
+
+
 @router.post("/meetings/{meeting_id}/regenerate-link", response_model=LiveMeetingOut)
 def admin_regenerate_meeting_link(
     meeting_id: int,
-    _: UserOut = Depends(require_admin)
+    admin: UserOut = Depends(require_admin)
 ):
     """
     [Admin Only] Retry Google Meet link generation for a meeting that has no link.
 
     Meetings scheduled while the Calendar integration was misconfigured are saved without a
     link. Once `GET /admin/integrations` reports Meet as healthy, this creates the event and
-    attaches the link without making anyone re-enter the session.
+    attaches the link without making anyone re-enter the session. Under the classroom model
+    the retry attaches the class's shared room instead, creating it if need be.
     """
     meeting = require_document(firestore_meetings, meeting_id, "Meeting")
 
@@ -1333,6 +1550,23 @@ def admin_regenerate_meeting_link(
             status_code=400,
             detail="This meeting already has a link. Clear it first, or edit it directly.",
         )
+
+    if class_room_service.class_room_mode():
+        class_room = require_document(firestore_classes, meeting.get("class_id"), "ClassRoom")
+        class_room, room_error = class_room_service.ensure_room(
+            class_room, actor_id=admin.id, actor_email=admin.email
+        )
+        if not class_room_service.has_room(class_room):
+            firestore_meetings.add_document(
+                str(meeting_id), {"meet_status": "FAILED", "meet_error": room_error}
+            )
+            raise HTTPException(
+                status_code=502, detail=room_error or "The class room could not be created."
+            )
+        firestore_meetings.add_document(
+            str(meeting_id), class_room_service.meeting_fields_for_room(class_room)
+        )
+        return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
 
     scheduled_time = meeting.get("scheduled_time")
     if not scheduled_time:
@@ -1343,6 +1577,9 @@ def admin_regenerate_meeting_link(
         for student in active_students_in_class(meeting.get("class_id"))
         if student.get("email")
     ]
+    # A teacher outside the domain is not the organiser; invite them or they knock.
+    if not google_meet.is_own_calendar(_owner_email(meeting)):
+        attendee_emails.append(_owner_email(meeting))
 
     created = google_meet.create_meeting(
         teacher_email=_owner_email(meeting),
@@ -1377,6 +1614,8 @@ def admin_regenerate_meeting_link(
             else ("NOT_REQUESTED" if not meeting.get("auto_record", True) else "ARM_FAILED")
         ),
         "recording_error": created["recording_error"],
+        "meet_access_type": created.get("access_type"),
+        "meet_access_error": created.get("access_error"),
     })
     return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
 

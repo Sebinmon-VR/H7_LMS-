@@ -866,6 +866,8 @@ def hydrate_topic(topic: dict) -> dict:
         "date_covered": topic.get("date_covered"),
         "completion_percentage": topic.get("completion_percentage"),
         "created_at": topic.get("created_at"),
+        # Notes, images and voice clips the teacher attached; see teachers.py attachments.
+        "attachments": topic.get("attachments") or [],
     }
 
 
@@ -894,6 +896,10 @@ def hydrate_live_meeting(meeting: dict) -> dict:
         "recording_drive_file_id": meeting.get("recording_drive_file_id"),
         "recording_stored_at": meeting.get("recording_stored_at"),
         "recording_files": meeting.get("recording_files"),
+        "duration_minutes": meeting.get("duration_minutes"),
+        "uses_class_room": meeting.get("uses_class_room"),
+        "meet_access_type": meeting.get("meet_access_type"),
+        "meet_access_error": meeting.get("meet_access_error"),
     }
 
 
@@ -1089,6 +1095,15 @@ firestore_academic_years = _service("academic_years", cacheable=True)
 # The basis a student was admitted on, and the concession that comes with it. Same shape and
 # same access pattern as the years above.
 firestore_admission_categories = _service("admission_categories", cacheable=True)
+# What happened in a class's live room: who joined, who started and ended a period, when the
+# room was made. Written on every join, so never cached; read by the admin's live board.
+firestore_class_room_events = _service("class_room_events")
+# One row per user: when the LMS last heard from them. See services/presence.py.
+firestore_user_presence = _service("user_presence")
+# What Google Meet itself saw in a class's room: one row per participant per conference, with
+# their join and leave times. Filled by a sync that needs the Meet read scope; until that is
+# authorised the collection stays empty and the LMS's own event log is the record.
+firestore_class_room_attendance = _service("class_room_attendance")
 # Admission requests posted from the public website form. One document per application,
 # carrying the student, parent and address detail the office needs to decide, plus the
 # decision itself once made. Never cached: the admin queue must show a request the moment

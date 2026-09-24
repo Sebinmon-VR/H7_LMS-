@@ -442,6 +442,80 @@ def enable_auto_recording(teacher_email: str, meeting_link: str) -> dict:
     return {"ok": True, "space_name": space_name, "meeting_code": code, "error": None}
 
 
+ACCESS_TYPES = ("OPEN", "TRUSTED", "RESTRICTED")
+
+
+def set_access_type(teacher_email: str, meeting_link: str, access_type: str | None = None) -> dict:
+    """
+    Decides who may enter the space behind `meeting_link` without asking.
+
+    OPEN lets anyone with the link straight in - what a school wants for a class room whose
+    teachers and students sign into Google with personal addresses the LMS cannot invite.
+    Always returns {"ok", "space_name", "meeting_code", "access_type", "error"}. Uses the
+    same `meetings.space.settings` grant as auto-recording, and fails the same soft way when
+    that grant is missing, with the instruction in `error`.
+    """
+    wanted = (access_type or settings.MEET_ACCESS_TYPE or "").strip().upper()
+    failure = {"ok": False, "space_name": None, "meeting_code": None, "access_type": wanted or None, "error": None}
+
+    if not wanted:
+        return {**failure, "error": "MEET_ACCESS_TYPE is blank, so Google's default access stands."}
+    if wanted not in ACCESS_TYPES:
+        return {**failure, "error": f"MEET_ACCESS_TYPE '{wanted}' is not one of {', '.join(ACCESS_TYPES)}."}
+
+    code = meeting_code_from_link(meeting_link)
+    if not code:
+        return {**failure, "error": f"'{meeting_link}' is not a Google Meet link, so its access cannot be set."}
+
+    if not settings.ENABLE_GOOGLE_MEET or not _credentials_path():
+        return {**failure, "meeting_code": code, "error": "Google Meet is not enabled, or no credentials file was found."}
+    if not settings.GOOGLE_CALENDAR_IMPERSONATION and not settings.GOOGLE_IMPERSONATION_FALLBACK:
+        return {
+            **failure, "meeting_code": code,
+            "error": "The Meet REST API requires an impersonated Workspace user, but impersonation "
+                     "is off and GOOGLE_IMPERSONATION_FALLBACK is empty.",
+        }
+
+    try:
+        acting_as = resolve_impersonation_email(teacher_email)
+        service = _build_meet_service(acting_as, "settings")
+    except GoogleMeetError as exc:
+        return {**failure, "meeting_code": code, "error": str(exc)}
+
+    try:
+        space = service.spaces().get(name=f"spaces/{code}").execute()
+    except Exception as exc:
+        return {
+            **failure, "meeting_code": code,
+            "error": f"Could not read meeting space '{code}'. {_describe_api_error(exc)}",
+        }
+
+    space_name = space.get("name")
+    if not space_name:
+        return {**failure, "meeting_code": code, "error": f"Meet returned no resource name for space '{code}'."}
+
+    current = ((space.get("config") or {}).get("accessType") or "").upper()
+    if current == wanted:
+        return {"ok": True, "space_name": space_name, "meeting_code": code, "access_type": wanted, "error": None}
+
+    try:
+        service.spaces().patch(
+            name=space_name,
+            # Only this field: an unmasked patch replaces everything in the body's parent,
+            # which would silently reset the recording and moderation settings.
+            updateMask="config.accessType",
+            body={"config": {"accessType": wanted}},
+        ).execute()
+    except Exception as exc:
+        return {
+            **failure, "space_name": space_name, "meeting_code": code,
+            "error": f"Could not set the meeting access to {wanted}. {_describe_api_error(exc)}",
+        }
+
+    logger.info("Meet space %s (%s) access set to %s as %s.", space_name, code, wanted, acting_as)
+    return {"ok": True, "space_name": space_name, "meeting_code": code, "access_type": wanted, "error": None}
+
+
 def _recording_record(recording: dict, conference: dict) -> dict:
     """Flattens a Meet recording plus its conference into the shape callers persist."""
     drive = recording.get("driveDestination") or {}
@@ -533,6 +607,102 @@ def list_recordings(
         "conferences": len(conferences),
         "error": error,
     }
+
+
+def _participant_identity(participant: dict) -> tuple[str, str]:
+    """(display name, kind) for a Meet participant; kind is SIGNED_IN, ANONYMOUS or PHONE."""
+    if participant.get("signedinUser"):
+        return participant["signedinUser"].get("displayName") or "Signed-in user", "SIGNED_IN"
+    if participant.get("anonymousUser"):
+        return participant["anonymousUser"].get("displayName") or "Guest", "ANONYMOUS"
+    if participant.get("phoneUser"):
+        return participant["phoneUser"].get("displayName") or "Phone caller", "PHONE"
+    return "Participant", "UNKNOWN"
+
+
+def list_participant_sessions(
+    teacher_email: str,
+    space_name: str | None = None,
+    meeting_code: str | None = None,
+    since: datetime | None = None,
+) -> dict:
+    """
+    Who was in a meeting space, and when: every participant of every conference held in it
+    (from `since`, naive UTC), with each of their sessions' join and leave times.
+
+    This is the only true record of attendance - the LMS sees people take a link, never
+    hang up. Always returns {"ok", "participants", "conferences", "error"}. Needs the
+    `meetings.space.readonly` scope; without it `error` says what to authorise. Meet does
+    not expose a signed-in participant's email, only a display name, so matching to LMS
+    accounts is the caller's best effort.
+    """
+    failure = {"ok": False, "participants": [], "conferences": 0, "error": None}
+
+    if not space_name and not meeting_code:
+        return {**failure, "error": "Neither a space name nor a meeting code was supplied."}
+
+    problems = configuration_problems(for_collection=True)
+    if problems:
+        return {**failure, "error": " ".join(problems)}
+
+    try:
+        acting_as = resolve_impersonation_email(teacher_email)
+        service = _build_meet_service(acting_as, "read")
+    except GoogleMeetError as exc:
+        return {**failure, "error": str(exc)}
+
+    query = f'space.name = "{space_name}"' if space_name else f'space.meeting_code = "{meeting_code}"'
+    if since is not None:
+        query += f' AND start_time >= "{since.strftime("%Y-%m-%dT%H:%M:%SZ")}"'
+
+    try:
+        response = service.conferenceRecords().list(filter=query, pageSize=50).execute()
+    except Exception as exc:
+        return {**failure, "error": f"Could not list conferences for {query}. {_describe_api_error(exc)}"}
+
+    conferences = response.get("conferenceRecords", [])
+    found: list[dict] = []
+    error = None
+
+    for conference in conferences:
+        try:
+            listed = service.conferenceRecords().participants().list(
+                parent=conference["name"], pageSize=100
+            ).execute()
+        except Exception as exc:
+            error = f"Could not list participants for {conference.get('name')}. {_describe_api_error(exc)}"
+            logger.warning(error)
+            continue
+
+        for participant in listed.get("participants", []):
+            sessions = []
+            try:
+                session_page = service.conferenceRecords().participants().participantSessions().list(
+                    parent=participant["name"], pageSize=100
+                ).execute()
+                sessions = [
+                    {"start_time": s.get("startTime"), "end_time": s.get("endTime")}
+                    for s in session_page.get("participantSessions", [])
+                ]
+            except Exception as exc:
+                # A participant we cannot break into sessions still counts, with the
+                # conference-level first and last times Meet gives on the participant.
+                logger.info("Sessions unavailable for %s: %s", participant.get("name"), exc)
+
+            display_name, kind = _participant_identity(participant)
+            found.append({
+                "conference_record": conference.get("name"),
+                "conference_start_time": conference.get("startTime"),
+                "conference_end_time": conference.get("endTime"),
+                "participant": participant.get("name"),
+                "display_name": display_name,
+                "user_kind": kind,
+                "earliest_start_time": participant.get("earliestStartTime"),
+                "latest_end_time": participant.get("latestEndTime"),
+                "sessions": sessions,
+            })
+
+    return {"ok": True, "participants": found, "conferences": len(conferences), "error": error}
 
 
 def recording_filename(title: str, when: datetime | None = None) -> str:

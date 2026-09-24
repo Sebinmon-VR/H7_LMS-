@@ -990,6 +990,9 @@ class ProgramSettingsUpdate(BaseModel):
     student_uploads_need_approval: bool | None = None
     currency: str | None = Field(None, max_length=8)
     auto_create_meet: bool | None = None
+    # LMS only. One standing Meet room per class that every subject teacher joins at their
+    # period, instead of a fresh link per scheduled session.
+    class_room_mode: bool | None = None
 
 
 class TimezoneUpdate(BaseModel):

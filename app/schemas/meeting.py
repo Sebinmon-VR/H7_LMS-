@@ -83,4 +83,13 @@ class LiveMeetingOut(BaseModel):
     # Every segment filed for this session, when a class was recorded in more than one.
     recording_files: list[dict] | None = None
 
+    duration_minutes: int | None = None
+    # True when the session uses its class's one standing room rather than a link of its
+    # own (`meet_status` is then CLASS_ROOM). See `app.services.class_rooms`.
+    uses_class_room: bool | None = None
+    # Who may walk in without asking: OPEN means anyone with the link. None means Google
+    # has not accepted the setting yet; `meet_access_error` says why.
+    meet_access_type: str | None = None
+    meet_access_error: str | None = None
+
     model_config = ConfigDict(from_attributes=True)

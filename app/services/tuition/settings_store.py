@@ -246,6 +246,11 @@ def lms_settings() -> dict:
         "join_grace_minutes": _int(
             stored.get("join_grace_minutes"), env_settings.SCHOOL_JOIN_GRACE_MINUTES
         ),
+        # One room per class, shared by every subject period, rather than a link per
+        # session. See `app.services.class_rooms`.
+        "class_room_mode": _bool(
+            stored.get("class_room_mode"), env_settings.SCHOOL_CLASS_ROOM_MODE
+        ),
         "extra_class_needs_approval": _bool(
             stored.get("extra_class_needs_approval"), env_settings.EXTRA_CLASS_NEEDS_APPROVAL
         ),
@@ -391,7 +396,7 @@ _LMS_KEYS = _SHARED_KEYS | _FINANCE_KEYS | _LIBRARY_KEYS | {
     "admission_id_mode", "admission_id_prefix",
     "employee_id_mode", "employee_id_prefix",
     "auto_start_class", "join_open_minutes_before", "default_class_minutes",
-    "join_grace_minutes", "extra_class_needs_approval",
+    "join_grace_minutes", "extra_class_needs_approval", "class_room_mode",
 }
 WRITABLE_KEYS = {
     Program.LMS.value: _LMS_KEYS,

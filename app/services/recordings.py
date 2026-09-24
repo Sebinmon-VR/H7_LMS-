@@ -145,9 +145,53 @@ def due_meetings(reference: datetime | None = None) -> list[dict]:
 
 
 def _teacher_email(meeting: dict) -> str:
-    """Email of the teacher the session is filed under, which is who Meet recorded for."""
+    """
+    Whose Drive Meet recorded into: the room's owner for a session held in the class's
+    shared room, else the teacher the session is filed under.
+    """
+    if meeting.get("meet_owner_email"):
+        return meeting["meet_owner_email"]
     teacher = firestore_users.get_document(str(meeting.get("teacher_id")))
     return (teacher or {}).get("email", "")
+
+
+# How far outside a period's scheduled window a recording may start and still be that
+# period's: a teacher who opens the room a little early, or a late start pushing the end.
+_PERIOD_PAD = timedelta(minutes=20)
+
+
+def _recordings_for_period(meeting: dict, recordings: list[dict]) -> tuple[list[dict], bool]:
+    """
+    Which of a shared room's recordings belong to THIS period.
+
+    A class room is one Meet space for the whole day, so listing its recordings returns
+    every period's. A recording is this period's if it *started* inside the period's window
+    (padded a little either side). One that started in an earlier period and ran on into
+    this one belongs to the period it started in - filing it twice would move the same Drive
+    file twice - and the second value says that happened, so this period can be marked
+    honestly rather than as "never recorded".
+    """
+    start = _parse_time(meeting.get("scheduled_time"))
+    end = meeting_ended_at(meeting)
+    if start is None or end is None:
+        return recordings, False
+
+    grace = timedelta(minutes=max(int(settings.SCHOOL_JOIN_GRACE_MINUTES), 0))
+    window_start = start - _PERIOD_PAD
+    window_end = end + grace + _PERIOD_PAD
+
+    own, continued_from_earlier = [], False
+    for recording in recordings:
+        began = _parse_time(recording.get("start_time"))
+        if began is None:
+            continue
+        if window_start <= began <= window_end:
+            own.append(recording)
+            continue
+        finished = _parse_time(recording.get("end_time"))
+        if began < window_start and (finished is None or finished > start):
+            continued_from_earlier = True
+    return own, continued_from_earlier
 
 
 def _student_emails(class_id) -> list[str]:
@@ -248,6 +292,21 @@ def harvest_meeting(meeting: dict, dry_run: bool = False) -> dict:
         }
 
     recordings = listed["recordings"]
+
+    # A session held in the class's shared room shares its Meet space with every other
+    # period that day, so only the recordings that began in this period are its own.
+    if meeting.get("uses_class_room"):
+        recordings, continued = _recordings_for_period(meeting, recordings)
+        if not recordings and continued:
+            detail = (
+                "This period was part of a longer class-room recording that began in an "
+                "earlier period; the video is filed under that period."
+            )
+            if not dry_run:
+                _update_meeting(
+                    meeting_id, recording_status=STATUS_UNAVAILABLE, recording_error=detail
+                )
+            return {**summary, "status": STATUS_UNAVAILABLE, "detail": detail}
 
     if not recordings:
         if meeting.get("_too_old"):

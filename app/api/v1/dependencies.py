@@ -10,6 +10,7 @@ from app.core.firebase import firestore_users
 from app.core.firebase_auth import verify_token
 from app.core.security import decode_access_token
 from app.schemas.user import UserOut
+from app.services import presence
 
 logger = logging.getLogger("auth_dependencies")
 
@@ -86,7 +87,11 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> UserOut:
             detail="Inactive user account"
         )
 
-    return UserOut(**user_document)
+    user = UserOut(**user_document)
+    # Every authenticated request is a sign of life for the office's "who is online";
+    # throttled inside to one write a minute per user.
+    presence.touch(user)
+    return user
 
 
 def require_roles(allowed_roles: List[UserRole]) -> Callable:

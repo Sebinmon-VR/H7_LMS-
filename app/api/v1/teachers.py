@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, s
 from app.api.v1.dependencies import require_teacher
 from app.core import google_meet
 from app.core.enums import DayOfWeek
-from app.core.gcp_services import storage_service
+import uuid
+
+from app.core.gcp_services import StorageError, storage_service
 from app.core.firebase import (
     firestore_attendance, firestore_topics, firestore_meetings,
     firestore_materials, firestore_grades,
@@ -27,7 +29,7 @@ from app.schemas.academic import ClassTeacherMappingOut, TeacherMappingOut
 from app.schemas.timetable import ScheduledPeriod, TimetableEntryOut
 from app.schemas.user import UserOut
 from app.schemas.attendance import BatchAttendanceCreate, AttendanceUpdate, AttendanceOut
-from app.schemas.topic import TopicCreate, TopicUpdate, TopicOut
+from app.schemas.topic import PendingTopicOut, TopicCreate, TopicUpdate, TopicOut
 from app.schemas.meeting import LiveMeetingCreate, LiveMeetingUpdate, LiveMeetingOut
 from app.schemas.material import StudyMaterialUpdate, StudyMaterialOut
 from app.schemas.grade import GradeEntryCreate, GradeEntryUpdate, ExamGradeOut
@@ -289,6 +291,51 @@ def list_topics_covered(
     return [TopicOut(**hydrate_topic(topic)) for topic in topics]
 
 
+@router.get("/topics/pending", response_model=List[PendingTopicOut])
+def pending_topic_logs(current_user: UserOut = Depends(require_teacher)):
+    """
+    [Teacher Only] Periods of yours that have ended today with no topic logged yet - what
+    the dashboard prompts you to fill in as soon as a class is over, most recent first.
+
+    A period counts as logged once a topic of yours exists for the same class, subject and
+    date. Yesterday's are not chased here: the prompt is for the class just finished.
+    """
+    tz = timetable_service.school_timezone()
+    now = datetime.now(tz)
+    periods = timetable_service.resolve_on_date(
+        timetable_service.list_entries(teacher_id=current_user.id), now.date(), reference=now
+    )
+    ended = [p for p in periods if p["ends_at"] <= now]
+    if not ended:
+        return []
+
+    today = now.date().isoformat()
+    logged = {
+        (t.get("class_id"), t.get("subject_id"))
+        for t in firestore_topics.query_documents("teacher_id", "==", current_user.id)
+        if str(t.get("date_covered") or "")[:10] == today
+    }
+
+    pending = []
+    for period in ended:
+        entry = period["entry"]
+        if (entry.get("class_id"), entry.get("subject_id")) in logged:
+            continue
+        pending.append(PendingTopicOut(
+            class_id=entry["class_id"],
+            class_name=(entry.get("class_room") or {}).get("name") or f"Class {entry['class_id']}",
+            subject_id=entry["subject_id"],
+            subject_name=(entry.get("subject") or {}).get("name") or "Subject",
+            on_date=period["on_date"],
+            starts_at=period["starts_at"],
+            ends_at=period["ends_at"],
+            period_label=entry.get("period_label"),
+            minutes_since_end=int((now - period["ends_at"]).total_seconds() // 60),
+        ))
+    pending.sort(key=lambda p: p.ends_at, reverse=True)
+    return pending
+
+
 @router.put("/topics/{topic_id}", response_model=TopicOut)
 def update_topic_covered(
     topic_id: int,
@@ -323,8 +370,116 @@ def delete_topic_covered(
     topic = require_document(firestore_topics, topic_id, "Topic")
     assert_owner(topic, current_user, "topics")
 
+    # The files go with the record; a note nobody can reach is only a storage bill.
+    for attachment in topic.get("attachments") or []:
+        if attachment.get("file_url"):
+            storage_service.delete_file(attachment["file_url"], provider=attachment.get("storage_provider"))
+
     firestore_topics.delete_document(str(topic_id))
     return None
+
+
+# ------------------------------------------------------------------ topic attachments
+#
+# Notes, images and voice clips a teacher hangs on a logged topic. They live where study
+# materials do (Drive, Cloud Storage or the server disk), under the class's folder, and
+# are listed on the topic itself so students see them in their syllabus.
+
+MAX_TOPIC_ATTACHMENTS = 10
+_IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".heif", ".bmp", ".svg", ".avif")
+_AUDIO_EXT = (".webm", ".weba", ".m4a", ".mp3", ".wav", ".ogg", ".oga", ".aac", ".opus", ".amr", ".3gp")
+
+
+def _attachment_kind(content_type: str | None, filename: str | None) -> str:
+    """NOTE, IMAGE or AUDIO from what the browser said the file is, else its extension."""
+    kind_hint = (content_type or "").lower()
+    name = (filename or "").lower()
+    if kind_hint.startswith("image/") or name.endswith(_IMAGE_EXT):
+        return "IMAGE"
+    if kind_hint.startswith("audio/") or name.endswith(_AUDIO_EXT):
+        return "AUDIO"
+    return "NOTE"
+
+
+@router.post("/topics/{topic_id}/attachments", response_model=TopicOut, status_code=status.HTTP_201_CREATED)
+async def add_topic_attachment(
+    topic_id: int,
+    file: UploadFile = File(...),
+    kind: Optional[str] = Form(None, description="NOTE, IMAGE or AUDIO; inferred from the file when omitted."),
+    caption: Optional[str] = Form(None),
+    current_user: UserOut = Depends(require_teacher),
+):
+    """
+    [Teacher Only] Attach notes, an image or a voice note to a logged topic.
+
+    The file field must be named `file`. A voice note is whatever the browser recorded
+    (WebM/Opus on Chrome and Firefox, MP4/AAC on Safari). Returns the topic with its
+    attachments; `storage_warning` on one means it landed on the server disk rather than
+    the configured cloud backend.
+    """
+    topic = require_document(firestore_topics, topic_id, "Topic")
+    assert_owner(topic, current_user, "topics")
+
+    attachments = list(topic.get("attachments") or [])
+    if len(attachments) >= MAX_TOPIC_ATTACHMENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A topic can carry at most {MAX_TOPIC_ATTACHMENTS} attachments.",
+        )
+
+    try:
+        stored = await storage_service.save_file_detailed(
+            file=file, folder=f"class_{topic.get('class_id')}/topics/{topic_id}"
+        )
+    except StorageError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    size = getattr(file, "size", None)
+    if size is None:
+        try:
+            file.file.seek(0, 2)
+            size = file.file.tell()
+        except Exception:  # noqa: BLE001 - size is a nicety, not a requirement
+            size = None
+
+    wanted = (kind or "").strip().upper()
+    attachments.append({
+        "id": uuid.uuid4().hex[:12],
+        "kind": wanted if wanted in {"NOTE", "IMAGE", "AUDIO"} else _attachment_kind(file.content_type, file.filename),
+        "file_name": file.filename,
+        "file_url": stored["url"],
+        "content_type": file.content_type,
+        "size_bytes": size,
+        "storage_provider": stored["provider"],
+        "storage_warning": stored.get("warning"),
+        "uploaded_at": datetime.utcnow().isoformat(),
+        "caption": (caption or "").strip() or None,
+    })
+    firestore_topics.add_document(str(topic_id), {"attachments": attachments})
+    return TopicOut(**hydrate_topic(firestore_topics.get_document(str(topic_id))))
+
+
+@router.delete("/topics/{topic_id}/attachments/{attachment_id}", response_model=TopicOut)
+def remove_topic_attachment(
+    topic_id: int,
+    attachment_id: str,
+    current_user: UserOut = Depends(require_teacher),
+):
+    """[Teacher Only] Remove one attachment from a topic, and its file."""
+    topic = require_document(firestore_topics, topic_id, "Topic")
+    assert_owner(topic, current_user, "topics")
+
+    attachments = list(topic.get("attachments") or [])
+    gone = next((a for a in attachments if a.get("id") == attachment_id), None)
+    if gone is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    if gone.get("file_url"):
+        storage_service.delete_file(gone["file_url"], provider=gone.get("storage_provider"))
+    firestore_topics.add_document(
+        str(topic_id), {"attachments": [a for a in attachments if a.get("id") != attachment_id]}
+    )
+    return TopicOut(**hydrate_topic(firestore_topics.get_document(str(topic_id))))
 
 
 @router.post("/meetings", response_model=LiveMeetingOut, status_code=status.HTTP_201_CREATED)

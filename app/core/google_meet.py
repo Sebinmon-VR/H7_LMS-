@@ -279,6 +279,22 @@ def _resolve_impersonation_email(teacher_email: str | None) -> str | None:
     )
 
 
+def is_own_calendar(teacher_email: str | None) -> bool:
+    """
+    Whether an event created "for" this teacher is actually organised by them.
+
+    True only when impersonation would act as the teacher themself. A teacher outside the
+    Workspace domain gets an event on the fallback identity's calendar instead, and is an
+    outsider to it - which is why callers add them as a guest when this is False.
+    """
+    if not teacher_email:
+        return False
+    try:
+        return (_resolve_impersonation_email(teacher_email) or "").lower() == teacher_email.lower()
+    except GoogleMeetError:
+        return False
+
+
 def resolve_impersonation_email(teacher_email: str | None) -> str | None:
     """
     Public form of `_resolve_impersonation_email`, for the recording modules.
@@ -439,6 +455,8 @@ def create_meeting(
         "meeting_code": None,
         "recording_armed": False,
         "recording_error": None,
+        "access_type": None,
+        "access_error": None,
     }
 
     problems = configuration_problems()
@@ -534,6 +552,16 @@ def create_meeting(
         if not recording["ok"]:
             logger.warning("Auto-recording was not armed: %s", recording["error"])
 
+    # Who may walk in without knocking. Set on the space, best-effort, because a guest list
+    # cannot admit people who sign into Google with addresses the LMS does not know.
+    access = {"ok": False, "access_type": None, "error": None, "space_name": None}
+    if meeting_link and (settings.MEET_ACCESS_TYPE or "").strip():
+        from app.core import meet_recordings
+
+        access = meet_recordings.set_access_type(teacher_email=teacher_email, meeting_link=meeting_link)
+        if not access["ok"]:
+            logger.warning("Meeting access was not set: %s", access["error"])
+
     return {
         "ok": bool(meeting_link),
         "meeting_link": meeting_link,
@@ -543,11 +571,13 @@ def create_meeting(
         "error": warning,
         # Persisted by the caller: the space name is what finds this conference's recordings
         # once the class is over, and it cannot be derived from the event afterwards.
-        "space_name": recording["space_name"],
+        "space_name": recording["space_name"] or access.get("space_name"),
         "meeting_code": recording["meeting_code"]
                         or _meeting_code_of(meeting_link),
         "recording_armed": recording["ok"],
         "recording_error": recording["error"],
+        "access_type": access["access_type"] if access["ok"] else None,
+        "access_error": None if access["ok"] else access["error"],
     }
 
 
@@ -608,6 +638,73 @@ def update_meeting(
             "Could not update Google Meet event '%s': %s", event_id, _describe_api_error(exc)
         )
         return False
+
+
+def add_attendees(
+    owner_email: str,
+    event_id: str,
+    attendee_emails: list[str],
+    calendar_id: str | None = None,
+    notify: bool = True,
+) -> dict:
+    """
+    Adds people to an event's guest list, keeping whoever is already on it.
+
+    Why this exists: Meet lets the organiser and *invited* guests straight into a call and
+    makes everybody else ask to join. A teacher outside the Workspace domain - most of them,
+    on gmail addresses - is an outsider to an event organised by the school identity,
+    however many times they pressed "create". Putting them on the guest list is what stops
+    the knocking, and it is the one lever the Calendar API offers without the Meet scopes.
+
+    Always returns {"ok", "added", "already", "error"}. Reads the event first because the
+    API replaces the whole list on a patch, and the students already invited must stay.
+    """
+    failure = {"ok": False, "added": [], "already": [], "error": None}
+    if not is_enabled() or not event_id:
+        return {**failure, "error": "Google Meet is not enabled, or the event has no id."}
+    if not settings.GOOGLE_MEET_INVITE_ATTENDEES:
+        return {
+            **failure,
+            "error": "GOOGLE_MEET_INVITE_ATTENDEES is off, so nobody can be added as a guest.",
+        }
+
+    wanted = []
+    for email in attendee_emails or []:
+        cleaned = (email or "").strip().lower()
+        if cleaned and cleaned not in wanted:
+            wanted.append(cleaned)
+    if not wanted:
+        return {**failure, "ok": True}
+
+    try:
+        impersonate = _resolve_impersonation_email(owner_email)
+        service = _build_calendar_service(impersonate)
+        target = calendar_id or settings.GOOGLE_CALENDAR_ID
+
+        event = service.events().get(calendarId=target, eventId=event_id).execute()
+        existing = [a for a in event.get("attendees", []) if a.get("email")]
+        present = {a["email"].strip().lower() for a in existing}
+        organiser = ((event.get("organizer") or {}).get("email") or "").strip().lower()
+
+        added = [e for e in wanted if e not in present and e != organiser]
+        already = [e for e in wanted if e in present or e == organiser]
+        if not added:
+            return {"ok": True, "added": [], "already": already, "error": None}
+
+        service.events().patch(
+            calendarId=target,
+            eventId=event_id,
+            body={"attendees": existing + [{"email": e} for e in added]},
+            sendUpdates="all" if notify else "none",
+        ).execute()
+        return {"ok": True, "added": added, "already": already, "error": None}
+    except GoogleMeetError as exc:
+        logger.warning("Guest list not updated on event '%s': %s", event_id, exc)
+        return {**failure, "error": str(exc)}
+    except Exception as exc:
+        detail = _describe_api_error(exc)
+        logger.error("Could not update guests on event '%s': %s", event_id, detail)
+        return {**failure, "error": detail}
 
 
 def delete_meeting(teacher_email: str, event_id: str, calendar_id: str | None = None) -> bool:
