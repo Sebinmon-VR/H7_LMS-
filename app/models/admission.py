@@ -14,7 +14,84 @@ every year; an academic year is the frame those classes hang in, and it outlives
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
-from app.core.enums import AcademicYearStatus
+from app.core.enums import AcademicYearStatus, AdmissionRequestStatus
+
+
+@dataclass(slots=True)
+class AdmissionRequest:
+    """
+    An application filed from the public website, waiting for the office to decide.
+
+    Deliberately NOT a user. A family filling in a form has not been admitted, may never be,
+    and must not be able to sign in, appear on a roster or be billed by submitting one. The
+    request holds everything the office needs to decide - the child, the class asked for, the
+    parents and how to reach them - and the decision itself once made. Admitting it is what
+    creates the student (and, if asked, the parent login), and the request keeps the ids of
+    what it created so the two can always be traced to each other.
+
+    `parents` is a list rather than father/mother columns: a single guardian, two parents or
+    a grandparent doing the school run are all one shape, and exactly one entry is the
+    primary contact the office writes to.
+    """
+    reference: str                  # "ADR-2026-0007", what the family quotes on the phone.
+    program: str                    # LMS or TUITION - which product they applied to.
+    status: AdmissionRequestStatus
+
+    # The child.
+    student_full_name: str
+    date_of_birth: date
+    gender: str | None = None
+    blood_group: str | None = None
+    nationality: str | None = None
+    previous_school: str | None = None
+    previous_class: str | None = None
+
+    # What they asked for. `class_name` is a snapshot of the class at submission, so a class
+    # renamed or deleted later does not blank the application.
+    class_id: int | None = None
+    class_name: str | None = None
+    academic_year_id: int | None = None
+    academic_year_name: str | None = None
+    syllabus: str | None = None
+    medium: str | None = None
+
+    # [{"relation", "full_name", "phone", "email", "occupation", "is_primary"}]
+    parents: list[dict] = field(default_factory=list)
+    # The primary contact, denormalised so a list screen needs no pass over `parents`.
+    contact_name: str | None = None
+    contact_phone: str | None = None
+    contact_email: str | None = None
+
+    address_line1: str | None = None
+    address_line2: str | None = None
+    city: str | None = None
+    state: str | None = None
+    postal_code: str | None = None
+    country: str | None = None
+
+    sibling_name: str | None = None
+    transport_required: bool = False
+    medical_notes: str | None = None
+    message: str | None = None
+    how_heard: str | None = None
+
+    # The office's side.
+    internal_notes: list[dict] = field(default_factory=list)   # [{"author_id", "author_name", "body", "at"}]
+    history: list[dict] = field(default_factory=list)          # [{"status", "at", "by", "by_name", "note"}]
+    decision_note: str | None = None
+    reviewed_by: int | None = None
+    reviewed_at: datetime | None = None
+
+    # Filled by an admit, and only then.
+    admitted_student_id: int | None = None
+    admitted_parent_id: int | None = None
+    enrollment_id: int | None = None
+    admission_number: str | None = None
+
+    source: str = "website"
+    submitted_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime | None = None
+    id: int | None = None
 
 
 @dataclass(slots=True)

@@ -186,6 +186,95 @@ def create_account(payload, role: UserRole | None = None,
     return document
 
 
+def issue_credentials(user: dict, send_email: bool = True, revoke_sessions: bool = True,
+                      deliver_to: str | None = None) -> dict:
+    """
+    Generates a password for an existing account, sets it on Firebase Auth and emails it.
+
+    Backs the admin's "Generate credentials" button and the admission flow that creates a
+    student and hands the family their login in one go. Safe to run again to reset a
+    forgotten password.
+
+    `deliver_to` is where the email goes when that is not the login address itself - a
+    school pupil's login is `firstname.lastname@<domain>`, a mailbox that may not exist yet,
+    while the parent's own address on the admission form certainly does.
+
+    The password is returned once, in the result, and is never stored by this backend.
+    """
+    from app.core.credentials import generate_password
+    from app.core.firebase_auth import (
+        create_auth_user, revoke_tokens, set_auth_password, set_role_claims, set_user_disabled,
+    )
+    from app.core.mailer import is_configured as mail_is_configured, send_credentials_email
+
+    user_id = int(user["id"])
+    email = user.get("email")
+    if not email:
+        raise HTTPException(
+            status_code=400,
+            detail="This user has no email address. Set one before issuing credentials.",
+        )
+
+    password = generate_password(settings.GENERATED_PASSWORD_LENGTH)
+    full_name = user.get("full_name") or email
+    role = user.get("role", UserRole.STUDENT.value)
+
+    # An account created while Firebase Auth was unreachable has no uid yet, so the auth
+    # account is created now and linked rather than failing the request.
+    firebase_uid = user.get("firebase_uid")
+    if firebase_uid:
+        applied = set_auth_password(firebase_uid, password)
+    else:
+        firebase_uid = create_auth_user(email, password, full_name)
+        applied = firebase_uid is not None
+        if applied:
+            firestore_users.add_document(str(user_id), {"firebase_uid": firebase_uid})
+
+    if not applied:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not set the password on Firebase Auth. "
+                   "Check the Admin SDK credentials and try again.",
+        )
+
+    set_role_claims(firebase_uid, role, user_id)
+
+    # A password reset must not leave old sessions alive on someone else's device.
+    if revoke_sessions:
+        revoke_tokens(firebase_uid)
+
+    # Re-enable the account, otherwise fresh credentials still cannot sign in.
+    if not user.get("is_active", False):
+        firestore_users.add_document(str(user_id), {"is_active": True})
+        set_user_disabled(firebase_uid, False)
+
+    recipient = (deliver_to or email).strip()
+    email_sent = False
+    if send_email and mail_is_configured():
+        email_sent = send_credentials_email(recipient, full_name, role, email, password)
+
+    if email_sent:
+        detail = f"Credentials generated and emailed to {recipient}."
+    elif not send_email:
+        detail = "Credentials generated. Email delivery was skipped as requested."
+    elif not mail_is_configured():
+        detail = ("Credentials generated, but SMTP is not configured, so no email was sent. "
+                  "Set SMTP_USER and SMTP_PASSWORD (a Google App Password) to enable delivery.")
+    else:
+        detail = ("Credentials generated, but the email could not be delivered. "
+                  "Share the password with the user directly and check the server logs.")
+
+    return {
+        "user_id": user_id,
+        "full_name": full_name,
+        "email": email,
+        "role": role,
+        "password": password,
+        "email_sent": email_sent,
+        "detail": detail,
+    }
+
+
 def next_identifier(field: str, prefix: str) -> str:
     """
     A free admission number or employee id, of the form PREFIX-YEAR-0001.

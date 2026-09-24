@@ -440,6 +440,30 @@ class IdentifierMode(str, enum.Enum):
     MANUAL = "MANUAL"
 
 
+class AdmissionRequestStatus(str, enum.Enum):
+    """
+    Where an online admission request has got to.
+
+    A request is the school's side of a form a family filled in on the website: it is not a
+    student until somebody in the office says so. ADMITTED is the terminal state that creates
+    the student account and is never left again; REJECTED and WAITLISTED are decisions that can
+    be reopened, because a waitlist exists precisely so a "no" can become a "yes" in August.
+    """
+    NEW = "NEW"                    # Submitted; nobody has looked at it.
+    UNDER_REVIEW = "UNDER_REVIEW"  # Somebody has picked it up.
+    WAITLISTED = "WAITLISTED"      # No seat right now; kept for when one frees.
+    ADMITTED = "ADMITTED"          # A student account exists. Terminal.
+    REJECTED = "REJECTED"          # Declined. Reopenable.
+
+
+# Requests still awaiting a decision - what the admin's queue and the duplicate check look at.
+OPEN_ADMISSION_REQUEST_VALUES = frozenset({
+    AdmissionRequestStatus.NEW.value,
+    AdmissionRequestStatus.UNDER_REVIEW.value,
+    AdmissionRequestStatus.WAITLISTED.value,
+})
+
+
 class AcademicYearStatus(str, enum.Enum):
     """
     Where a session year sits relative to today.

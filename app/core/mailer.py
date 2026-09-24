@@ -170,6 +170,172 @@ def send_class_reminder_email(
     )
 
 
+def _html_shell(paragraphs: list[str], rows: list[tuple[str, str]] | None = None,
+                footer: str | None = None) -> str:
+    """The plain HTML frame every family-facing message uses, so they read as one sender."""
+    table = ""
+    if rows:
+        cells = "".join(
+            f'<tr><td style="color:#5f6368;padding:6px 12px;">{label}</td>'
+            f'<td style="padding:6px 12px;"><strong>{value}</strong></td></tr>'
+            for label, value in rows if value
+        )
+        table = (
+            f'<table cellpadding="0" style="border-collapse:collapse;background:#f8f9fa;'
+            f'border:1px solid #dadce0;border-radius:4px;margin:16px 0;">{cells}</table>'
+        )
+    body = "".join(f"<p>{p}</p>" for p in paragraphs)
+    tail = f'<p style="color:#5f6368;">{footer}</p>' if footer else ""
+    return (
+        f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#202124;">'
+        f"{body}{table}{tail}</div>"
+    )
+
+
+def send_admission_request_received_email(
+    to: str,
+    contact_name: str,
+    student_name: str,
+    reference: str,
+    class_name: str | None,
+    year_name: str | None,
+) -> bool:
+    """
+    Acknowledges an admission request the moment it is filed.
+
+    A family that hears nothing after pressing Submit assumes the form failed and fills it
+    in again, which is where duplicate applications come from. The reference number is what
+    they quote when they ring the office.
+    """
+    school = settings.resolved_school_name
+    rows = [("Reference", reference), ("Student", student_name),
+            ("Class applied for", class_name or ""), ("Session", year_name or "")]
+    detail_lines = "\n".join(f"    {label}: {value}" for label, value in rows if value)
+
+    body_text = (
+        f"Dear {contact_name},\n\n"
+        f"Thank you for applying to {school}. We have received your admission request for "
+        f"{student_name} and the office will be in touch once it has been reviewed.\n\n"
+        f"{detail_lines}\n\n"
+        f"Please quote the reference above in any correspondence. There is nothing more you "
+        f"need to do for now.\n"
+    )
+    body_html = _html_shell(
+        [
+            f"Dear {contact_name},",
+            f"Thank you for applying to <strong>{school}</strong>. We have received your "
+            f"admission request for <strong>{student_name}</strong> and the office will be in "
+            f"touch once it has been reviewed.",
+        ],
+        rows,
+        footer="Please quote the reference above in any correspondence. There is nothing more "
+               "you need to do for now.",
+    )
+    return send_email(
+        to=to,
+        subject=f"{school}: admission request received ({reference})",
+        body_text=body_text,
+        body_html=body_html,
+    )
+
+
+def send_admission_request_alert_email(to: str, request: dict, admin_url: str | None = None) -> bool:
+    """Tells the office inbox a new request is waiting. Short: the detail is on the admin page."""
+    rows = [
+        ("Reference", request.get("reference") or ""),
+        ("Student", request.get("student_full_name") or ""),
+        ("Class applied for", request.get("class_name") or ""),
+        ("Session", request.get("academic_year_name") or ""),
+        ("Contact", f"{request.get('contact_name') or ''} "
+                    f"({request.get('contact_phone') or ''}, {request.get('contact_email') or ''})"),
+    ]
+    detail_lines = "\n".join(f"    {label}: {value}" for label, value in rows if value)
+    link_line = f"\nReview it here: {admin_url}\n" if admin_url else ""
+
+    body_text = (
+        f"A new admission request has been submitted from the website.\n\n"
+        f"{detail_lines}\n{link_line}\n"
+        f"Open Admission Requests in the admin panel to review, admit or decline it.\n"
+    )
+    body_html = _html_shell(
+        ["A new admission request has been submitted from the website."]
+        + ([f'<a href="{admin_url}">Review it in the admin panel</a>.'] if admin_url else []),
+        rows,
+        footer="Open Admission Requests in the admin panel to review, admit or decline it.",
+    )
+    return send_email(
+        to=to,
+        subject=f"New admission request: {request.get('student_full_name') or ''} "
+                f"({request.get('reference') or ''})",
+        body_text=body_text,
+        body_html=body_html,
+    )
+
+
+def send_admission_decision_email(
+    to: str,
+    contact_name: str,
+    student_name: str,
+    reference: str,
+    status: str,
+    note: str | None = None,
+    class_name: str | None = None,
+    year_name: str | None = None,
+) -> bool:
+    """
+    Tells the family what the office decided.
+
+    ADMITTED, WAITLISTED and REJECTED each get their own opening line; the optional note is
+    whatever the administrator typed and goes in verbatim, because it is the part of the
+    message that actually answers the family's question.
+    """
+    school = settings.resolved_school_name
+    if status == "ADMITTED":
+        subject = f"{school}: admission confirmed for {student_name}"
+        opening = (
+            f"We are pleased to confirm that {student_name} has been admitted to {school}"
+            + (f" in {class_name}" if class_name else "")
+            + (f" for the {year_name} session" if year_name else "")
+            + ". The office will contact you about the next steps, including fees and the "
+              "documents to bring."
+        )
+    elif status == "WAITLISTED":
+        subject = f"{school}: admission request for {student_name} placed on the waiting list"
+        opening = (
+            f"Thank you for applying to {school}. There is no seat available for "
+            f"{student_name}"
+            + (f" in {class_name}" if class_name else "")
+            + " at the moment, so the application has been placed on our waiting list. We "
+              "will contact you as soon as a place opens up."
+        )
+    else:
+        subject = f"{school}: an update on the admission request for {student_name}"
+        opening = (
+            f"Thank you for your interest in {school}. We are sorry to let you know that we are "
+            f"unable to offer {student_name} a place"
+            + (f" in {class_name}" if class_name else "")
+            + " at this time."
+        )
+
+    note_text = f"\nMessage from the school:\n{note}\n" if note else ""
+    body_text = (
+        f"Dear {contact_name},\n\n{opening}\n{note_text}\n"
+        f"    Reference: {reference}\n\n"
+        f"If you have any questions, please contact the school office and quote the reference "
+        f"above.\n"
+    )
+    paragraphs = [f"Dear {contact_name},", opening]
+    if note:
+        paragraphs.append(f"<em>Message from the school:</em><br>{note}")
+    body_html = _html_shell(
+        paragraphs,
+        [("Reference", reference)],
+        footer="If you have any questions, please contact the school office and quote the "
+               "reference above.",
+    )
+    return send_email(to=to, subject=subject, body_text=body_text, body_html=body_html)
+
+
 def send_credentials_email(
     to: str,
     full_name: str,

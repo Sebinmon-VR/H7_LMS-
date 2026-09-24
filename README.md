@@ -55,6 +55,32 @@ python -m scripts.migrate_firestore_to_sql --verify    # compare counts afterwar
 `GET /health/database` says which backend a deployment is on and whether it answers.
 Setting `DATABASE_BACKEND=firestore` switches back; nothing Firestore-side is removed.
 
+## Online admission requests
+
+The school's public website (a separate static site) carries an admission form that posts
+to this API without a login. A request is a record for the office to decide on, never a
+student account by itself.
+
+| Endpoint | Who | What |
+| --- | --- | --- |
+| `GET /admissions/requests/options` | Public | Whether applications are open, the session they land in, the classes on offer. |
+| `POST /admissions/requests` | Public | File a request. 409 for an open duplicate (same child, same date of birth), 429 past `ADMISSION_REQUEST_RATE_LIMIT` per hour per address, 503 when `ADMISSION_REQUESTS_ENABLED` is off. |
+| `GET /admin/admissions/requests` | Admin | The queue, filterable by `status`, `program`, `class_id`, `academic_year_id`. |
+| `POST /admin/admissions/requests/{id}/status` | Admin | Review, waitlist, decline or reopen; optionally email the family. |
+| `POST /admin/admissions/requests/{id}/notes` | Admin | An internal note. |
+| `POST /admin/admissions/requests/{id}/admit` | Admin | Create the student, enrol them, optionally create a parent login and email passwords. |
+| `DELETE /admin/admissions/requests/{id}` | Admin | Remove the request; a student created from it stays. |
+
+The two public endpoints answer to **any origin** (a middleware in `app/main.py` handles
+their CORS separately, since they accept no token), so the website needs no CORS setup. A
+hidden `website` field on the form is a honeypot: a filled one is acknowledged and dropped.
+
+Emails are best-effort and never fail a request: the family gets an acknowledgement with the
+reference (`ADR-2026-0007`), `ADMISSION_REQUEST_NOTIFY_EMAIL` gets an alert per request, and
+decisions go out when the admin asks. `SCHOOL_DISPLAY_NAME` is how the school is named in
+them. Admitting reuses the same code as the Users screen (`app/services/accounts.py`), so an
+admitted family lands in exactly the state a hand-created one would.
+
 ## School fees: heads, structures and the admission charge
 
 A fee head is one thing the school charges for; a structure is what a year's cohort is

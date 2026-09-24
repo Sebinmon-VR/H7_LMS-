@@ -360,6 +360,25 @@ class Settings(BaseSettings):
     SCHOOL_ADMISSION_ID_MODE: str = "AUTO"
     SCHOOL_EMPLOYEE_ID_MODE: str = "AUTO"
 
+    # --- Online admission requests -----------------------------------------------------
+    #
+    # The public form on the school's website posts here without a login. A request is a
+    # record for the office to decide on, never a student account by itself, so the worst a
+    # bad actor can do is fill the queue - which the per-address limit below bounds.
+    ADMISSION_REQUESTS_ENABLED: bool = True
+    # Submissions accepted per hour from one client address. 0 disables the limit.
+    ADMISSION_REQUEST_RATE_LIMIT: int = 5
+    # An office inbox told of every new request, so nobody has to keep the admin page open.
+    # Blank sends nothing; the request is still recorded and visible in the admin panel.
+    ADMISSION_REQUEST_NOTIFY_EMAIL: str = ""
+    # How the school is named in emails to families. PROJECT_NAME is the API's own name and
+    # reads oddly at the top of a letter to a parent.
+    SCHOOL_DISPLAY_NAME: str = ""
+
+    @property
+    def resolved_school_name(self) -> str:
+        return (self.SCHOOL_DISPLAY_NAME or self.PROJECT_NAME or "the school").strip()
+
     # How often the school maintenance sweep runs: opening due classes, closing abandoned
     # ones, and sending any parent digest that has come due. Every action it takes is
     # idempotent or claimed, so the interval is a cost/latency trade rather than a

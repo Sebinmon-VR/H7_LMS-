@@ -12,11 +12,9 @@ from app.core.enums import (
 )
 from app.core.gcp_services import storage_service
 from app.core.jobs import job_registry, report_cache
-from app.core.credentials import generate_password
-from app.core.mailer import is_configured as mail_is_configured, send_credentials_email
+from app.core.mailer import is_configured as mail_is_configured
 from app.core.firebase_auth import (
-    create_auth_user, delete_auth_user, set_role_claims, set_auth_password,
-    set_user_disabled, revoke_tokens, update_auth_user
+    delete_auth_user, set_role_claims, set_user_disabled, revoke_tokens, update_auth_user
 )
 from app.core.firebase import (
     firestore_users, firestore_classes, firestore_subjects,
@@ -427,74 +425,10 @@ def generate_user_credentials(
     relay it; it is never stored by this backend and cannot be retrieved later.
     """
     user = require_document(firestore_users, user_id, "User")
-
-    email = user.get("email")
-    if not email:
-        raise HTTPException(
-            status_code=400,
-            detail="This user has no email address. Set one before issuing credentials.",
-        )
-
-    password = generate_password(settings.GENERATED_PASSWORD_LENGTH)
-    full_name = user.get("full_name") or email
-    role = user.get("role", UserRole.STUDENT.value)
-
-    # An account created while Firebase Auth was unreachable has no uid yet, so create the
-    # auth account now and link it rather than failing the request.
-    firebase_uid = user.get("firebase_uid")
-    if firebase_uid:
-        applied = set_auth_password(firebase_uid, password)
-    else:
-        firebase_uid = create_auth_user(email, password, full_name)
-        applied = firebase_uid is not None
-        if applied:
-            firestore_users.add_document(str(user_id), {"firebase_uid": firebase_uid})
-
-    if not applied:
-        raise HTTPException(
-            status_code=503,
-            detail="Could not set the password on Firebase Auth. "
-                   "Check the Admin SDK credentials and try again.",
-        )
-
-    set_role_claims(firebase_uid, role, user_id)
-
-    # A password reset must not leave old sessions alive on someone else's device.
-    if options.revoke_sessions:
-        revoke_tokens(firebase_uid)
-
-    # Re-enable the account, otherwise fresh credentials still cannot sign in.
-    if not user.get("is_active", False):
-        firestore_users.add_document(str(user_id), {"is_active": True})
-        set_user_disabled(firebase_uid, False)
-
-    email_sent = False
-    if options.send_email:
-        if mail_is_configured():
-            email_sent = send_credentials_email(email, full_name, role, email, password)
-        else:
-            email_sent = False
-
-    if email_sent:
-        detail = f"Credentials generated and emailed to {email}."
-    elif not options.send_email:
-        detail = "Credentials generated. Email delivery was skipped as requested."
-    elif not mail_is_configured():
-        detail = ("Credentials generated, but SMTP is not configured, so no email was sent. "
-                  "Set SMTP_USER and SMTP_PASSWORD (a Google App Password) to enable delivery.")
-    else:
-        detail = ("Credentials generated, but the email could not be delivered. "
-                  "Share the password with the user directly and check the server logs.")
-
-    return CredentialsIssued(
-        user_id=user_id,
-        full_name=full_name,
-        email=email,
-        role=UserRole(role),
-        password=password,
-        email_sent=email_sent,
-        detail=detail,
-    )
+    # Shared with the admission flow, which issues a new student's login the same way.
+    return CredentialsIssued(**account_service.issue_credentials(
+        user, send_email=options.send_email, revoke_sessions=options.revoke_sessions,
+    ))
 
 
 @router.post("/classes", response_model=ClassRoomOut, status_code=status.HTTP_201_CREATED)

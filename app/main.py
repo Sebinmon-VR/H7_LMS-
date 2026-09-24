@@ -15,6 +15,11 @@ from app.core.sqldb import DatabaseUnavailable
 from app.api.v1.auth import router as auth_router
 from app.api.v1.admin import router as admin_router
 from app.api.v1.admissions import router as admissions_router
+from app.api.v1.admission_requests import (
+    PUBLIC_PREFIX as ADMISSION_REQUESTS_PUBLIC_PREFIX,
+    admin_router as admission_requests_admin_router,
+    public_router as admission_requests_router,
+)
 from app.api.v1.families import (
     admin_router as families_admin_router,
     parent_router as parent_router,
@@ -196,6 +201,45 @@ logger.info(
 
 
 # ---------------------------------------------------------------------------------------
+# The public admission form
+#
+# The school's website is a different site on a different domain, and it posts the admission
+# form here with no login. The listed-origins policy above exists to protect endpoints that
+# accept a bearer token; these two accept none, so they answer to any origin. Handled by a
+# middleware added AFTER CORSMiddleware - which makes it the outer one - because the inner
+# one would otherwise refuse the preflight from an unlisted origin before any route ran.
+# ---------------------------------------------------------------------------------------
+
+_PUBLIC_CORS_PATH = f"{settings.API_V1_STR}{ADMISSION_REQUESTS_PUBLIC_PREFIX}"
+_PUBLIC_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Accept, Origin, X-Requested-With, X-Timezone",
+    "Access-Control-Max-Age": "600",
+    "Vary": "Origin",
+}
+
+
+@app.middleware("http")
+async def public_admission_form_cors(request: Request, call_next):
+    path = request.url.path
+    if path == _PUBLIC_CORS_PATH or path.startswith(_PUBLIC_CORS_PATH + "/"):
+        if request.method == "OPTIONS":
+            from fastapi.responses import Response
+
+            return Response(status_code=204, headers=_PUBLIC_CORS_HEADERS)
+        response = await call_next(request)
+        for key, value in _PUBLIC_CORS_HEADERS.items():
+            response.headers[key] = value
+        # Credentials and a wildcard origin are mutually exclusive; the inner middleware may
+        # have added this for a listed origin, and it must not travel with the wildcard.
+        if "access-control-allow-credentials" in response.headers:
+            del response.headers["access-control-allow-credentials"]
+        return response
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------------------
 # When the database says no
 #
 # Every request here ends in Firestore, and Firestore fails in two ways worth telling the
@@ -301,6 +345,9 @@ app.include_router(tuition_notices_router, prefix=settings.API_V1_STR)
 # term dates, bills one household and keeps one set of session years. Each router carries its
 # own role guards, and where a record concerns one product it says so with a `program` field.
 app.include_router(admissions_router, prefix=settings.API_V1_STR)
+# The website's admission form (public) and the office's queue for it (admin).
+app.include_router(admission_requests_router, prefix=settings.API_V1_STR)
+app.include_router(admission_requests_admin_router, prefix=settings.API_V1_STR)
 app.include_router(families_admin_router, prefix=settings.API_V1_STR)
 app.include_router(parent_router, prefix=settings.API_V1_STR)
 app.include_router(notices_admin_router, prefix=settings.API_V1_STR)

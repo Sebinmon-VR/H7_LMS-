@@ -1089,6 +1089,11 @@ firestore_academic_years = _service("academic_years", cacheable=True)
 # The basis a student was admitted on, and the concession that comes with it. Same shape and
 # same access pattern as the years above.
 firestore_admission_categories = _service("admission_categories", cacheable=True)
+# Admission requests posted from the public website form. One document per application,
+# carrying the student, parent and address detail the office needs to decide, plus the
+# decision itself once made. Never cached: the admin queue must show a request the moment
+# it lands, and the status must read back as just written after an admit.
+firestore_admission_requests = _service("admission_requests")
 # Billing households. Cached: every fee calculation resolves a student's family, and the
 # membership changes only when a sibling is admitted or leaves.
 firestore_sibling_groups = _service("sibling_groups", cacheable=True)
