@@ -149,6 +149,40 @@ def deep_merge(base: dict, updates: dict) -> dict:
 # Connections
 # ---------------------------------------------------------------------------------------
 
+_SQL_SERVER_DRIVERS = (
+    "ODBC Driver 18 for SQL Server",
+    "ODBC Driver 17 for SQL Server",
+    "ODBC Driver 13 for SQL Server",
+)
+_driver_warned = False
+
+
+def driver_name() -> str:
+    """
+    The ODBC driver to connect with: `DB_DRIVER` when it is installed, else whichever
+    Microsoft SQL Server driver the host does have.
+
+    A developer's Windows box and an App Service image rarely ship the same driver
+    version, and "Can't open lib 'ODBC Driver 18'" is a poor way to find that out at 8am.
+    The fallback is logged once so nobody is surprised by a downgrade.
+    """
+    global _driver_warned
+    wanted = settings.DB_DRIVER
+    try:
+        available = list(pyodbc.drivers()) if pyodbc is not None else []
+    except Exception:  # noqa: BLE001 - driver enumeration failing is not worth a crash
+        available = []
+    if not available or wanted in available:
+        return wanted
+    for candidate in _SQL_SERVER_DRIVERS:
+        if candidate in available:
+            if not _driver_warned:
+                logger.warning("ODBC driver %r is not installed here; connecting with %r.", wanted, candidate)
+                _driver_warned = True
+            return candidate
+    return wanted
+
+
 def connection_string() -> str:
     if settings.DB_CONNECTION_STRING:
         return settings.DB_CONNECTION_STRING
@@ -160,7 +194,7 @@ def connection_string() -> str:
     if "," not in server:
         server = f"{server},1433"
     return (
-        f"Driver={{{settings.DB_DRIVER}}};Server={server};Database={settings.DB_NAME};"
+        f"Driver={{{driver_name()}}};Server={server};Database={settings.DB_NAME};"
         f"Uid={settings.DB_USER};Pwd={settings.DB_PASSWORD};"
         "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
     )

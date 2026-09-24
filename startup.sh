@@ -22,6 +22,29 @@ WORKERS="${GUNICORN_WORKERS:-1}"
 # tail of a cold Firestore round trip, so it would recycle workers mid-request.
 TIMEOUT="${GUNICORN_TIMEOUT:-600}"
 
+# The Azure SQL backend needs Microsoft's ODBC driver, which the App Service Python image
+# may or may not ship. Install it on first boot when it is missing, from Microsoft's Debian
+# repository; skipped in a second when it is already there. A failed install is logged and
+# the app still starts - the driver fallback in app/core/sqldb.py picks whatever exists.
+if [ "${DATABASE_BACKEND:-firestore}" = "azuresql" ] && command -v apt-get >/dev/null 2>&1; then
+    if ! (odbcinst -q -d 2>/dev/null | grep -q "ODBC Driver 1[78] for SQL Server"); then
+        echo "startup: no Microsoft ODBC driver for SQL Server found; installing msodbcsql18"
+        (
+            set +e
+            export DEBIAN_FRONTEND=noninteractive ACCEPT_EULA=Y
+            . /etc/os-release
+            curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+                -o /etc/apt/trusted.gpg.d/microsoft.asc
+            echo "deb [arch=amd64] https://packages.microsoft.com/debian/${VERSION_ID}/prod ${VERSION_CODENAME} main" \
+                > /etc/apt/sources.list.d/mssql-release.list
+            apt-get update -qq && apt-get install -y -qq unixodbc msodbcsql18
+            if [ $? -ne 0 ]; then
+                echo "startup: ODBC driver install failed; SQL connections will fail until it is fixed"
+            fi
+        )
+    fi
+fi
+
 exec gunicorn app.main:app \
     --worker-class uvicorn.workers.UvicornWorker \
     --workers "${WORKERS}" \
