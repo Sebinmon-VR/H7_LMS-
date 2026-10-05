@@ -1,5 +1,5 @@
 """
-Reconciles the teaching staff roster against Firestore.
+Reconciles the teaching staff roster against the database.
 
 The roster below is the school's own record of who teaches what: full legal name, the
 personal email each teacher actually signs in with, and the subject/grade combinations they
@@ -12,8 +12,8 @@ is a partial statement about the staff it names, not a complete statement about 
 Three things happen, in order:
 
   1. Subjects named in the roster that do not exist yet are created.
-  2. Named teachers get their `full_name` and `email` corrected, on both the Firestore
-     profile and the linked Firebase Auth account, so the two never drift apart.
+  2. Named teachers get their `full_name` and `email` corrected on their profile, which is
+     also what they sign in with.
   3. Subject/class mappings are brought in line: missing ones are added, and ones the
      roster contradicts are removed.
 
@@ -50,13 +50,7 @@ from app.core.firebase import (  # noqa: E402
     firestore_users,
     generate_id,
 )
-from app.core.firebase_auth import (  # noqa: E402
-    create_auth_user,
-    revoke_tokens,
-    set_auth_password,
-    set_role_claims,
-    update_auth_user,
-)
+from app.core import identity  # noqa: E402
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 
@@ -86,7 +80,7 @@ KG_TO_7 = KG + grades("1-7")
 KG2_TO_7 = [KG2] + grades("1-7")
 
 # Subjects the roster needs that the database may not have yet, keyed by the code used in
-# ROSTER below. Codes already present in Firestore are matched, not duplicated.
+# ROSTER below. Codes already present in the database are matched, not duplicated.
 REQUIRED_SUBJECTS = {
     "RHYM": ("RHYMES & STORIES", "Rhymes and stories (KG)"),
 }
@@ -252,15 +246,6 @@ class Reconciler:
                f"<{updates.get('email', user.get('email'))}>")
         if not self.dry_run:
             firestore_users.add_document(str(user["id"]), updates)
-            if user.get("firebase_uid"):
-                # Firestore and Firebase Auth hold the email separately. Letting them
-                # diverge leaves an account the admin list shows one address for and that
-                # signs in with another.
-                update_auth_user(
-                    user["firebase_uid"],
-                    email=updates.get("email"),
-                    display_name=updates.get("full_name"),
-                )
         user.update(updates)
         self.log(f"update {was} -> {now}")
 
@@ -334,10 +319,10 @@ class Reconciler:
 
 def issue_passwords(users: list[dict], dry_run: bool) -> list[tuple[dict, str]]:
     """
-    Mints a fresh password per teacher and applies it to Firebase Auth.
+    Mints a fresh password per teacher and stores its hash.
 
-    The password exists only in this function's return value and the printed table; it is
-    never written to Firestore and cannot be read back afterwards.
+    The password itself exists only in this function's return value and the printed table;
+    only its hash is written, and it cannot be read back afterwards.
     """
     issued = []
     for user in sorted(users, key=lambda u: u.get("full_name") or ""):
@@ -346,22 +331,8 @@ def issue_passwords(users: list[dict], dry_run: bool) -> list[tuple[dict, str]]:
             issued.append((user, password))
             continue
 
-        uid = user.get("firebase_uid")
-        if uid:
-            applied = set_auth_password(uid, password)
-        else:
-            uid = create_auth_user(user["email"], password, user.get("full_name"))
-            applied = uid is not None
-            if applied:
-                firestore_users.add_document(str(user["id"]), {"firebase_uid": uid})
-
-        if not applied:
-            print(f"  !! could not set a password for {user.get('email')}")
-            continue
-
-        set_role_claims(uid, user.get("role"), int(user["id"]))
-        # The rostered email change means the old address may still hold a live session.
-        revoke_tokens(uid)
+        # Revoking signs out any session the old address may still hold.
+        identity.set_password(user["id"], password, source="roster", revoke=True)
         issued.append((user, password))
     return issued
 

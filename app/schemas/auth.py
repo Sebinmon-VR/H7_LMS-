@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.core.enums import UserRole
 
 
@@ -12,19 +12,26 @@ class LoginRequest(BaseModel):
 
 class Token(BaseModel):
     """
-    Response schema returning JWT bearer token and user metadata.
+    Response schema returning the session token and user metadata.
     """
     access_token: str
     token_type: str = "bearer"
+    # Seconds until the token runs out; renew it with POST /auth/refresh before then.
+    expires_in: int | None = None
     role: UserRole
     user_id: int
     full_name: str
 
 
-class TokenData(BaseModel):
-    """
-    Internal payload decoded from verified JWT access tokens.
-    """
-    user_id: int | None = None
-    email: str | None = None
-    role: UserRole | None = None
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(..., min_length=1)
+
+
+class PasswordResetRequest(BaseModel):
+    email: str
+
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_password: str = Field(..., min_length=1)

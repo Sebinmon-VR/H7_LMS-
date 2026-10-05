@@ -3,19 +3,17 @@ from typing import Callable, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status, Query
 
 from app.api.v1.dependencies import require_admin
-from app.core import google_drive, google_meet, meet_recordings
+from app.core import acs
+from app.core import mailer
 from app.core.concurrency import run_parallel
 from app.core.config import settings
 from app.core.enums import (
     UserRole, AttendanceStatus, DayOfWeek, Program,
     TEACHING_ROLE_VALUES, TEACHING_OR_ADMIN_VALUES, normalize_programs,
 )
-from app.core.gcp_services import storage_service
+from app.core.storage import storage_service
 from app.core.jobs import job_registry, report_cache
-from app.core.mailer import is_configured as mail_is_configured
-from app.core.firebase_auth import (
-    delete_auth_user, set_role_claims, set_user_disabled, revoke_tokens, update_auth_user
-)
+from app.core import identity
 from app.core.firebase import (
     firestore_users, firestore_classes, firestore_subjects,
     firestore_teacher_mappings, firestore_class_teacher_mappings,
@@ -34,7 +32,8 @@ from app.services import class_rooms as class_room_service
 from app.services import families as family_service
 from app.services import timetable as timetable_service
 from app.services.content import (
-    active_students_in_class, resolve_teacher, schedule_meeting, store_material
+    is_legacy_meet_link, regenerate_meeting_link, resolve_teacher, schedule_meeting,
+    store_material,
 )
 from app.services.recordings import (
     get_scheduler as get_recording_scheduler, harvest_meeting, sweep as run_recording_sweep,
@@ -83,7 +82,10 @@ _profile_fields = account_service.profile_fields
 @router.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 def create_user(user_in: UserCreate, admin: UserOut = Depends(require_admin)):
     """
-    [Admin Only] Create a new system user (Student, Teacher, or Admin) and sync to Firebase.
+    [Admin Only] Create a new system user (Student, Teacher, or Admin).
+
+    The password, when given, is stored as a hash in `user_credentials` (app/core/identity.py);
+    the user signs in with it at `POST /auth/login`.
 
     Omit `email` to have one generated as firstname.lastname@<USER_EMAIL_DOMAIN>.
     Omit `password` to create the account without a credential, then issue one with
@@ -238,17 +240,10 @@ def update_user(
             and any(key in updated for key in GUARDIAN_FIELDS)):
         family_service.auto_place(user_id, admin.id)
 
-    # Mirror profile changes onto the linked Firebase Auth account.
-    firebase_uid = user.get("firebase_uid")
-    if firebase_uid:
-        update_auth_user(firebase_uid, email=updated.get("email"), display_name=user_in.full_name)
-        if user_in.is_active is not None:
-            set_user_disabled(firebase_uid, not user_in.is_active)
-        if user_in.role is not None:
-            # Claims drive what the frontend renders, so a role change that does not reach
-            # Firebase leaves the user seeing the wrong navigation until their token expires.
-            set_role_claims(firebase_uid, user_in.role, user_id)
-            revoke_tokens(firebase_uid)
+    # A deactivated account is signed out everywhere at once, not when its token runs out.
+    # Roles need nothing here: they are read from the profile on every request.
+    if user_in.is_active is False and user.get("is_active", False):
+        identity.revoke_sessions(user_id)
 
     return UserOut(**firestore_users.get_document(str(user_id)))
 
@@ -296,10 +291,10 @@ def delete_user(
     [Admin Only] Remove a user account.
 
     **Default (soft delete)** deactivates: the profile stays, attendance, topic and grade
-    history keep resolving to a name, and the linked Firebase Auth account is disabled with
-    its sessions revoked. `POST /admin/users/{id}/reactivate` reverses it.
+    history keep resolving to a name, and the account can no longer sign in: every session it
+    holds is revoked at once. `POST /admin/users/{id}/reactivate` reverses it.
 
-    **`?permanent=true`** erases the profile and the Firebase Auth account. It refuses with
+    **`?permanent=true`** erases the profile and its stored password. It refuses with
     `409` while anything still references the user, listing what and how many — add
     `&force=true` to delete those records too. This is irreversible and will leave gaps in
     historical reports, which is exactly why it is neither the default nor silent.
@@ -330,16 +325,12 @@ def delete_user(
                 ),
             )
 
-    firebase_uid = user.get("firebase_uid")
-
     if not permanent:
         firestore_users.add_document(str(user_id), {
             "is_active": False,
             "updated_at": datetime.utcnow().isoformat(),
         })
-        if firebase_uid:
-            set_user_disabled(firebase_uid, True)
-            revoke_tokens(firebase_uid)
+        identity.revoke_sessions(user_id)
 
         return UserDeleted(
             user_id=user_id,
@@ -347,8 +338,8 @@ def delete_user(
             full_name=user.get("full_name"),
             mode="SOFT",
             detail=(
-                "User deactivated. History is preserved and the Firebase account is "
-                "disabled. Use POST /admin/users/{id}/reactivate to restore access, or "
+                "User deactivated. History is preserved and every session is signed "
+                "out. Use POST /admin/users/{id}/reactivate to restore access, or "
                 "?permanent=true to erase the account."
             ),
         )
@@ -384,27 +375,23 @@ def delete_user(
     if deletions:
         run_parallel(deletions)
 
-    auth_deleted = False
-    if firebase_uid:
-        auth_deleted = delete_auth_user(firebase_uid)
+    had_password = identity.has_password(user_id)
+    login_deleted = identity.delete_credentials(user_id) if had_password else True
 
     firestore_users.delete_document(str(user_id))
 
     detail = f"User {user.get('email') or user_id} permanently deleted."
     if blocking:
         detail += f" {sum(blocking.values())} referencing record(s) were removed."
-    if firebase_uid and not auth_deleted:
-        detail += (
-            " The Firebase Auth account could not be deleted and may still exist - remove "
-            f"uid {firebase_uid} from the Firebase console manually."
-        )
+    if not login_deleted:
+        detail += " Their stored password could not be removed; the account no longer exists, so it cannot be used."
 
     return UserDeleted(
         user_id=user_id,
         email=user.get("email"),
         full_name=user.get("full_name"),
         mode="PERMANENT",
-        firebase_auth_deleted=auth_deleted,
+        login_deleted=login_deleted,
         deleted_records=blocking,
         detail=detail,
     )
@@ -415,13 +402,9 @@ def reactivate_user(user_id: int, _: UserOut = Depends(require_admin)):
     """
     [Admin Only] Re-enable a previously deactivated user account.
     """
-    user = require_document(firestore_users, user_id, "User")
+    require_document(firestore_users, user_id, "User")
 
     firestore_users.add_document(str(user_id), {"is_active": True})
-
-    firebase_uid = user.get("firebase_uid")
-    if firebase_uid:
-        set_user_disabled(firebase_uid, False)
 
     return UserOut(**firestore_users.get_document(str(user_id)))
 
@@ -439,7 +422,7 @@ def generate_user_credentials(
     receive their email and password. Safe to run again to reset a forgotten password.
 
     The generated password is returned once in the response so the admin can display or
-    relay it; it is never stored by this backend and cannot be retrieved later.
+    relay it; only its hash is stored, so it cannot be retrieved later.
     """
     user = require_document(firestore_users, user_id, "User")
     # Shared with the admission flow, which issues a new student's login the same way.
@@ -498,9 +481,8 @@ def live_class_events(
     _: UserOut = Depends(require_admin),
 ):
     """
-    [Admin Only] A class's room log, newest first: joins, periods opened and closed, room
-    changes. What the LMS itself handed out and recorded - Google does not report who is
-    inside a Meet to this app.
+    [Admin Only] A class's room log, newest first: joins and leaves (reported by the call
+    itself for an LMS room), periods opened and closed, room changes.
     """
     require_document(firestore_classes, class_id, "ClassRoom")
     since = None
@@ -520,18 +502,15 @@ def live_class_events(
 def live_class_attendance(
     class_id: int,
     on_date: Optional[date] = Query(None, description="School day. Defaults to today."),
-    sync: bool = Query(False, description="Ask Google Meet now rather than waiting for the sweep."),
+    sync: bool = Query(False, description="Rebuild from the room log now rather than waiting for the sweep."),
     _: UserOut = Depends(require_admin),
 ):
     """
-    [Admin Only] Who was in the class's room according to Google Meet: each participant
-    with their join and leave times.
+    [Admin Only] Who was in the class's room: each person with their join and leave times
+    and total minutes, for one school day.
 
-    The only true record - the LMS sees people take a link, never hang up. Copied from
-    Meet every few minutes once the `meetings.space.readonly` scope is authorised; until
-    then this is empty and the class's `room_attendance_error` on the live board says so.
-    Meet names participants by display name, so a row is matched to an LMS account by name
-    when it can be.
+    Built from the room log, which the in-LMS call writes on every connect and hang-up, and
+    rebuilt by the maintenance sweep every few minutes.
     """
     from app.services import timetable as timetable_service
 
@@ -571,14 +550,13 @@ def setup_class_room(
     """
     [Admin Only] Give a class its standing live-class room.
 
-    The school runs one Google Meet room per class: students join it and stay, and each
-    subject teacher joins at their timetabled period. Leave the body empty to create a Meet
-    room on the school's Workspace identity; `owner_id` hosts it on a teacher's calendar
-    instead (whose Drive its recordings then land in); `manual_link` records a link the
-    school already has. An existing room is kept unless `replace` is set.
+    The school runs one live-class room per class, inside the LMS: students join it and
+    stay, and each subject teacher joins at their timetabled period. Leave the body empty to
+    create it; `manual_link` records an outside link the school already has instead. An
+    existing room is kept unless `replace` is set, which gives the class a fresh room.
 
     Rooms are also created on their own the first time a session is scheduled for a class,
-    so this is for setting one up ahead of time, choosing its owner, or repairing one.
+    so this is for setting one up ahead of time, or repairing one.
     """
     class_room = require_document(firestore_classes, class_id, "ClassRoom")
     if payload.manual_link:
@@ -593,50 +571,10 @@ def setup_class_room(
     return ClassRoomOut(**updated)
 
 
-@router.post("/classes/{class_id}/room/guests", response_model=ClassRoomOut)
-def invite_class_room_teachers(class_id: int, admin: UserOut = Depends(require_admin)):
-    """
-    [Admin Only] Put every teacher of the class on its room's guest list.
-
-    Meet lets the organiser and invited guests straight in and makes everybody else ask to
-    join; a teacher on a gmail address is an outsider to a room organised by the school
-    identity. This happens on its own when a room is made and when a teacher is mapped,
-    schedules or joins - run it by hand after fixing a Calendar problem, or to re-send the
-    invitations. A 502 carries Google's reason.
-    """
-    class_room = require_document(firestore_classes, class_id, "ClassRoom")
-    if class_room.get("room_provider") != class_room_service.PROVIDER_MEET:
-        raise HTTPException(
-            status_code=400,
-            detail="Only a Google Meet room made by the LMS has a guest list it can manage.",
-        )
-    updated, error = class_room_service.sync_room_guests(class_room, notify=True)
-    if error:
-        raise HTTPException(status_code=502, detail=error)
-    return ClassRoomOut(**updated)
-
-
-@router.post("/classes/{class_id}/room/open", response_model=ClassRoomOut)
-def open_class_room(class_id: int, admin: UserOut = Depends(require_admin)):
-    """
-    [Admin Only] Let anyone with the link into the class's room without asking to join.
-
-    Sets the Meet space's access type to `MEET_ACCESS_TYPE` (OPEN). Done on its own when a
-    room is made and retried by the sweep; run it by hand after authorising the Meet scope
-    in Workspace. A 502 carries Google's reason - including, when the delegation lacks the
-    `meetings.space.settings` scope, exactly what to add and where.
-    """
-    class_room = require_document(firestore_classes, class_id, "ClassRoom")
-    updated, error = class_room_service.open_room_access(class_room)
-    if error:
-        raise HTTPException(status_code=502, detail=error)
-    return ClassRoomOut(**updated)
-
-
 @router.delete("/classes/{class_id}/room", response_model=ClassRoomOut)
 def clear_class_room(class_id: int, admin: UserOut = Depends(require_admin)):
     """
-    [Admin Only] Remove a class's room. Its Calendar event is deleted, so the old link stops
+    [Admin Only] Remove a class's room. Its live-class room is deleted, so the old link stops
     working. Sessions already scheduled keep the link they were given.
     """
     class_room = require_document(firestore_classes, class_id, "ClassRoom")
@@ -681,8 +619,7 @@ def delete_class_room(
     Cascading also removes the class-teacher assignments, and any teacher left leading no
     class at all drops back to the plain `TEACHER` role.
     """
-    # The room's Calendar event goes with the class: a Meet room pointing at a class that no
-    # longer exists is clutter on its owner's calendar. Best-effort, before the cascade.
+    # The room goes with the class. Best-effort, before the cascade.
     existing = firestore_classes.get_document(str(class_id))
     if existing:
         class_room_service.drop_calendar_event(existing)
@@ -835,13 +772,6 @@ def map_teacher_to_class(
     firestore_teacher_mappings.add_document(str(mapping_id), mapping_data)
     mapping_data["id"] = mapping_id
 
-    # A newly mapped teacher must be able to walk into the class's room without asking to
-    # join, so they go on its guest list now. Best-effort: a Calendar hiccup is recorded on
-    # the class, not turned into a failed mapping.
-    if class_room_service.has_room(class_room):
-        class_room_service.sync_room_guests(
-            class_room, extra_emails=[teacher.get("email")], notify=True
-        )
     return TeacherMappingOut(**hydrate_teacher_mapping(mapping_data))
 
 
@@ -876,7 +806,8 @@ def sync_class_teacher_role(teacher_id: int | None) -> str | None:
     Brings a teacher's role label back into line with their class-teacher mappings.
 
     The mappings are the authority for what a class teacher may do; the role exists only so
-    the frontend can gate navigation straight from the Firebase claim. Running this after
+    the frontend can gate navigation straight from the profile (`/auth/me`, or the `role`
+    claim in the session token when that is unreachable). Running this after
     every assign and unassign is what stops the two from drifting into the state
     `app.services.permissions` warns about - a role reading CLASS_TEACHER while no mapping
     says which class, or a teacher still leading 9-A whose token says plain TEACHER.
@@ -905,13 +836,6 @@ def sync_class_teacher_role(teacher_id: int | None) -> str | None:
         "updated_at": datetime.utcnow().isoformat(),
     })
 
-    firebase_uid = user.get("firebase_uid")
-    if firebase_uid:
-        set_role_claims(firebase_uid, target, teacher_id)
-        # Claims are baked into an already-issued ID token, so without revoking, a teacher
-        # promoted mid-session keeps seeing the old navigation until the token expires.
-        revoke_tokens(firebase_uid)
-
     return target.value
 
 
@@ -933,8 +857,9 @@ def assign_class_teacher(
     class, not only their own periods. Authority stays scoped to the classes assigned here —
     leading 9-A grants nothing over 10-B.
 
-    The teacher's role is promoted to `CLASS_TEACHER` and their Firebase claims re-issued, so
-    the frontend can gate navigation without another call. Their existing subject mappings,
+    The teacher's role is promoted to `CLASS_TEACHER`, which applies from their next request
+    (roles are read from the profile, not the token), so the frontend can gate navigation
+    from `/auth/me` without another call. Their existing subject mappings,
     periods and records are untouched; a class teacher is still an ordinary teacher elsewhere.
 
     A class may have several class teachers (joint or relief arrangements), and re-posting an
@@ -1019,8 +944,8 @@ def delete_class_teacher_mapping(mapping_id: int, _: UserOut = Depends(require_a
 
     The teacher keeps their subject mappings, periods and everything they logged; they simply
     stop being answerable for the class, and lose the cross-teacher visibility that came with
-    it. If this was their last class, their role drops back to `TEACHER` and their Firebase
-    claims are re-issued so the frontend stops offering the class-teacher screens.
+    it. If this was their last class, their role drops back to `TEACHER`, which applies from
+    their next request, so the frontend stops offering the class-teacher screens.
     """
     mapping = require_document(firestore_class_teacher_mappings, mapping_id, "Class teacher mapping")
     firestore_class_teacher_mappings.delete_document(str(mapping_id))
@@ -1331,9 +1256,9 @@ def get_recording_status(_: UserOut = Depends(require_admin)):
     """
     [Admin Only] Whether class recordings are being collected, and what the last sweep did.
 
-    Open this first when a finished class has no video: `meet_problems` names any missing
-    piece of the Meet setup, and `last_result.details` shows what the sweep decided about
-    each session it looked at.
+    Open this first when a finished class has no video: `problems` names any missing piece
+    of the recording setup, and `last_result.details` shows what the sweep decided about each
+    recording it looked at.
     """
     return get_recording_scheduler().status()
 
@@ -1341,10 +1266,7 @@ def get_recording_status(_: UserOut = Depends(require_admin)):
 @router.get("/recordings/pending")
 def preview_recordings(_: UserOut = Depends(require_admin)):
     """
-    [Admin Only] What the next sweep would file, without moving or sharing anything.
-
-    Safe to call repeatedly: no claim is taken and no Drive file is touched, so this answers
-    "is recording actually working?" without committing to the answer.
+    [Admin Only] What the next sweep would do, without copying or changing anything.
     """
     return run_recording_sweep(dry_run=True)
 
@@ -1355,7 +1277,7 @@ def run_recordings_now(current_user: UserOut = Depends(require_admin)):
     [Admin Only] Collect finished recordings now instead of waiting for the next tick.
 
     Returns a job id to poll at `GET /admin/jobs/{job_id}`. Recordings already filed are
-    skipped by their Firestore claim, so running this by hand cannot duplicate a video.
+    skipped by their copy claim, so running this by hand cannot duplicate a video.
     """
     job = job_registry.submit(
         name="recording_sweep",
@@ -1371,23 +1293,13 @@ def admin_sync_meeting_recording(
     _: UserOut = Depends(require_admin),
 ):
     """
-    [Admin Only] Fetch and file one session's recording immediately.
+    [Admin Only] File one session's announced recording immediately.
 
     For the session someone is asking about right now, rather than waiting up to
-    RECORDING_SCAN_INTERVAL_SECONDS for the sweep to reach it. The outcome is written to the
-    meeting exactly as the sweep would write it, and a session Meet has not finished
-    processing simply comes back as WAITING.
+    RECORDING_SCAN_INTERVAL_SECONDS for the sweep to reach it. A recording ACS has not
+    finished writing simply leaves the session as WAITING.
     """
     meeting = require_document(firestore_meetings, meeting_id, "Meeting")
-
-    if not (meeting.get("meet_space_name") or meeting.get("meet_meeting_code")):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "This meeting has no Google Meet conference behind it, so there is no "
-                "recording to collect. Only sessions with a generated Meet link are recorded."
-            ),
-        )
 
     harvest_meeting(meeting)
     return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
@@ -1411,18 +1323,6 @@ def list_recording_log(
     return records[:limit]
 
 
-def _owner_email(record: dict) -> str:
-    """
-    Email of the teacher a record belongs to.
-
-    Calendar operations act as the event's owner, so an admin editing someone else's meeting
-    must impersonate that teacher rather than themselves - otherwise the patch is issued
-    against a calendar that does not hold the event.
-    """
-    owner = firestore_users.get_document(str(record.get("teacher_id")))
-    return (owner or {}).get("email", "")
-
-
 @router.post("/meetings", response_model=LiveMeetingOut, status_code=status.HTTP_201_CREATED)
 def admin_create_meeting(
     meeting_in: AdminLiveMeetingCreate,
@@ -1431,11 +1331,10 @@ def admin_create_meeting(
     """
     [Admin Only] Schedule a live session, optionally on behalf of a teacher.
 
-    Set `teacher_id` to file the session under that teacher and create the Google Calendar
-    event on their calendar; omit it to schedule under the acting admin. Enrolled students
-    are invited when `invite_students` is set.
+    Set `teacher_id` to file the session under that teacher; omit it to schedule under the
+    acting admin.
 
-    The meeting is saved even if Meet link generation fails - inspect `meet_status` and
+    The meeting is saved even if it cannot be given a room - inspect `meet_status` and
     `meet_error` on the response, and `GET /admin/integrations` for the underlying cause.
     """
     if meeting_in.teacher_id is not None:
@@ -1483,11 +1382,10 @@ def admin_update_meeting(
     _: UserOut = Depends(require_admin)
 ):
     """
-    [Admin Only] Reschedule or edit any teacher's meeting.
-    Title and time changes propagate to the backing Google Calendar event, so invited
-    students see the update on their own calendars.
+    [Admin Only] Reschedule or edit any teacher's meeting. The join link is unchanged; the
+    class's room follows the new time on its own.
     """
-    meeting = require_document(firestore_meetings, meeting_id, "Meeting")
+    require_document(firestore_meetings, meeting_id, "Meeting")
 
     updated = update_in.model_dump(exclude_unset=True, exclude_none=True)
     if not updated:
@@ -1496,38 +1394,8 @@ def admin_update_meeting(
     if "scheduled_time" in updated:
         updated["scheduled_time"] = updated["scheduled_time"].isoformat()
 
-    google_event_id = meeting.get("google_event_id")
-    if google_event_id and ("title" in updated or "scheduled_time" in updated):
-        google_meet.update_meeting(
-            teacher_email=_owner_email(meeting),
-            event_id=google_event_id,
-            calendar_id=meeting.get("google_calendar_id"),
-            title=update_in.title,
-            scheduled_time=update_in.scheduled_time,
-            duration_minutes=update_in.duration_minutes or meeting.get("duration_minutes") or 60,
-        )
-
     firestore_meetings.add_document(str(meeting_id), updated)
     return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
-
-
-@router.post("/meetings/repair-teacher-access")
-def repair_meeting_teacher_access(
-    notify: bool = Query(False, description="Also email each teacher a Calendar invitation."),
-    _: UserOut = Depends(require_admin),
-):
-    """
-    [Admin Only] Let teachers into their own sessions without asking to join.
-
-    Meet admits the organiser and invited guests and makes everybody else knock. A session
-    created by a teacher outside the Workspace domain is organised by the school identity,
-    and until now the teacher was not on its guest list. This adds every such teacher to
-    every future session's event, once. The maintenance sweep does the same for the next two
-    days on its own; run this after a deploy to cover everything already scheduled.
-    """
-    from app.services.content import repair_teacher_access
-
-    return repair_teacher_access(days_ahead=None, notify=notify)
 
 
 @router.post("/meetings/{meeting_id}/regenerate-link", response_model=LiveMeetingOut)
@@ -1536,105 +1404,35 @@ def admin_regenerate_meeting_link(
     admin: UserOut = Depends(require_admin)
 ):
     """
-    [Admin Only] Retry Google Meet link generation for a meeting that has no link.
+    [Admin Only] Give a session a working live-class room.
 
-    Meetings scheduled while the Calendar integration was misconfigured are saved without a
-    link. Once `GET /admin/integrations` reports Meet as healthy, this creates the event and
-    attaches the link without making anyone re-enter the session. Under the classroom model
-    the retry attaches the class's shared room instead, creating it if need be.
+    For a session saved without one (live classes were not configured when it was
+    scheduled), and for one still carrying a Google Meet link from before the move to Azure -
+    those links stopped working with the Workspace. Under the classroom model the session is
+    pointed at its class's shared room, creating it if need be.
     """
     meeting = require_document(firestore_meetings, meeting_id, "Meeting")
 
-    if meeting.get("meeting_link"):
+    link = meeting.get("meeting_link") or ""
+    if link and not is_legacy_meet_link(link) and meeting.get("meet_status") == "MANUAL":
         raise HTTPException(
             status_code=400,
-            detail="This meeting already has a link. Clear it first, or edit it directly.",
+            detail="This meeting has a link entered by hand. Clear it first, or edit it directly.",
         )
 
-    if class_room_service.class_room_mode():
-        class_room = require_document(firestore_classes, meeting.get("class_id"), "ClassRoom")
-        class_room, room_error = class_room_service.ensure_room(
-            class_room, actor_id=admin.id, actor_email=admin.email
-        )
-        if not class_room_service.has_room(class_room):
-            firestore_meetings.add_document(
-                str(meeting_id), {"meet_status": "FAILED", "meet_error": room_error}
-            )
-            raise HTTPException(
-                status_code=502, detail=room_error or "The class room could not be created."
-            )
-        firestore_meetings.add_document(
-            str(meeting_id), class_room_service.meeting_fields_for_room(class_room)
-        )
-        return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
-
-    scheduled_time = meeting.get("scheduled_time")
-    if not scheduled_time:
-        raise HTTPException(status_code=400, detail="This meeting has no scheduled time.")
-
-    attendee_emails = [
-        student["email"]
-        for student in active_students_in_class(meeting.get("class_id"))
-        if student.get("email")
-    ]
-    # A teacher outside the domain is not the organiser; invite them or they knock.
-    if not google_meet.is_own_calendar(_owner_email(meeting)):
-        attendee_emails.append(_owner_email(meeting))
-
-    created = google_meet.create_meeting(
-        teacher_email=_owner_email(meeting),
-        title=meeting.get("title") or "LMS session",
-        scheduled_time=datetime.fromisoformat(scheduled_time),
-        duration_minutes=meeting.get("duration_minutes") or 60,
-        attendee_emails=attendee_emails,
-        auto_record=meeting.get("auto_record", True),
-    )
-
-    if not created["ok"]:
-        firestore_meetings.add_document(
-            str(meeting_id), {"meet_status": "FAILED", "meet_error": created["error"]}
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=created["error"] or "Google Meet did not return a link.",
-        )
-
-    firestore_meetings.add_document(str(meeting_id), {
-        "meeting_link": created["meeting_link"],
-        "google_event_id": created["event_id"],
-        "google_calendar_id": created["calendar_id"],
-        "meet_status": "CREATED",
-        "meet_error": created["error"],
-        # The regenerated link is a different conference, so its space - and therefore where
-        # its recording will be found - replaces whatever the failed attempt left behind.
-        "meet_space_name": created["space_name"],
-        "meet_meeting_code": created["meeting_code"],
-        "recording_status": (
-            "ARMED" if created["recording_armed"]
-            else ("NOT_REQUESTED" if not meeting.get("auto_record", True) else "ARM_FAILED")
-        ),
-        "recording_error": created["recording_error"],
-        "meet_access_type": created.get("access_type"),
-        "meet_access_error": created.get("access_error"),
-    })
+    updates = regenerate_meeting_link(meeting)
+    if updates.get("meet_status") == "FAILED":
+        raise HTTPException(status_code=502, detail=updates.get("meet_error") or "No room could be given.")
     return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
 
 
 @router.delete("/meetings/{meeting_id}", status_code=status.HTTP_204_NO_CONTENT)
 def admin_delete_meeting(meeting_id: int, _: UserOut = Depends(require_admin)):
     """
-    [Admin Only] Cancel any teacher's meeting.
-    The backing Google Calendar event is deleted too, so attendees are notified.
+    [Admin Only] Cancel any teacher's meeting. Its live-class room goes with it.
     """
     meeting = require_document(firestore_meetings, meeting_id, "Meeting")
-
-    google_event_id = meeting.get("google_event_id")
-    if google_event_id:
-        google_meet.delete_meeting(
-            teacher_email=_owner_email(meeting),
-            event_id=google_event_id,
-            calendar_id=meeting.get("google_calendar_id"),
-        )
+    acs.delete_room(meeting.get("acs_room_id"))
 
     firestore_meetings.delete_document(str(meeting_id))
     return None
@@ -1653,9 +1451,9 @@ async def admin_upload_material(
     """
     [Admin Only] Upload notes, books, or study materials, optionally on behalf of a teacher.
 
-    Uses the same storage backend as the teacher upload (Cloud Storage, Workspace Drive, or
-    local disk). If `storage_provider` on the response reads LOCAL while Drive or GCS is
-    configured, `storage_warning` names the failure - `GET /admin/integrations` diagnoses it.
+    Uses the same storage backend as the teacher upload (Azure Blob Storage, or local disk).
+    If `storage_provider` on the response reads LOCAL while Blob storage is configured,
+    `storage_warning` names the failure - `GET /admin/integrations` diagnoses it.
     """
     if teacher_id is not None:
         resolve_teacher(teacher_id)
@@ -1725,9 +1523,17 @@ def admin_delete_material(
 ):
     """
     [Admin Only] Delete any uploaded study material.
-    The underlying file in Cloud Storage or Drive is removed too unless `keep_file=true`.
+    The underlying file in cloud storage is removed too unless `keep_file=true`.
     """
     material = require_document(firestore_materials, material_id, "Study material")
+
+    # A published class recording is unpublished; its video stays with the recordings.
+    if material.get("recording_key"):
+        from app.services import recordings
+
+        recordings.material_removed(material)
+        firestore_materials.delete_document(str(material_id))
+        return None
 
     if not keep_file:
         storage_service.delete_file(
@@ -1745,35 +1551,33 @@ def get_integration_status(
     _: UserOut = Depends(require_admin)
 ):
     """
-    [Admin Only] Health and configuration of the Google integrations.
+    [Admin Only] Health and configuration of the Azure integrations.
 
-    This is the endpoint to open when uploads land on local disk or a meeting comes back
-    without a Meet link. Each section reports `ok` plus a `detail` naming the exact
-    misconfiguration - missing credentials file, unauthorized delegation, a Drive ID the
-    service account cannot see, and so on. No secrets are returned.
+    This is the endpoint to open when uploads land on local disk, a class cannot be joined,
+    or email does not arrive. Each section reports `ok` (when probed) plus a `detail` naming
+    the exact misconfiguration. No secrets are returned.
     """
     storage = storage_service.check_access() if probe else storage_service.describe()
-    drive = google_drive.check_access() if probe else google_drive.describe_configuration()
-    meet = google_meet.check_access() if probe else google_meet.describe_configuration()
-    recording = (
-        meet_recordings.check_access() if probe
-        else meet_recordings.describe_configuration()
-    )
+    live = acs.check_access() if probe else acs.describe_configuration()
+    recording_problems = acs.recording_problems()
 
     return {
         "storage": storage,
         "storage_config_conflict": settings.storage_config_conflict,
-        "drive": drive,
-        "google_meet": meet,
-        # Recording rides on its own delegation grant and its own API, so it is reported
-        # separately: Meet links can work perfectly while recording is unauthorized.
-        "meet_recording": recording,
-        "email": {
-            "enabled": settings.ENABLE_EMAIL_NOTIFICATIONS,
-            "configured": mail_is_configured(),
-            "smtp_host": settings.SMTP_HOST,
-            "smtp_user": settings.SMTP_USER or None,
+        "live_classes": {**acs.describe_configuration(), **live},
+        # Reported separately: classes can run perfectly while the recording webhook is not
+        # yet subscribed.
+        "recording": {
+            "enabled": settings.ENABLE_AUTO_RECORDING,
+            "ok": not recording_problems,
+            "problems": recording_problems,
+            "webhook_path": f"{settings.API_V1_STR}/calls/events?key=<ACS_EVENTS_KEY>",
+            "detail": (
+                "Recordings are started with each teacher's call and filed into Blob storage."
+                if not recording_problems else recording_problems[0]
+            ),
         },
+        "email": {**mailer.describe(), "ok": mailer.is_configured()},
         "probed": probe,
     }
 
@@ -1788,7 +1592,7 @@ async def test_storage_upload(
     delete it again.
 
     `GET /admin/integrations` checks reachability; this proves a real write actually works,
-    which is the difference between "Drive is visible" and "Drive accepts our uploads".
+    which is the difference between "storage is visible" and "storage accepts our uploads".
     """
     import io as _io
     from starlette.datastructures import UploadFile as _UploadFile
@@ -1830,7 +1634,7 @@ def build_monitoring_report(progress: Callable[[int, str], None] | None = None) 
     """
     Computes the full system monitoring report.
 
-    The original implementation issued one Firestore query at a time, so cost scaled as
+    The original implementation issued one database query at a time, so cost scaled as
     (4 + 4 x teachers + 3 x students) sequential network waits - over twenty seconds on a
     small dataset. This version reads each collection once, in parallel, and derives every
     per-teacher and per-student figure by grouping those results in memory. Query count is

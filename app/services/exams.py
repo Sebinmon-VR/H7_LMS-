@@ -36,7 +36,7 @@ from app.core.firebase import (
     firestore_student_enrollments, firestore_subjects, firestore_users, generate_id,
     prefetch_references, require_document, _resolve_document,
 )
-from app.core.gcp_services import StorageError, storage_service
+from app.core.storage import StorageError, storage_service
 from app.services.content import assert_class_and_subject_exist, resolve_teacher
 from app.services.timetable import school_timezone
 
@@ -79,7 +79,7 @@ def to_utc(value: datetime | str | None) -> datetime | None:
 
 
 def store_dt(value: datetime | str | None) -> str | None:
-    """Serializes a datetime for Firestore, always with an explicit UTC offset."""
+    """Serializes a datetime for the database, always with an explicit UTC offset."""
     normalized = to_utc(value)
     return normalized.isoformat() if normalized else None
 

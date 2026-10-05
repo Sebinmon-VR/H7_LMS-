@@ -14,7 +14,8 @@ This module is the single place that resolves the difference. Two rules, applied
   an ordinary subject teacher in 10-B, and nothing here grants power over a class they do not
   lead.
 * **The role is only the label.** `UserRole.CLASS_TEACHER` exists so the frontend can gate
-  navigation straight from the Firebase claim without an extra call. It is maintained *from*
+  navigation straight from the profile it already has (`/auth/me`) without an extra call.
+  It is maintained *from*
   the mappings by the admin router (see `sync_class_teacher_role`), so the two cannot drift
   into the state where a role says CLASS_TEACHER but no mapping says which class.
 

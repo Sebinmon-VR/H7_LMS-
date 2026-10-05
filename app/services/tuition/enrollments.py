@@ -157,8 +157,8 @@ def existing_active(student_id: int, subject_id: int, exclude_id=None) -> dict |
     The active enrollment already covering this (student, subject), if any.
 
     Queried on `student_id` and filtered in memory rather than with a compound query: a
-    student has a handful of subjects, so the filter is free, and a composite Firestore index
-    is one more thing that has to be created before the feature works in a fresh project.
+    student has a handful of subjects, so the filter is free, and a composite index is one
+    more thing that has to be created before the feature works in a fresh deployment.
     """
     for record in firestore_tuition_enrollments.query_documents("student_id", "==", student_id):
         if record.get("subject_id") != subject_id:

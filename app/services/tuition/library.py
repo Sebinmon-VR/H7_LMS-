@@ -31,7 +31,7 @@ from app.core.enums import LibraryApprovalStatus, LibraryVisibility, UserRole
 from app.core.firebase import (
     firestore_tuition_library, hydrate_tuition_library_item, prefetch_tuition,
 )
-from app.core.gcp_services import StorageError, storage_service
+from app.core.storage import StorageError, storage_service
 from app.services.tuition.common import is_admin, is_teacher, now_utc, store_dt, user_id_of
 from app.services.tuition.enrollments import require_enrollment, visible_to
 from app.services.tuition.settings_store import tuition_settings
@@ -301,8 +301,9 @@ async def store_upload(file: UploadFile, payload, user) -> dict:
     Saves an uploaded file and records it in the library.
 
     The upload is attempted against the configured cloud provider and falls back to local
-    disk with a warning, exactly as LMS materials do - a teacher whose Drive is misconfigured
-    still gets their book saved, and the warning says why it is not where they expected.
+    disk with a warning, exactly as LMS materials do - a teacher on a deployment whose Blob
+    storage is misconfigured still gets their book saved, and the warning says why it is not
+    where they expected.
     """
     assert_uploads_allowed(user)
     visibility = payload.visibility.value if hasattr(payload.visibility, "value") else str(payload.visibility)
@@ -327,8 +328,8 @@ def store_link(payload, user) -> dict:
     """
     Records a link rather than a file.
 
-    A textbook on a publisher's site, a YouTube playlist, a recording that lives in Drive
-    already. Uploading a copy of something that is already on the web is worse for everybody:
+    A textbook on a publisher's site, a YouTube playlist, a recording that lives on another
+    site already. Uploading a copy of something that is already on the web is worse for everybody:
     it goes stale, it costs storage, and it loses the source.
     """
     assert_uploads_allowed(user)

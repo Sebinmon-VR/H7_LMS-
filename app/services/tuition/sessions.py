@@ -42,15 +42,13 @@ from datetime import datetime, timedelta
 
 from fastapi import HTTPException
 
-from app.core.config import settings as env_settings
 from app.core.enums import (
     AttendanceStatus, CONDUCTED_SESSION_VALUES, TuitionSessionStatus,
 )
+from app.core import acs
 from app.core.firebase import (
-    firestore_subjects, firestore_tuition_sessions, firestore_users,
-    hydrate_tuition_session, prefetch_tuition,
+    firestore_tuition_sessions, hydrate_tuition_session, prefetch_tuition,
 )
-from app.core.google_meet import create_meeting as create_google_meet
 from app.services.tuition.common import (
     is_admin, now_utc, parse_date, store_dt, to_utc, user_id_of,
 )
@@ -109,9 +107,9 @@ def filter_sessions(records: list[dict], from_date=None, to_date=None,
     """
     Narrows a set of sessions in memory.
 
-    Filtering here rather than in Firestore is a deliberate trade. Compound queries on date
-    plus status plus subject would each need their own composite index, created by hand
-    before the endpoint works at all in a fresh project; a person's sessions number in the
+    Filtering here rather than in the database is a deliberate trade. Compound queries on
+    date plus status plus subject would each need their own composite index, created by hand
+    before the endpoint works at all in a fresh deployment; a person's sessions number in the
     hundreds, so the filter costs nothing and the feature works the moment it is deployed.
     """
     start = parse_date(from_date)
@@ -605,58 +603,45 @@ def create_ad_hoc(payload, actor, allow_conflicts: bool = False) -> dict:
 
 def ensure_meeting_link(session: dict, actor, force: bool = False) -> dict:
     """
-    Gives a class somewhere to happen, preferring Google Meet.
+    Gives a class somewhere to happen: its live-class room in the LMS, /call/tuition/<id>.
 
-    Meet is generated lazily - on demand rather than for every class the generator creates -
-    because a month of generated sessions would otherwise mean a month of Calendar API calls
-    for classes that may be rescheduled or cancelled before anybody opens them. The link is
-    created the first time somebody actually needs it.
+    The ACS room behind the link is made the first time somebody is let in
+    (app/services/calls.py), so a month of generated sessions costs nothing until a class is
+    actually opened. `force` drops that room so the next join gets a fresh one.
 
     A hand-entered link always wins and is never overwritten; the brief asks explicitly for
     other meeting providers to be usable, and a teacher who pastes a Zoom link has said what
-    they want. Failure to reach Google is recorded on the session and returned, never raised:
-    a class with no link is a problem to fix, not a reason to lose the class.
+    they want. When live classes are not configured the reason is recorded on the session and
+    returned, never raised: a class with no link is a problem to fix, not a reason to lose it.
     """
     if session.get("meeting_link") and not force:
         return session
 
-    teacher = firestore_users.get_document(str(session.get("teacher_id"))) or {}
-    subject = firestore_subjects.get_document(str(session.get("subject_id"))) or {}
-    student = firestore_users.get_document(str(session.get("student_id"))) or {}
-    starts = to_utc(session.get("scheduled_start_at")) or now_utc()
+    if force:
+        acs.delete_room(session.get("acs_room_id"))
 
-    title = session.get("title") or (
-        f"{subject.get('name', 'Tuition')} - {student.get('full_name', 'student')}"
-    )
+    if not acs.is_enabled():
+        error = " ".join(acs.configuration_problems()) or "Live classes are not configured."
+        logger.warning("No room for tuition session %s: %s", session.get("id"), error)
+        return _save(session, {"meet_status": "FAILED", "meet_error": error})
 
-    created = create_google_meet(
-        teacher_email=teacher.get("email") or "",
-        title=title,
-        scheduled_time=starts,
-        duration_minutes=int(session.get("duration_minutes") or 60),
-        description=f"One-to-one tuition class. Subject: {subject.get('name', '-')}.",
-        attendee_emails=[e for e in (student.get("email"), teacher.get("email")) if e],
-        auto_record=env_settings.ENABLE_MEET_AUTO_RECORDING,
-    )
-
-    updates = {
-        "meeting_link": created["meeting_link"],
-        "google_event_id": created["event_id"],
-        "google_calendar_id": created["calendar_id"],
-        "meet_status": "CREATED" if created["ok"] else "FAILED",
-        "meet_error": created["error"],
-        "meet_space_name": created["space_name"],
-        "meet_meeting_code": created["meeting_code"],
-    }
-    if not created["ok"]:
-        logger.warning("Meet link for tuition session %s failed: %s",
-                       session.get("id"), created["error"])
-    return _save(session, updates)
+    return _save(session, {
+        "meeting_link": acs.call_link(acs.KIND_TUITION, session["id"]),
+        "meet_status": "CREATED",
+        "meet_error": None,
+        "acs_room_id": None,
+        "google_event_id": None,
+        "google_calendar_id": None,
+        "meet_space_name": None,
+        "meet_meeting_code": None,
+    })
 
 
 def set_meeting_link(session: dict, actor, link: str) -> dict:
-    """Replaces the link with one supplied by hand - Zoom, Teams, a permanent Meet room."""
+    """Replaces the link with one supplied by hand - Zoom, Teams, any permanent room."""
+    acs.delete_room(session.get("acs_room_id"))
     return _save(session, {
+        "acs_room_id": None,
         "meeting_link": link,
         "meet_status": "MANUAL",
         "meet_error": None,

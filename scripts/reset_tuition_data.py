@@ -38,7 +38,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.concurrency import run_parallel  # noqa: E402
-from app.core.config import settings  # noqa: E402
 from app.core.enums import Program  # noqa: E402
 from app.core.firebase import (  # noqa: E402
     document_cache,
@@ -55,7 +54,8 @@ from app.core.firebase import (  # noqa: E402
     firestore_tuition_reminder_log,
     firestore_tuition_sessions,
     firestore_tuition_slots,
-    initialize_firebase,
+    database_backend,
+    database_ready,
 )
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -177,11 +177,11 @@ def main() -> int:
                         help="Only delete data belonging to this student id.")
     args = parser.parse_args()
 
-    if initialize_firebase() is None:
-        print("ERROR: Firestore is unavailable. Check FIREBASE_CREDENTIALS_PATH.")
+    if not database_ready():
+        print("ERROR: the database is unavailable. Check the DB_* settings.")
         return 1
 
-    print(f"\nProject: {settings.GCP_PROJECT_ID}")
+    print(f"\nDatabase: {database_backend()}")
     if args.student is not None:
         print(f"Restricted to student {args.student}")
     print("Surveying tuition collections...\n")

@@ -93,7 +93,7 @@ class FeeStructure:
     Resolution is most-specific-first (`app.services.finance.resolve_structure`): a structure
     naming both the student's class and their category beats one naming only the class, which
     beats the default. Ties are broken by `priority`, then by the newer document - an
-    arbitrary rule, but a stated one, which is better than whichever Firestore returned first.
+    arbitrary rule, but a stated one, which is better than whichever the database returned first.
 
     `items` holds the lines: [{"fee_head_id", "amount", "frequency", "label"}]. Stored inline
     rather than as their own collection because a structure is always read whole - nothing

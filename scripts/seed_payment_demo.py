@@ -48,7 +48,7 @@ from app.core.enums import (  # noqa: E402
 from app.core.firebase import (  # noqa: E402
     document_cache, firestore_subjects, firestore_tuition_enrollments,
     firestore_tuition_package_assignments, firestore_tuition_packages,
-    firestore_tuition_sessions, firestore_users, initialize_firebase,
+    firestore_tuition_sessions, firestore_users,
 )
 from app.schemas.admission import AcademicYearCreate, AdmissionCategoryCreate  # noqa: E402
 from app.schemas.tuition import (  # noqa: E402
@@ -521,7 +521,6 @@ def main() -> None:
     except (AttributeError, ValueError):
         pass
 
-    initialize_firebase()
     Seeder(args.student, args.dry_run).run()
 
 

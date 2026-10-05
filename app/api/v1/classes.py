@@ -8,9 +8,10 @@ Three concerns that all answer "what am I doing, and when?":
   * `/calendar` - everything on one person's calendar, for the tile and calendar views.
 
 The join endpoint is the one to read. It is the server-side half of the disabled join
-button: the button is a courtesy, this is the rule. A student who bookmarks a Meet link and
+button: the button is a courtesy, this is the rule. A student who bookmarks a class link and
 opens it twenty minutes early gets nothing from here, which is the only place that can
-actually be enforced.
+actually be enforced. The in-LMS call page (/call/...) asks the same rules before it lets
+anybody into the room (app/api/v1/calls.py).
 """
 
 from datetime import date, timedelta
@@ -41,36 +42,8 @@ extra_router = APIRouter(prefix="/extra-classes", tags=["Extra Classes"])
 calendar_router = APIRouter(prefix="/calendar", tags=["Calendar"])
 
 
-def _assert_may_see(meeting: dict, user: UserOut) -> None:
-    """
-    Whether this user is entitled to the class at all, before any timing question.
-
-    Separate from `assert_may_join`, which answers "yet?". Conflating them gives a student
-    from another class the message "this class has not started yet", which quietly confirms
-    the class exists.
-    """
-    if user.role == UserRole.ADMIN:
-        return
-
-    class_id = meeting.get("class_id")
-    if user.role in (UserRole.TEACHER, UserRole.CLASS_TEACHER):
-        if int(meeting.get("teacher_id", -1)) == int(user.id):
-            return
-        if class_id is not None and permissions.is_class_teacher_of(user, class_id):
-            return
-        raise HTTPException(status_code=403, detail="This is not your class.")
-
-    if user.role == UserRole.STUDENT:
-        from app.core.firebase import firestore_student_enrollments
-        mine = {
-            int(e["class_id"]) for e in
-            firestore_student_enrollments.query_documents("student_id", "==", int(user.id))
-            if e.get("class_id") is not None
-        }
-        if class_id is not None and int(class_id) in mine:
-            return
-
-    raise HTTPException(status_code=404, detail="Meeting not found")
+# Whether this user is entitled to the class at all; shared with the call page's gate.
+_assert_may_see = live_classes.assert_may_see
 
 
 @router.get("/{meeting_id}/timing", response_model=ClassTimingOut)
@@ -204,7 +177,7 @@ def my_live_classes(user: UserOut = Depends(require_any_authenticated)):
 
 
 # ---------------------------------------------------------------------------------------
-# Class rooms: the one standing Meet room per class
+# Class rooms: the one standing live-class room per class
 #
 # The classroom model. A session (above) is one teacher's period; the room is where the
 # whole class sits all day and where every period happens. Students are let in while any
@@ -254,8 +227,9 @@ def leave_class_room(class_id: int, user: UserOut = Depends(require_any_authenti
     """
     Record that you have left the room.
 
-    The LMS cannot see a Meet tab close, so leaving is something you tell it; the class's
-    log then carries your join and leave times. Nothing is done to the Meet call itself.
+    The in-LMS call page reports its own hang-up (`POST /calls/class/{id}/left`); this is the
+    "Leave the class" button for a room that is a pasted external link, whose tab the LMS
+    cannot see close. Either way the class's log then carries your join and leave times.
     """
     class_room = class_rooms.require_class(class_id)
     class_rooms.assert_may_see(class_room, user)
@@ -339,7 +313,7 @@ def decide_extra_class(
     [Admin Only] Approve or reject a request.
 
     Records the decision only - the class is created by `/schedule`. The two are separate
-    because creating it can fail on a clash or a Meet error long after you pressed approve,
+    because creating it can fail on a clash or a room error long after you pressed approve,
     and a decision that rolls itself back because of an API error is worse than one that sits
     visibly in APPROVED awaiting a retry.
 
@@ -353,8 +327,8 @@ def decide_extra_class(
 @extra_router.post("/{request_id}/schedule", response_model=ExtraClassOut)
 def schedule_extra_class(request_id: int, admin: UserOut = Depends(require_admin)):
     """
-    [Admin Only] Create the approved class - a school meeting with a real Meet link and the
-    students invited, or a tuition session.
+    [Admin Only] Create the approved class - a school meeting with its live-class room in the
+    LMS and its recording armed, or a tuition session.
 
     Idempotent: a request that already produced a class returns it rather than making a
     second one.

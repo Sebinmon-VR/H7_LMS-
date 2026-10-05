@@ -1,21 +1,20 @@
-# LMS Backend API (Firebase + Google Workspace)
+# LMS Backend API (Azure)
 
 ## Overview
 
-This repository contains a FastAPI-based Learning Management System (LMS) backend built on Firebase Cloud Firestore as its persistence layer and Google Workspace for identity, conferencing, and document storage. The codebase is API-first and supports:
+This repository contains a FastAPI-based Learning Management System (LMS) backend that runs on Azure: **Azure SQL** holds the data, **Azure Blob Storage** holds the files, and **Azure Communication Services (ACS)** carries the live classes and the email. The codebase is API-first and supports:
 
-- **Firebase Authentication** for login, password management, and session revocation (the backend never stores passwords)
-- Role-based access control (RBAC) for `ADMIN`, `TEACHER`, and `STUDENT`
+- **Its own sign-in**: passwords are hashed in the database and sessions are tokens the backend signs itself, with refresh, password change and emailed password reset. No Google or Microsoft account is needed by anyone
+- Role-based access control (RBAC) for `ADMIN`, `CLASS_TEACHER`, `TEACHER`, `STUDENT` and `PARENT`
 - Admin workflows for user management, class/subject CRUD, teacher assignments, and enrollments
 - Teacher workflows for attendance, topic logging, meeting scheduling, material uploads, and grade entry
 - Student workflows for viewing classes, attendance, topics, meetings, materials, and grades
-- **Google Meet links generated automatically** as real Google Calendar events, with enrolled students invited
-- **Online classes record themselves**, and the finished video is filed into the school's Shared Drive and shared with the class
-- **Pluggable file storage**: Google Cloud Storage, a Workspace Shared Drive, or local disk
+- **Live classes joined inside the LMS** (`/call/<kind>/<id>` in the frontend) on ACS rooms, with the timetable deciding who may enter and when
+- **Online classes record themselves** through ACS Call Recording, and the finished video is filed into Blob storage and attached to the session
+- **File storage** in a private Blob container, served through short-lived links, or local disk for development
 - **Full update and delete coverage** across every resource, with referential-integrity guards
-- Firestore seeding for initial demo data
 
-The implementation avoids SQLAlchemy and relational databases entirely, relying on Firestore document storage with helper abstractions around the Firebase Admin SDK.
+Every service reads and writes plain JSON documents through one small interface, so there is no ORM: see [Database backends](#database-backends).
 
 ---
 
@@ -24,15 +23,13 @@ The implementation avoids SQLAlchemy and relational databases entirely, relying 
 
 The application stores documents, not rows: every service reads and writes plain dicts
 through one small interface (`get`, `get many`, `query by a field`, `list`, `add`, `create`,
-`delete`), declared once in `app/core/firebase.py`. Two backends implement it:
+`delete`), declared once in `app/core/firebase.py` (the module keeps its Firebase-era name,
+as do its `firestore_*` variables). Two backends implement it:
 
 | `DATABASE_BACKEND` | Where the data lives | Notes |
 | --- | --- | --- |
-| `firestore` | Firebase Cloud Firestore | The original. Subject to the free tier's 50,000 reads a day, after which every request answers 503 until midnight Pacific. |
-| `azuresql` | Azure SQL, one JSON-document table per collection | No read quota. Lives entirely inside the `DB_SCHEMA` schema (`h7lms`), so it can share a database with other applications without touching their tables. Fields the code queries by are indexed computed columns. |
-
-Firebase Auth signs people in on either backend; only the data moves. The fifty-odd files
-that use the collections do not change, and neither does the API.
+| `azuresql` | Azure SQL, one JSON-document table per collection | **The live store** (production switched on 2026-09-24). No read quota. Lives entirely inside the `DB_SCHEMA` schema (`h7lms`), so it can share a database with other applications without touching their tables. Fields the code queries by are indexed computed columns. |
+| `firestore` | Firebase Cloud Firestore | The pre-migration original, now a **frozen backup**. Nothing writes to it any more; it is kept only so the data from before the move can be read. |
 
 ```bash
 # .env
@@ -44,16 +41,23 @@ DB_PASSWORD=...
 DB_SCHEMA=h7lms
 ```
 
-Tables are created on first use and at startup. To move existing data across once:
+Tables are created on first use and at startup. The host needs Microsoft's
+"ODBC Driver 18 for SQL Server"; `startup.sh` installs it on App Service when the image lacks
+it, and `app/core/sqldb.py` falls back to whichever SQL Server driver exists.
+
+`scripts/migrate_firestore_to_sql.py` copied the Firestore data across before the switch:
 
 ```bash
-python -m scripts.migrate_firestore_to_sql --dry-run   # count what would be copied
-python -m scripts.migrate_firestore_to_sql             # copy (re-runnable; overwrites by id)
-python -m scripts.migrate_firestore_to_sql --verify    # compare counts afterwards
+python -m scripts.migrate_firestore_to_sql --verify    # compare counts only (safe)
+python -m scripts.migrate_firestore_to_sql --dry-run   # count what would be copied (safe)
 ```
 
+> **Do not run it in copy mode again.** It overwrites SQL documents by id with the Firestore
+> copy, and Firestore is frozen at the day of the move - every change made since would be
+> rolled back. It also needs `pip install firebase-admin` and the old service-account key,
+> neither of which the Azure deployment has.
+
 `GET /health/database` says which backend a deployment is on and whether it answers.
-Setting `DATABASE_BACKEND=firestore` switches back; nothing Firestore-side is removed.
 
 ## Online admission requests
 
@@ -132,10 +136,65 @@ removes them again.
 
 ## What's New
 
+### Moved to Azure (2026-09-30)
+
+The school's Google Workspace was retired, and everything that depended on it moved to Azure.
+The HTTP contract is almost unchanged: field names such as `meeting_link`, `meet_status`,
+`google_event_id` and `auto_create_meet` kept their names so no client had to change.
+
+| Was | Now | Where |
+| --- | --- | --- |
+| Firebase Auth | The backend's own sign-in: PBKDF2 password hashes in `user_credentials`, session tokens signed with `SECRET_KEY` | `app/core/identity.py`, `app/api/v1/auth.py` |
+| Firestore | Azure SQL (moved 2026-09-24; Firestore is a frozen backup) | `app/core/sqldb.py` |
+| Google Meet + Calendar | Live classes inside the LMS on ACS rooms, at `/call/<kind>/<id>` | `app/core/acs.py`, `app/services/calls.py`, `app/api/v1/calls.py` |
+| Meet recording into Drive | ACS Call Recording, filed into Blob storage by an Event Grid webhook | `app/services/recordings.py` |
+| Cloud Storage / Shared Drive | A private Azure Blob container, served as `/files/<blob>` | `app/core/azure_blob.py`, `app/core/storage.py` |
+| Gmail SMTP | ACS Email (or any SMTP relay) | `app/core/mailer.py` |
+
+**Sign-in.** `POST /api/v1/auth/login` checks the password and returns a session token
+(`expires_in` seconds, `ACCESS_TOKEN_EXPIRE_MINUTES`). Clients renew it with
+`POST /api/v1/auth/refresh` before it runs out, for up to 30 days after the password was last
+typed. `POST /auth/password/change`, `POST /auth/password/reset-request` (emails a link to
+`<LMS_APP_URL>/reset-password?token=...`) and `POST /auth/password/reset` complete the set.
+Nobody had to reset their password: `scripts/import_firebase_passwords.py` copied Firebase's own
+scrypt hashes across, the backend verifies them with Firebase's algorithm, and each is replaced
+by a native hash the first time its owner signs in. While `FIREBASE_WEB_API_KEY` is set, an
+account the import missed is checked once against Firebase and moved over on sign-in. A
+password change, a reset, a deactivation or regenerated credentials revoke every session the
+account holds.
+
+**Live classes.** A class's standing room, a scheduled session and a tuition class each get an
+ACS room. The LMS is the doorman: nobody is added to a room ahead of time; the call page asks
+`POST /api/v1/calls/{kind}/{id}/session`, the same timetable rules as the join buttons decide,
+and only then is the person put on the room's list with their role and handed a short-lived
+calling token. Stored links point at the in-LMS call page (`/call/class/<id>`,
+`/call/meeting/<id>`, `/call/tuition/<id>`); `scripts/migrate_google_links.py` re-pointed the old
+Meet links.
+
+**Recording.** A session set to record starts recording when its teacher's call connects and
+stops when they leave. ACS announces the finished file through Event Grid to
+`/api/v1/calls/events?key=<ACS_EVENTS_KEY>`, which copies it into Blob storage and puts it on
+the session as `recording_url`.
+
+**Files.** Uploads go to a private Blob container. What the database stores is an LMS path,
+`/files/<blob>`, which the API answers with a redirect to a read link valid for
+`AZURE_BLOB_LINK_MINUTES`, so a link copied out of the app stops working within the hour.
+Files that were on Google Drive or Cloud Storage went with the Workspace; they were reported
+(and labelled with `--mark-lost`) by `scripts/migrate_google_links.py`.
+
+**Email.** ACS Email through the same Communication resource, sending as `ACS_EMAIL_SENDER`.
+SMTP remains available for a school with its own relay.
+
+**Removed endpoints:** `POST /admin/classes/{id}/room/guests` and `POST /admin/classes/{id}/room/open`
+(an ACS room has no guest list or access setting to manage), `POST /admin/meetings/repair-teacher-access`,
+and `GET /health/firestore` (use `GET /health/database`).
+
+See [Azure setup](#azure-setup) for the resources and settings a deployment needs.
+
 ### Online Tuition Module (new)
 
 A second product alongside the school LMS, sharing this deployment's login, user table, and
-infrastructure — Firestore, Firebase Auth, Google Meet, storage, mail — but with its own
+infrastructure — the database, sign-in, live-class rooms, storage, mail — but with its own
 collections, services, and routers.
 
 It is a separate product rather than a filtered view of the LMS because the two disagree
@@ -254,20 +313,19 @@ products create people identically.
 
 #### Meeting links
 
-Every class needs somewhere to happen, and a link can always be supplied by hand — the module
-does not assume Google Meet:
+Every class needs somewhere to happen. By default that is the class's own live-class room in
+the LMS, and a link can always be supplied by hand instead:
 
 | | |
 | --- | --- |
-| On a slot | `meeting_link` on `POST`/`PUT /admin/tuition/slots` — a standing room for every occurrence |
+| On a slot | `meeting_link` on `POST`/`PUT /admin/tuition/slots` — a standing Zoom/Teams room for every occurrence |
 | On one class | `PUT /admin/tuition/sessions/{id}/meeting-link`, or `POST /tuition/teachers/sessions/{id}/meeting-link` with a body |
-| Generated | the same teacher endpoint with **no** body creates a Google Meet on the spot |
+| Generated | the same teacher endpoint with **no** body gives the class its LMS room, `/call/tuition/<id>` |
 
-A hand-entered link is marked `meet_status: MANUAL` and is **never overwritten** by Meet
-generation afterwards, so a Zoom or Teams link a teacher pastes in stays put. Meet links are
-created lazily — on demand rather than for every generated class — because a month of
-scheduled classes would otherwise be a month of Calendar API calls for classes that may be
-rescheduled or cancelled before anyone opens them.
+A hand-entered link is marked `meet_status: MANUAL` and is **never overwritten** by room
+generation afterwards, so a Zoom or Teams link a teacher pastes in stays put. The ACS room
+behind a generated link is made only when somebody first joins, so a month of generated
+classes costs nothing for classes that are rescheduled or cancelled before anyone opens them.
 
 #### Timezones — Indian by default, the student's own automatically
 
@@ -306,7 +364,7 @@ clients that format times themselves.
 #### Admin-editable settings
 
 Reminder lead times, the timezone, class length, and the timing thresholds are stored in
-Firestore and edited from `GET`/`PUT /api/v1/admin/tuition/settings/{LMS|TUITION}` — **for
+the database and edited from `GET`/`PUT /api/v1/admin/tuition/settings/{LMS|TUITION}` — **for
 both products**. The environment variables are deployment defaults that apply until an
 administrator changes something; resolution is stored value → environment → built-in, so the
 module ships working with no configuration and an existing `.env` keeps deciding behaviour
@@ -446,7 +504,7 @@ item, so it follows a student's current enrollments instead of going stale silen
 | `POST` | `/sessions/{id}/start` | Join. **If you are late, this is what buys the student their extra time** |
 | `POST` | `/sessions/{id}/end` | Close it, record the topic. Early finishes are recorded |
 | `POST` | `/sessions/{id}/attendance` | Mark the student. Overrides what the timestamps imply |
-| `POST` | `/sessions/{id}/meeting-link` | Generate a Meet, or supply another provider's link |
+| `POST` | `/sessions/{id}/meeting-link` | Give the class its LMS room, or supply another provider's link |
 | `POST` | `/sessions`, `/sessions/{id}/reschedule` `/cancel` | Extra class; move one; call one off |
 | `POST` `GET` | `/assessments`, `/assessments/{id}` | Homework, assignments, exams — the full exam engine, one student |
 | `POST` | `/report-cards`, `/report-cards/{id}/publish` | Build a card, then release it |
@@ -486,8 +544,8 @@ body. Any caller who could reach the API was able to create themselves an `ADMIN
 The endpoint is gone.
 
 Accounts are now created only by an administrator through `POST /api/v1/admin/users`, or by
-the provisioning scripts. Signing in with Google grants **no role by itself** — a Google
-account with no LMS profile is rejected with `403`, never given a default role.
+the provisioning scripts. There is no third-party sign-in: only an account with an LMS
+profile and a password can sign in, and its role comes from that profile.
 
 The system therefore needs one account to exist before anyone can sign in. That bootstrap
 administrator is created at startup from `BOOTSTRAP_ADMIN_EMAIL` and
@@ -504,8 +562,9 @@ starting over from zero.
 
 ### Performance: 4.8x faster overall, 1800x on the monitoring report
 
-The API was slow because **every Firestore round trip costs ~850 ms** from outside the
-database's region. Response time was therefore driven almost entirely by *how many* calls a
+*Measured on Firestore, before the move to Azure SQL; the batching and caching below serve
+both backends unchanged.* The API was slow because **every Firestore round trip cost ~850 ms**
+from outside the database's region. Response time was therefore driven almost entirely by *how many* calls a
 request made, not by how much data it moved. Measured on the real database:
 
 | Access pattern | Cost per document |
@@ -546,7 +605,7 @@ size.** Results are cached for `MONITORING_REPORT_TTL_SECONDS` (default 5 minute
 **4. Creating a record no longer scans a collection.** `get_next_numeric_id()` streamed
 every document in the collection on *every single create* to find the maximum ID — a full
 round trip that grew with collection size. IDs now come from a monotonic clock with a
-per-process counter, requiring no Firestore access at all, in the same
+per-process counter, requiring no database access at all, in the same
 millisecond-timestamp format already stored.
 
 Delete dependency checks were also parallelised (7 sequential checks → one wave), taking
@@ -556,7 +615,7 @@ deletes from ~6 s to ~1.6 s.
 request over 1500 ms is logged as a warning. `GET /health/cache` reports cache hit rate.
 
 **The single biggest remaining win is infrastructure, not code:** the ~850 ms per-call
-latency is the distance between your server and the Firestore region. Deploying the backend
+latency is the distance between your server and the database's region. Deploying the backend
 in the same region as the database would cut the remaining floor by roughly an order of
 magnitude, and no amount of application-level work substitutes for it.
 
@@ -580,78 +639,102 @@ process restart, and with multiple server workers a poll may land on a worker th
 saw the job. Both are acceptable here because every job is a recomputation of derived data,
 never a source of truth. A shared store or real task queue is the fix if that changes.
 
-### Authentication moved to Firebase Auth (breaking change for clients)
+### Sign-in owned by the backend
 
-Login previously verified a bcrypt hash stored in the Firestore `users` collection and issued a backend-signed HS256 JWT. That is gone.
+Firebase Auth held every password and issued every session until the Workspace was retired.
+The backend now does both itself (`app/core/identity.py`):
 
-Clients now sign in with the **Firebase SDK** (email/password or Google sign-in) and send the resulting **Firebase ID token** as `Authorization: Bearer <idToken>`. The backend verifies it with the Admin SDK.
+- Passwords are hashed with PBKDF2-SHA256 in the `user_credentials` collection, **apart from
+  the `users` profiles**, so no endpoint that returns a profile can ever return a hash.
+- `POST /api/v1/auth/login` returns a session token signed with `SECRET_KEY`. It carries the
+  profile's `session_version`; bumping it (password change or reset, deactivation, regenerated
+  credentials) makes every earlier token stop working on its next request.
+- `POST /api/v1/auth/refresh` renews a token for up to 30 days after the password was last
+  typed; after that the person signs in again.
+- `LOGIN_MAX_FAILURES` failures within `LOGIN_LOCKOUT_MINUTES` lock an address out (`429`).
+- Roles are read from the profile on every request; the `role` claim in the token is only a
+  convenience for the frontend.
+- Imported Firebase hashes keep working and are upgraded on first sign-in; numeric user IDs
+  never changed, so every `teacher_id` / `student_id` reference is as it was.
 
-- Passwords, resets, email verification, and token revocation are owned by Firebase.
-- `hashed_password` is no longer written to Firestore.
-- User profiles link to Firebase accounts via a new `firebase_uid` field. **Numeric user IDs are unchanged**, so all existing references (`teacher_id`, `student_id`) and client code keep working.
-- The LMS role is mirrored into Firebase **custom claims** (`role`, `lms_user_id`) so a frontend can gate UI directly from the token. The Firestore profile remains authoritative for the backend.
-- `ALLOW_LEGACY_JWT_LOGIN=True` keeps previously issued backend JWTs valid during the transition. Set it to `False` after cutover.
+### Live classes inside the LMS
 
-### Google Meet integration
+Every live class is an Azure Communication Services room joined on the LMS's own call page, so
+nobody needs a Microsoft or Google account and teachers and students keep signing in with
+whatever address the school gave them.
 
-`POST /api/v1/teachers/meetings` now creates a real Google Calendar event with an attached Meet link, owned by the teacher, with enrolled students added as attendees so they receive calendar invitations. Editing or deleting the meeting propagates to Calendar.
+`POST /api/v1/teachers/meetings` (and the admin equivalent) saves the session and, unless a
+`meeting_link` is supplied or `auto_create_meet` is false, gives it the link
+`/call/meeting/<id>` - or, in class-room mode, its class's standing room `/call/class/<id>`.
+The ACS room behind a link is made the first time somebody is let in, and extended while it is
+still wanted (`ACS_ROOM_VALIDITY_DAYS`, `ACS_ROOM_RENEW_DAYS`).
 
-If Meet generation is unavailable — delegation not yet propagated, teacher outside the Workspace domain, quota exhausted — the endpoint still returns `201` with a null `meeting_link` rather than failing. **A misconfiguration degrades the feature; it never takes the endpoint down.** The response now carries `meet_status` (`CREATED` / `FAILED` / `MANUAL` / `SKIPPED`) and `meet_error`, so a missing link is explained instead of silent, and `POST /admin/meetings/{id}/regenerate-link` retries once the configuration is fixed.
+If live classes are not configured the endpoint still returns `201`; **a misconfiguration
+degrades the feature, it never takes the endpoint down.** `meet_status` (`CREATED` /
+`CLASS_ROOM` / `MANUAL` / `SKIPPED` / `FAILED`) and `meet_error` explain a missing link, and
+`POST /admin/meetings/{id}/regenerate-link` retries once the configuration is fixed - it also
+gives a working room to a session still carrying a Meet link from before the move.
 
-Every event is stamped with `GOOGLE_CALENDAR_TIMEZONE`. Calendar rejects a naive `dateTime` that arrives without a zone, which was the most common reason link generation produced nothing at all.
+The call page drives four endpoints (`kind` is `class`, `meeting` or `tuition`):
 
-**Scopes are probed, not assumed.** Google fails the *entire* token exchange with `unauthorized_client` if any single requested scope is missing from the domain-wide delegation grant, so requesting extra scopes "just in case" breaks an otherwise working setup. The client tries `calendar.events` first (all that Meet requires), then wider sets, and remembers whichever authenticates. Pin the set with `GOOGLE_CALENDAR_SCOPES` if you prefer. `GET /admin/integrations` reports the granted scopes and the numeric Client ID the delegation form asks for.
+```
+POST /api/v1/calls/{kind}/{id}/session    -> room_id, acs_user_id, token, expires_on, role, is_host
+POST /api/v1/calls/{kind}/{id}/connected  -> logs the join; starts the recording for its teacher
+POST /api/v1/calls/{kind}/{id}/left       -> logs the leave; stops that teacher's recording
+POST /api/v1/calls/{kind}/{id}/recording  -> [teacher] start or stop recording by hand
+```
+
+`/session` answers `409` with the reason when the class is not open to the caller now (the
+same rules as the join buttons, so a bookmarked link is no way round them) and `503` when
+live classes are not configured. The connect and hang-up reports are what the admin's live
+board, room presence and per-day room attendance are built from.
 
 ### Automatic class recording
 
-Online classes record themselves, and the video ends up in the school's Drive rather than in a teacher's personal one.
-
-Recording is a property of the **meeting space**, not of the calendar event, so the Calendar API cannot ask for it. When a session is scheduled the backend makes a second call, against the Google Meet REST API v2:
-
-```
-Calendar events.insert  ->  hangoutLink  ->  meeting code
-Meet spaces.get         ->  the space's resource name
-Meet spaces.patch       ->  config.artifactConfig.recordingConfig.autoRecordingGeneration = ON
-```
-
-Meet then starts recording on its own when the first participant joins. Nobody has to press anything, and a teacher who forgets does not lose the lesson.
-
-A background sweep every `RECORDING_SCAN_INTERVAL_SECONDS` picks the video up afterwards. Meet writes it into the *organiser's* Drive, where it is invisible to students, counts against that teacher's quota, and leaves with them when they go — so `RECORDING_HARVEST_DELAY_MINUTES` after a session's scheduled end the sweep asks Meet for its recordings, moves each one into the Shared Drive under `Class Recordings/class_<id>/`, and grants every enrolled student read access. `recording_url` on the meeting then points at the stored copy.
+A session with `auto_record` on is recorded by ACS Call Recording: recording starts when its
+teacher's call connects and stops when they leave (or after `RECORDING_MAX_MINUTES`, for a
+browser that died). When ACS has written the file it sends
+`Microsoft.Communication.RecordingFileStatusUpdated` through Event Grid to
+`/api/v1/calls/events?key=<ACS_EVENTS_KEY>`. The webhook answers at once and copies the video
+into Blob storage in the background, under `recordings/class_<id>/`; `recording_url` on the
+session then points at it as a `/files/` link. A background sweep every
+`RECORDING_SCAN_INTERVAL_SECONDS` retries copies that did not finish and closes out sessions
+nobody recorded.
 
 `recording_status` on every meeting tracks the whole lifecycle:
 
 | Status | Meaning |
 | --- | --- |
 | `NOT_REQUESTED` | `auto_record: false` on the session, or the link was entered by hand |
-| `ARMED` | Meet will record it automatically |
-| `ARM_FAILED` | Arming did not work — still swept, in case a teacher records manually |
-| `WAITING` | The class has ended and Meet has not published a file yet |
-| `STORED` | The video is in the school Drive; `recording_url` points at it |
-| `UNAVAILABLE` | Nothing was ever published; gave up after `RECORDING_MAX_AGE_HOURS` |
+| `ARMED` | It will be recorded when its teacher joins through the LMS |
+| `RECORDING` | It is being recorded now |
+| `WAITING` | The recording has stopped and ACS has not delivered the file yet |
+| `STORED` | The video is in Blob storage; `recording_url` points at it |
+| `UNAVAILABLE` | Nothing was ever recorded; gave up after `RECORDING_MAX_AGE_HOURS` |
 | `FAILED` | A recording exists but could not be filed; `recording_error` says why |
 
 Three properties matter, because the failure mode of an automated file mover is not silence — it is duplicate videos and lost originals:
 
-- **Exactly once.** Before transferring, the sweep *claims* a Firestore document keyed by (meeting, Meet recording name) with an atomic `create`. A second server worker, an overlapping sweep, and `POST /admin/recordings/run` all lose the race and skip.
-- **No infinite polling.** A class nobody joined never produces a recording. Sessions are polled until `RECORDING_MAX_AGE_HOURS` after they end and then marked `UNAVAILABLE`, so the Meet API cost of the sweep stays proportional to today's timetable rather than to the school's whole history.
-- **Never lose the link.** Every failure degrades rather than aborts: a video that cannot be moved is copied, one that cannot be copied is linked where it lies, and the reason lands in `recording_error`.
+- **Exactly once.** Each file is claimed per (recording, chunk) with an atomic `create` before it is copied, so a delivery Event Grid retries, the sweep, and `POST /admin/recordings/run` never file it twice.
+- **Nothing lost to a slow request.** Event Grid gives up on a delivery that takes more than thirty seconds, so the webhook only records what arrived; the copy runs afterwards and the sweep retries it for as long as ACS keeps the file.
+- **No infinite polling.** A session nobody recorded is marked `UNAVAILABLE` once `RECORDING_MAX_AGE_HOURS` have passed since it ended.
 
-`RECORDING_TRANSFER_MODE` chooses between `MOVE` (default — organisation-owned, no duplicate storage), `COPY` (the teacher keeps the original), and `LINK` (record where it already is).
+**Requirements:** `ACS_CONNECTION_STRING`, Blob storage, `ACS_EVENTS_KEY`, and the Event Grid
+subscription described in [Azure setup](#azure-setup). `GET /admin/recordings/status` lists
+whichever piece is missing.
 
-**Requirements beyond the Calendar setup:** the Meet API enabled on the project, the `meetings.space.settings` and `meetings.space.readonly` scopes added to the delegation grant, and a Workspace edition that can record at all — Business Standard/Plus, Enterprise, Education Plus, or the Teaching & Learning Upgrade. Business Starter and personal Gmail accounts cannot record, and no API configuration changes that. `GET /admin/integrations` reports the `meet_recording` section separately from `google_meet`, because Meet links can work perfectly while recording is unauthorized.
+### File storage: Azure Blob
 
-### Google Drive storage option
+`STORAGE_PROVIDER` is `AZURE_BLOB` (default) or `LOCAL`. Blob files are private: the stored
+address is an LMS path, `/files/<blob>`, and `GET /files/<blob>` redirects to a read link signed
+for `AZURE_BLOB_LINK_MINUTES` (`?download=true` asks the browser to save it). The container is
+created on first use if it does not exist. A deployment still carrying `STORAGE_PROVIDER=GCS`
+or `DRIVE` from before the move is treated as `AZURE_BLOB`.
 
-`StorageService` changed from a local/cloud boolean into a three-way `STORAGE_PROVIDER` switch (`GCS` | `DRIVE` | `LOCAL`). Two Drive layouts are supported:
-
-- **Shared Drive** (`GOOGLE_DRIVE_SHARED_DRIVE_ID`) — recommended. Files are owned by the organization, so the service account's zero personal Drive quota is irrelevant and no impersonation is needed.
-- **Ordinary folder** (`GOOGLE_DRIVE_FOLDER_ID`) — requires `GOOGLE_DRIVE_IMPERSONATION=True`, because a service account cannot own files outside a Shared Drive.
-
-Either value may be pasted as a full `drive.google.com` URL; the ID is unwrapped automatically.
-
-Each material records which backend stored it (`storage_provider`), so GCS-era and Drive-era files coexist and delete correctly. When the configured provider cannot be reached the file still saves to local disk, but the response says so via `storage_provider: "LOCAL"` plus a `storage_warning` — set `STORAGE_STRICT=True` to return `502` instead of falling back.
-
-**Recommendation:** keep `GCS` as the default. It is cheaper and faster for plain file serving. Use `DRIVE` when teachers need in-place preview and collaborative editing — Drive's value here is collaboration, not storage.
+Each material records which backend stored it (`storage_provider`); records from the Google
+era keep `GCS` / `DRIVE` so history reads true. When Blob storage cannot be reached the file
+still saves to local disk, but the response says so via `storage_provider: "LOCAL"` plus a
+`storage_warning` — set `STORAGE_STRICT=True` to return `502` instead of falling back.
 
 ### Weekly timetable
 
@@ -665,11 +748,11 @@ The `/timetable/day` and `/timetable/upcoming` endpoints resolve those rules aga
 
 ### Class reminders
 
-A background sweep every `REMINDER_SCAN_INTERVAL_SECONDS` finds periods entering a reminder window and emails the enrolled students, plus the teacher when `REMIND_TEACHERS` is on. `CLASS_REMINDER_MINUTES_BEFORE` accepts several offsets (`"60,15"`) for more than one nudge. When a live meeting is scheduled for the same class, subject, and slot, its Meet link is included in the email.
+A background sweep every `REMINDER_SCAN_INTERVAL_SECONDS` finds periods entering a reminder window and emails the enrolled students, plus the teacher when `REMIND_TEACHERS` is on. `CLASS_REMINDER_MINUTES_BEFORE` accepts several offsets (`"60,15"`) for more than one nudge. When a live meeting is scheduled for the same class, subject, and slot, its class link is included in the email.
 
 Two properties matter more than anything else, because the failure mode of a reminder system is not silence — it is spam:
 
-- **Exactly once.** Before sending, the sweep *claims* a Firestore document keyed by (entry, date, offset, recipient) using an atomic `create`. A second server worker, a restart mid-sweep, or a manually triggered run all lose the race and skip. The claim is written *before* the email, so the worst case is a dropped reminder rather than a duplicate — the right way round for something that lands in someone's inbox.
+- **Exactly once.** Before sending, the sweep *claims* a database document keyed by (entry, date, offset, recipient) using an atomic `create`. A second server worker, a restart mid-sweep, or a manually triggered run all lose the race and skip. The claim is written *before* the email, so the worst case is a dropped reminder rather than a duplicate — the right way round for something that lands in someone's inbox.
 - **No catch-up floods.** A reminder that came due more than `REMINDER_MAX_LATENESS_MINUTES` ago is dropped. A server that was down all morning comes back quiet instead of emailing everyone about classes that already finished.
 
 Reminders are **opt-out** per user (`reminder_opt_in`): enrolling a student means intending to tell them when class starts.
@@ -682,17 +765,23 @@ Reminders are **opt-out** per user (`reminder_opt_in`): enrolling a student mean
 
 ### Permanent user deletion
 
-`DELETE /admin/users/{id}` still soft-deletes by default. `?permanent=true` erases the Firestore profile and the Firebase Auth account, refusing with `409` while anything still references the user and listing what; `&force=true` cascades. Two guards apply to both modes: an admin cannot permanently delete the account they are signed in with, and the last active admin cannot be removed at all — locking everyone out of the system is never the intended outcome of a delete.
+`DELETE /admin/users/{id}` still soft-deletes by default. `?permanent=true` erases the profile and its stored password, refusing with `409` while anything still references the user and listing what; `&force=true` cascades. Two guards apply to both modes: an admin cannot permanently delete the account they are signed in with, and the last active admin cannot be removed at all — locking everyone out of the system is never the intended outcome of a delete.
 
 ### Integration diagnostics
 
-`GET /api/v1/admin/integrations` probes Drive, Cloud Storage, Calendar/Meet, Meet recording, and SMTP and reports `ok` plus a `detail` naming the precise misconfiguration — Drive API not enabled on the project, domain-wide delegation refused, a Shared Drive ID the service account cannot see, a folder layout that will hit `storageQuotaExceeded`. `POST /api/v1/admin/integrations/storage/test-upload` proves a real write works by uploading a probe file and deleting it. Teachers get the storage half at `GET /api/v1/storage/status`.
+`GET /api/v1/admin/integrations` probes Blob storage, live classes (ACS), class recording and
+email, and reports `ok` plus a `detail` naming the precise misconfiguration — a missing
+connection string, an unset `ACS_EVENTS_KEY`, an email sender with no connected domain. Recording
+is reported separately from live classes, because classes can run perfectly while the Event Grid
+subscription is not yet in place. `POST /api/v1/admin/integrations/storage/test-upload` proves a
+real write works by uploading a probe file and deleting it. Teachers get the storage half at
+`GET /api/v1/storage/status`; the call page asks `GET /api/v1/calls/config`.
 
 ### Full update and delete coverage
 
 The API previously had exactly one delete endpoint (a soft user deactivation). It now has **18 update/delete endpoints**.
 
-- **Users soft-delete** — deactivated, not removed, so attendance and grade history stay intact and keep resolving. The linked Firebase account is disabled and its sessions revoked. A new `POST /admin/users/{id}/reactivate` reverses it.
+- **Users soft-delete** — deactivated, not removed, so attendance and grade history stay intact and keep resolving. It can no longer sign in, and every session it holds is revoked at once. A new `POST /admin/users/{id}/reactivate` reverses it.
 - **Everything else hard-deletes**, guarded by referential-integrity checks. Deleting a class that still has enrollments returns `409` naming the blocking resources and counts. Pass `?force=true` to cascade.
 - **Teacher records are ownership-scoped.** A teacher may only modify records they created; admins bypass the check.
 
@@ -701,7 +790,7 @@ The API previously had exactly one delete endpoint (a soft user deactivation). I
 - Fixed a `NameError` crash in `hydrate_teacher_mapping` and `hydrate_student_enrollment` that made `GET /admin/mappings/teacher-subject-class` and `GET /admin/enrollments` return `500`.
 - Fixed silent file overwrites: uploads used the raw filename as the object path, so two teachers uploading `notes.pdf` to the same class clobbered each other. Filenames now carry a unique prefix.
 - Migrated Firestore queries to the modern `FieldFilter` form; the positional `.where(field, op, value)` call was deprecated and emitting warnings.
-- Removed `hash_password` / `verify_password` / `create_access_token` and dropped the `passlib` and `bcrypt` dependencies. Leaving password-hashing helpers in a codebase that no longer stores passwords invites their reintroduction.
+- Removed `hash_password` / `verify_password` / `create_access_token` and dropped the `passlib` and `bcrypt` dependencies. *(Superseded by the move to Azure: the backend stores password hashes again, in `user_credentials`; see `app/core/identity.py`.)*
 - Added the shared helpers `require_document`, `assert_owner`, `count_references`, and `delete_with_dependencies` in `app/core/firebase.py`, replacing repeated fetch-check-raise blocks across the routers.
 
 ---
@@ -713,35 +802,38 @@ The API previously had exactly one delete endpoint (a soft user deactivation). I
 - Python 3.13+
 - FastAPI for HTTP API routing and request validation
 - Pydantic for request/response schemas and settings management
-- Firebase Admin SDK for Firestore and Firebase Authentication
-- Google API Python Client for Calendar (Meet) and Drive
-- Google Cloud Storage client for bucket uploads
-- `python-jose` for validating legacy tokens only
+- `pyodbc` for the Azure SQL document store
+- `python-jose` for the session tokens this backend signs
+- Azure SDKs: `azure-storage-blob`, `azure-communication-identity`, `azure-communication-rooms`, `azure-communication-callautomation`, `azure-communication-email`
+- Gunicorn with Uvicorn workers on Azure App Service (`startup.sh`)
 
 ### Key Modules
 
 | Path | Responsibility |
 | --- | --- |
-| `app/main.py` | FastAPI application, middleware, router mounting, lifespan |
-| `app/core/firebase.py` | `FirestoreService` CRUD wrapper, batched reads, reference cache, hydration helpers, delete guards |
-| `app/core/concurrency.py` | `run_parallel` for independent, latency-bound Firestore work |
+| `app/main.py` | FastAPI application, middleware, router mounting, lifespan, the `/files/<blob>` redirect |
+| `app/core/firebase.py` | The collection registry (`firestore_*` names kept from the Firebase era), reference cache, hydration helpers, delete guards; the Firestore backend for reading the frozen backup |
+| `app/core/sqldb.py` | Azure SQL as a document store, behind the same interface |
+| `app/core/identity.py` | Password hashing and checking, session and reset tokens, lockout, the Firebase-hash migration path |
+| `app/core/acs.py` | Azure Communication Services: identities, rooms, calling tokens, call recording, plus `check_access()` diagnostics |
+| `app/core/azure_blob.py` | The private Blob container: uploads, deletes, short-lived read links |
+| `app/core/storage.py` | Storage provider switch (Azure Blob / Local) with the local-disk fallback |
+| `app/core/mailer.py` | Outbound email through ACS Email or SMTP |
+| `app/core/concurrency.py` | `run_parallel` for independent, latency-bound database work |
 | `app/core/jobs.py` | Background job registry with progress reporting, and the result cache |
-| `app/core/firebase_auth.py` | Firebase Auth: token verification, account creation, custom claims, disable/revoke |
-| `app/core/google_meet.py` | Google Meet link generation via the Calendar API, plus `check_access()` diagnostics |
-| `app/core/meet_recordings.py` | Meet REST API v2: arming auto-recording on a meeting space, finding its recordings afterwards |
-| `app/core/google_drive.py` | Shared Drive / folder uploads, folder resolution, recording transfer, deletion, plus `check_access()` diagnostics |
-| `app/core/gcp_services.py` | Storage provider switch (GCS / Drive / Local) |
-| `app/core/security.py` | Legacy JWT decoding only; removable after cutover |
-| `app/api/v1/` | Versioned routers: auth, admin, teachers, students, storage |
+| `app/api/v1/` | Versioned routers: auth, calls, admin, teachers, students, storage, and the rest |
+| `app/services/calls.py` | Letting a person into a live call: the join rules, the room, the token, the join/leave log |
+| `app/services/class_rooms.py` | One standing room per school class, its presence log and per-day attendance |
 | `app/services/content.py` | Meeting scheduling and material storage shared by the teacher and admin routers |
+| `app/services/recordings.py` | Starting and stopping recordings, filing the finished files into Blob, and its background sweep |
 | `app/services/timetable.py` | Recurring period storage, clash detection, resolution against calendar dates |
 | `app/services/reminders.py` | Timetable-driven reminder sweep and its background scheduler |
-| `app/services/recordings.py` | Collecting finished class recordings into the school Drive, and its background scheduler |
 | `app/schemas/` | Pydantic request/response models |
-| `app/db/init_db.py` | Firestore seeding at startup |
-| `scripts/migrate_users_to_firebase_auth.py` | One-time migration linking existing users to Firebase Auth |
+| `app/db/init_db.py` | Creates the bootstrap administrator at startup |
+| `scripts/import_firebase_passwords.py` | One-off: copied the Firebase Auth password hashes into `user_credentials` |
+| `scripts/migrate_google_links.py` | One-off: re-pointed Meet links at the LMS call pages and moved local uploads into Blob |
 
-Every Google integration **fails soft**: missing credentials or unauthorized delegation produce a logged warning and a degraded response, never a crash. This keeps the API importable and testable without a live Google project. Failing soft is not the same as failing silently — the reason travels back to the caller in `meet_error` / `storage_warning`, and `GET /admin/integrations` reports it in full.
+Every Azure integration **fails soft**: a missing connection string or a refused request produces a logged warning and a degraded response, never a crash. This keeps the API importable and testable without live Azure resources. Failing soft is not the same as failing silently — the reason travels back to the caller in `meet_error` / `recording_error` / `storage_warning`, and `GET /admin/integrations` reports it in full.
 
 ---
 
@@ -756,33 +848,33 @@ Configuration is centralized in `app/core/config.py` and overridable via environ
 | `PROJECT_NAME` | `LMS Backend API` | Application name |
 | `API_V1_STR` | `/api/v1` | API prefix |
 | `DEBUG` | `True` | Debug mode |
-| `GCP_PROJECT_ID` | — | Firebase/Google Cloud project ID |
-| `FIREBASE_CREDENTIALS_PATH` | `./firebase_credentials.json` | Firebase Admin SDK credentials |
-| `GOOGLE_APPLICATION_CREDENTIALS` | `./service_account.json` | Service account JSON (falls back to the above) |
-| `FIREBASE_CREDENTIALS_JSON` | `""` | The key itself, for hosts with no key file. See [Credentials in a hosted deployment](#credentials-in-a-hosted-deployment) |
-| `USE_FIREBASE_DB` | `True` | Enables Firestore usage |
+| `CORS_ALLOW_ORIGINS` | `""` | Exact frontend origins, comma-separated |
+| `CORS_ALLOW_ORIGIN_REGEX` | `*.azurestaticapps.net` and localhost | Fallback pattern for preview environments and local dev |
+| `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` / `BOOTSTRAP_ADMIN_NAME` | — | The one account created at startup when absent |
+| `SEED_DEMO_DATA` | `False` | Add a sample class and subject |
 
-### Credentials in a hosted deployment
+### Database
 
-The deployment artifact is built from a repository checkout, and `.gitignore` excludes `.env`
-and `*.json`. Neither `.env` nor `firebase_credentials.json` ever reaches App Service, so
-`FIREBASE_CREDENTIALS_PATH` resolves to nothing there.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DATABASE_BACKEND` | `azuresql` | `azuresql`, or `firestore` to read the frozen pre-Azure backup |
+| `DB_SERVER` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` | — | The Azure SQL database |
+| `DB_SCHEMA` | `h7lms` | The only schema the app creates, alters or reads |
+| `DB_DRIVER` | `ODBC Driver 18 for SQL Server` | Falls back to whichever SQL Server driver is installed |
+| `DB_CONNECTION_STRING` | `""` | A full ODBC string; overrides the fields above |
 
-This does not fail loudly. `initialize_firebase()` returns `None`, every `FirestoreService`
-method short-circuits on `is_available`, and the API answers `200` with an empty list on
-every collection — indistinguishable from a database nobody has populated yet.
+`GCP_PROJECT_ID`, `FIREBASE_CREDENTIALS_PATH`, `GOOGLE_APPLICATION_CREDENTIALS` and
+`FIREBASE_CREDENTIALS_JSON` still exist, but only for `DATABASE_BACKEND=firestore` and the
+one-off migration scripts. A deployment on Azure SQL leaves them unset.
 
-Supply the key through the environment instead. `FIREBASE_CREDENTIALS_JSON` accepts the
-contents of `firebase_credentials.json` as raw single-line JSON or base64-encoded, and the
-app writes it to a private temp file at startup that the path settings then point at. No
-secret is committed, and nothing changes locally: a key file that exists on disk always wins.
+### Settings in a hosted deployment
 
-```bash
-az webapp config appsettings set -g <rg> -n <app> --settings \
-  FIREBASE_CREDENTIALS_JSON="$(base64 -w0 firebase_credentials.json)"
-```
+The deployment artifact is built from a repository checkout, and `.gitignore` excludes `.env`,
+so nothing in `.env` reaches App Service by itself. Every setting is an App Service
+**application setting**, which arrives in the container as an ordinary environment variable.
 
-`scripts/sync_azure_settings.ps1` does this along with the rest of `.env` in one call. Run it
+`scripts/sync_azure_settings.ps1` pushes `.env` into the web app's application settings in one
+call, and clears the Google service-account settings left over from before the move. Run it
 with `-WhatIf` first — it prints setting names only, never values:
 
 ```powershell
@@ -790,63 +882,63 @@ with `-WhatIf` first — it prints setting names only, never values:
 ./scripts/sync_azure_settings.ps1
 ```
 
-Verify with `GET /health/firestore`, which reports whether the database is reachable, which
-credential source was used, and the result of a live read probe. It returns no secret
-material. `firestore_available: true` with `read_probe: "ok"` means the wiring is correct;
-if data is still missing after that, the cause is elsewhere (CORS, auth, or an empty
-database).
+Applying settings restarts the app; the script then checks `GET /health/database`, which
+reports which backend is in use and whether it answers. `GET /admin/integrations` covers
+storage, live classes, recording and email.
 
 ### Performance
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `REFERENCE_CACHE_TTL_SECONDS` | `60` | Lifetime of cached user/class/subject documents |
-| `QUERY_CONCURRENCY` | `8` | Thread-pool width for independent Firestore reads |
+| `QUERY_CONCURRENCY` | `8` | Thread-pool width for independent database reads |
 | `MONITORING_REPORT_TTL_SECONDS` | `300` | How long a computed monitoring report stays fresh |
 
 ### Authentication
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AUTH_PROVIDER` | `FIREBASE` | `FIREBASE` or `LEGACY_JWT` |
-| `ALLOW_LEGACY_JWT_LOGIN` | `True` | Accept legacy backend-issued JWTs during migration |
-| `FIREBASE_WEB_API_KEY` | `""` | Firebase Web API Key. Required **only** for the dev password-login helper, the Swagger auth modal, and `verify_lms.py` |
-| `SECRET_KEY` / `ALGORITHM` / `ACCESS_TOKEN_EXPIRE_MINUTES` | — | Legacy token validation only |
+| `SECRET_KEY` | — | Signs every session token and reset link. **Changing it signs everybody out.** Use a long random value |
+| `ALGORITHM` | `HS256` | Token signature algorithm |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `1440` | Session token lifetime; renew with `POST /auth/refresh` |
+| `PASSWORD_MIN_LENGTH` | `8` | Shortest password accepted on change or reset |
+| `PASSWORD_RESET_TOKEN_MINUTES` | `60` | How long a reset link works |
+| `LOGIN_MAX_FAILURES` / `LOGIN_LOCKOUT_MINUTES` | `10` / `15` | Failed sign-ins allowed per address before a `429` lockout |
+| `LMS_APP_URL` | `""` | The frontend's origin; reset and class links in emails are built from it. Falls back to `LMS_LOGIN_URL` without its path |
+| `FIREBASE_WEB_API_KEY` | `""` | Migration fallback only: while set, an account with no stored password is checked once against Firebase and moved over. Leave blank once every account is imported |
+| `FIREBASE_HASH_SIGNER_KEY` / `FIREBASE_HASH_SALT_SEPARATOR` / `FIREBASE_HASH_ROUNDS` / `FIREBASE_HASH_MEM_COST` | — | Parameters of the imported Firebase hashes. The import script stores them in the database; set these only to override |
 
-### Google Workspace
+### Live classes (Azure Communication Services)
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GOOGLE_WORKSPACE_DOMAIN` | `""` | Your Workspace domain, e.g. `yourschool.com` |
-| `GOOGLE_IMPERSONATION_FALLBACK` | `""` | Workspace user impersonated when a teacher's email is outside the domain |
-| `ENABLE_GOOGLE_MEET` | `True` | Auto-create Calendar events with Meet links |
-| `GOOGLE_CALENDAR_ID` | `primary` | Target calendar |
-| `GOOGLE_CALENDAR_TIMEZONE` | `Asia/Dubai` | IANA zone stamped on events whose time carries no offset. Calendar rejects a naive time without it |
-| `GOOGLE_CALENDAR_IMPERSONATION` | `True` | Set `False` on a non-Workspace project; `GOOGLE_CALENDAR_ID` must then name a calendar shared with the service account |
-| `GOOGLE_MEET_INVITE_ATTENDEES` | `True` | Invite enrolled students as Calendar guests. Turning it off still yields a Meet link |
-| `GOOGLE_CALENDAR_SCOPES` | `""` | Pin the Calendar OAuth scopes. Blank probes narrowest-first and settles on whatever delegation granted |
+| `ACS_CONNECTION_STRING` | `""` | Communication resource → Settings → Keys → Connection string |
+| `ENABLE_ACS_CALLING` | `True` | Let live classes be joined in the LMS |
+| `ACS_ROOM_VALIDITY_DAYS` | `180` | How long a room is valid (ACS allows up to 180) |
+| `ACS_ROOM_RENEW_DAYS` | `14` | A standing room is extended when somebody joins inside this window |
+| `ACS_TOKEN_HOURS` | `6` | Lifetime of the calling token a browser receives |
+| `SCHOOL_CLASS_ROOM_MODE` | `True` | One standing room per class rather than one per session (admin-editable) |
+| `SCHOOL_JOIN_OPEN_MINUTES_BEFORE` / `SCHOOL_JOIN_GRACE_MINUTES` | `5` / `15` | How early the join opens and how long after the end it stays open |
 
 ### Class recording
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ENABLE_MEET_AUTO_RECORDING` | `True` | Arm every generated Meet conference to record itself, and run the collection sweep |
-| `RECORDING_TRANSFER_MODE` | `MOVE` | `MOVE` into the Shared Drive, `COPY` there, or `LINK` to the teacher's original |
-| `RECORDING_DRIVE_FOLDER_NAME` | `Class Recordings` | Folder under the Drive root holding the per-class recording folders |
-| `RECORDING_SHARE_WITH_STUDENTS` | `True` | Grant each enrolled student read access to their class's recording |
-| `RECORDING_HARVEST_DELAY_MINUTES` | `5` | Wait this long after a session's scheduled end before looking. Meet needs minutes to write the file |
-| `RECORDING_SCAN_INTERVAL_SECONDS` | `300` | Sweep interval, floored at 60s |
-| `RECORDING_MAX_AGE_HOURS` | `48` | Give up on a session with no recording after this, and stop polling it |
-| `MEET_RECORDING_SCOPES` | `""` | Pin the Meet OAuth scopes. Blank probes narrowest-first, as with Calendar |
+| `ENABLE_AUTO_RECORDING` | `True` | Record sessions set to record, and run the filing sweep |
+| `ACS_EVENTS_KEY` | `""` | Shared secret in the Event Grid webhook URL. The webhook refuses every delivery until it is set |
+| `RECORDING_FOLDER_NAME` | `recordings` | Blob folder the videos are filed under, one sub-folder per class |
+| `RECORDING_MAX_AGE_HOURS` | `48` | Mark a session with no recording `UNAVAILABLE` after this |
+| `RECORDING_MAX_MINUTES` | `180` | Stop a recording nobody stopped (the teacher's browser died) |
+| `RECORDING_SCAN_INTERVAL_SECONDS` | `300` | How often the sweep retries failed copies and closes stale recordings |
 
 ### Timetable & reminders
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `SCHOOL_TIMEZONE` | falls back to `GOOGLE_CALENDAR_TIMEZONE` | IANA zone timetable periods are interpreted in |
+| `SCHOOL_TIMEZONE` | falls back to `GOOGLE_CALENDAR_TIMEZONE` (a retained legacy setting, `Asia/Dubai`) | IANA zone timetable periods are interpreted in |
 | `ENABLE_CLASS_REMINDERS` | `True` | Run the background reminder sweep |
 | `CLASS_REMINDER_MINUTES_BEFORE` | `15` | Minutes before a period to email. Comma-separated for several nudges, e.g. `60,15` |
-| `REMINDER_SCAN_INTERVAL_SECONDS` | `120` | Sweep interval. Keep below the smallest offset or a window can be stepped over |
+| `REMINDER_SCAN_INTERVAL_SECONDS` | `300` | Sweep interval. Keep below the smallest offset or a window can be stepped over |
 | `REMIND_TEACHERS` | `True` | Also email the teacher taking the period |
 | `REMINDER_MAX_LATENESS_MINUTES` | `10` | Drop reminders overdue by more than this, so a restart cannot flood everyone |
 
@@ -854,88 +946,121 @@ database).
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `STORAGE_PROVIDER` | `GCS` | `GCS`, `DRIVE`, or `LOCAL` |
+| `STORAGE_PROVIDER` | `AZURE_BLOB` | `AZURE_BLOB` or `LOCAL`. The Google-era `GCS` / `DRIVE` are read as `AZURE_BLOB` |
+| `AZURE_STORAGE_CONNECTION_STRING` | `""` | Storage account → Security + networking → Access keys → Connection string |
+| `AZURE_STORAGE_CONTAINER` | `lms-files` | Private container; created on first use |
+| `AZURE_BLOB_LINK_MINUTES` | `60` | Lifetime of the read link `/files/<blob>` redirects to |
 | `USE_LOCAL_STORAGE` | `False` | Legacy flag. Forces `LOCAL` **only when `STORAGE_PROVIDER` is left unset** — it no longer silently overrides an explicit choice |
-| `STORAGE_STRICT` | `False` | `True` returns `502` when the cloud provider is unreachable instead of falling back to local disk |
-| `GCP_BUCKET_NAME` | — | Cloud Storage bucket |
-| `GOOGLE_DRIVE_SHARED_DRIVE_ID` | `""` | Shared Drive destination. A full `drive.google.com` URL is accepted and unwrapped |
-| `GOOGLE_DRIVE_FOLDER_ID` | `""` | Ordinary-folder destination; requires `GOOGLE_DRIVE_IMPERSONATION=True` |
-| `GOOGLE_DRIVE_IMPERSONATION` | `True` | Act as `GOOGLE_IMPERSONATION_FALLBACK` for Drive. Leave `False` with a Shared Drive — no delegation needed |
-| `GOOGLE_DRIVE_LINK_SHARING` | `True` | Grant "anyone with the link can view" on uploads |
-| `GOOGLE_DRIVE_ROOT_FOLDER_NAME` | `H7 LMS Materials` | Folder created inside the destination to group LMS uploads |
+| `STORAGE_STRICT` | `False` | `True` returns `502` when Blob storage is unreachable instead of falling back to local disk |
 | `LOCAL_STORAGE_DIR` | `./uploads` | Local upload directory |
+
+### Email
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ENABLE_EMAIL_NOTIFICATIONS` | `True` | Send email at all |
+| `EMAIL_PROVIDER` | `""` | `ACS` or `SMTP`; blank picks whichever is configured, ACS first |
+| `ACS_EMAIL_SENDER` | `""` | The MailFrom address of the email domain connected to the Communication resource, e.g. `DoNotReply@<guid>.azurecomm.net` |
+| `ACS_EMAIL_CONNECTION_STRING` | `""` | Defaults to `ACS_CONNECTION_STRING` |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USE_TLS` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` / `SMTP_FROM_NAME` | — | Any SMTP relay, for a school that has one |
+| `USER_EMAIL_DOMAIN` | `""` | Domain for generated login addresses (`firstname.lastname@domain`). Falls back to the legacy `GOOGLE_WORKSPACE_DOMAIN` |
+| `LMS_LOGIN_URL` | `""` | Sign-in link included in the credentials email |
 
 ---
 
-## Google Cloud Console Setup
+## Azure setup
 
-Meet and Drive require Workspace configuration before they function. Firestore and Firebase Auth work without these steps.
-
-### 1. Enable APIs
+Four resources besides the App Service and the Azure SQL database: a **Storage account**, a
+**Communication Services** resource, an **Email Communication Service** with a domain connected
+to it, and an **Event Grid subscription** that delivers recording files. The examples use the
+Azure CLI (`az extension add --name communication` once for the `az communication` commands);
+the portal works just as well.
 
 ```bash
-gcloud config set project <YOUR_PROJECT_ID>
-gcloud services enable \
-  identitytoolkit.googleapis.com \
-  firestore.googleapis.com \
-  storage.googleapis.com \
-  calendar-json.googleapis.com \
-  drive.googleapis.com \
-  meet.googleapis.com \
-  iamcredentials.googleapis.com
+RG=<resource-group>
+LOC=<region, e.g. uaenorth>
+API=https://<api-host>          # the App Service's URL
 ```
 
-| API | Console name | Needed for |
-| --- | --- | --- |
-| `identitytoolkit` | Identity Toolkit API | Firebase Auth |
-| `calendar-json` | Google Calendar API | Meet link generation |
-| `drive` | Google Drive API | Shared Drive uploads, filing recordings |
-| `meet` | Google Meet API | Automatic class recording |
-| `iamcredentials` | IAM Service Account Credentials API | Delegation token minting |
+### 1. Storage account and container (files and recordings)
 
-### 2. Enable Firebase Auth providers
+```bash
+az storage account create -g $RG -n <storageaccount> -l $LOC \
+  --sku Standard_LRS --kind StorageV2 --allow-blob-public-access false --min-tls-version TLS1_2
+CONN="$(az storage account show-connection-string -g $RG -n <storageaccount> -o tsv)"
+az storage container create -n lms-files --public-access off --connection-string "$CONN"
+echo "$CONN"    # -> AZURE_STORAGE_CONNECTION_STRING
+```
 
-Firebase Console → **Authentication → Get started**:
+The container must stay **private**: every file is served through `/files/<blob>`, which hands
+out a link that expires after `AZURE_BLOB_LINK_MINUTES`. (The app creates the container on first
+use if you skip that step.) Put the connection string in `AZURE_STORAGE_CONNECTION_STRING`.
 
-- Enable **Email/Password**.
-- Enable **Google**, restricted to your Workspace domain.
-- Under **Settings → Authorized domains**, add `localhost` and your deployed hostname.
+### 2. Communication Services resource (live classes and recording)
 
-### 3. Authorize domain-wide delegation (requires a Workspace super-admin)
+```bash
+az communication create -g $RG -n <acs-name> --location global --data-location UAE
+az communication list-key -g $RG -n <acs-name> --query primaryConnectionString -o tsv
+```
 
-This is what allows the backend to act as a teacher without a per-user consent screen.
+Put the connection string in `ACS_CONNECTION_STRING`. Nobody signs in to ACS: the backend
+creates an ACS identity per LMS user on first join and hands the browser a short-lived token.
 
-1. Cloud Console → **IAM & Admin → Service Accounts** → open the service account → **Details** tab → copy the **Unique ID** (a ~21-digit number, *not* the email).
-2. Go to **admin.google.com** → **Security → Access and data control → API controls → Manage Domain Wide Delegation → Add new**.
-3. **Client ID** = the numeric Unique ID from step 1.
-4. **OAuth scopes**, comma-separated with no spaces:
-   ```
-   https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/meetings.space.settings,https://www.googleapis.com/auth/meetings.space.readonly
-   ```
-   The last two are needed only for automatic class recording; drop them if `ENABLE_MEET_AUTO_RECORDING=False`.
-5. Authorize. Propagation is usually under a minute, but Google documents up to 24 hours.
+### 3. Email (ACS Email)
 
-> **Scope discipline:** delegation lets the backend impersonate *any* user in the domain within the granted scopes. Grant only these four — and only the first two if you are not recording classes.
->
-> Add every scope you need **in one entry**. Google rejects the entire token exchange with `unauthorized_client` when any single requested scope is unauthorized, so a half-updated grant breaks Calendar as well as Meet.
+```bash
+az communication email create -g $RG -n <email-service> --location global --data-location UAE
+az communication email domain create -g $RG --email-service-name <email-service> \
+  --domain-name AzureManagedDomain --location global --domain-management AzureManaged
+az communication email domain show -g $RG --email-service-name <email-service> \
+  --domain-name AzureManagedDomain --query mailFromSenderDomain -o tsv
+# Connect the domain to the Communication resource from step 2:
+az communication update -g $RG -n <acs-name> --linked-domains \
+  "$(az communication email domain show -g $RG --email-service-name <email-service> \
+     --domain-name AzureManagedDomain --query id -o tsv)"
+```
 
-### 4. Create the Shared Drive (required for Drive storage *or* class recording)
+The **Azure-managed domain works immediately** (`<guid>.azurecomm.net`); a custom domain needs
+its DNS records verified first. Set `ACS_EMAIL_SENDER=DoNotReply@<mailFromSenderDomain>`.
+`ACS_EMAIL_CONNECTION_STRING` can stay blank because the domain is connected to the same
+resource as the rooms. The Azure-managed domain has low sending limits, which suit reminders
+and password resets; move to a custom domain for bulk mail.
 
-1. **drive.google.com → Shared drives → New**.
-2. **Manage members** → add the service account email as **Content manager**.
-3. Copy the ID from the URL `drive.google.com/drive/folders/<ID>` into `GOOGLE_DRIVE_SHARED_DRIVE_ID`.
+### 4. Event Grid subscription (finished recordings)
 
-Class recordings are filed here even when `STORAGE_PROVIDER=GCS`. A Meet recording is already a Drive file, and moving it within Drive costs nothing, while downloading and re-uploading a lecture-sized video would.
+Choose a long random `ACS_EVENTS_KEY`, set it on the App Service first (the webhook refuses
+every delivery, including the validation handshake, until it is set), then subscribe:
 
-### 4b. Enable Meet recording (only for automatic class recording)
+```bash
+az provider register --namespace Microsoft.EventGrid   # once per subscription
+az eventgrid event-subscription create --name lms-recordings \
+  --source-resource-id "$(az communication show -g $RG -n <acs-name> --query id -o tsv)" \
+  --endpoint "$API/api/v1/calls/events?key=<ACS_EVENTS_KEY>" \
+  --endpoint-type webhook \
+  --included-event-types Microsoft.Communication.RecordingFileStatusUpdated
+```
 
-**admin.google.com → Apps → Google Workspace → Google Meet → Meet video settings** → select the OU the teachers are in → turn **Recording** on.
+The subscription's validation handshake is answered automatically by the same endpoint, so the
+command succeeds as soon as the API is reachable with the right key.
 
-This is an edition feature, not a permission: it exists on Business Standard/Plus, Enterprise, Education Plus and the Teaching & Learning Upgrade, and does not exist at all on Business Starter or personal Gmail. A `403` from the Meet API in `GET /admin/integrations` means this first, delegation second.
+### 5. App Service settings
 
-### 5. Grant IAM roles
+Add these to the web app (or put them in `.env` and run `scripts/sync_azure_settings.ps1`):
 
-Grant the service account `roles/datastore.user`, `roles/storage.objectAdmin`, and `roles/firebaseauth.admin`.
+```bash
+az webapp config appsettings set -g $RG -n <app> --settings \
+  DATABASE_BACKEND=azuresql DB_SERVER=... DB_NAME=... DB_USER=... DB_PASSWORD=... DB_SCHEMA=h7lms \
+  SECRET_KEY="<long random value>" LMS_APP_URL="https://<frontend-host>" \
+  AZURE_STORAGE_CONNECTION_STRING="<from step 1>" AZURE_STORAGE_CONTAINER=lms-files \
+  ACS_CONNECTION_STRING="<from step 2>" ACS_EMAIL_SENDER="DoNotReply@<domain from step 3>" \
+  ACS_EVENTS_KEY="<from step 4>" CORS_ALLOW_ORIGINS="https://<frontend-host>"
+az webapp config set -g $RG -n <app> --startup-file "bash /home/site/wwwroot/startup.sh"
+```
+
+Leave **App Service → API → CORS empty** in the portal; when it has any entry Azure answers
+preflights itself and the app's own CORS configuration never runs. Once every Firebase account
+has been imported, clear `FIREBASE_WEB_API_KEY`, `FIREBASE_CREDENTIALS_JSON` and the other
+Google settings. Then open `GET /admin/integrations` to confirm every section reads `ok`.
 
 ---
 
@@ -943,19 +1068,24 @@ Grant the service account `roles/datastore.user`, `roles/storage.objectAdmin`, a
 
 ### Client flow
 
-1. The client signs in with the Firebase Web/Mobile SDK — email/password, or Google sign-in restricted to the Workspace domain.
-2. Firebase returns an **ID token**.
-3. The client sends it on every request as `Authorization: Bearer <idToken>`.
-4. The backend verifies signature, expiry, audience, and revocation, then resolves the Firestore profile.
-
-Profile lookup is by `firebase_uid`, falling back to email. When a profile predates the migration and matches by email, the `firebase_uid` link is backfilled automatically on first authenticated request.
+1. The client posts email and password to `POST /api/v1/auth/login`.
+2. The backend checks the password against the hash in `user_credentials` and returns a session token (`access_token`, `expires_in`, `role`, `user_id`, `full_name`).
+3. The client sends it on every request as `Authorization: Bearer <access_token>`.
+4. The backend checks the signature and expiry, loads the profile, and refuses the token if the account's sessions were revoked after it was issued.
+5. Shortly before `expires_in` runs out the client calls `POST /api/v1/auth/refresh` with the current token and swaps in the new one.
 
 ### Endpoints
 
-- `POST /api/v1/auth/register` — creates the Firebase Auth account and the Firestore profile. `password` is optional; omit it for Google-sign-in-only accounts or to have the user set one via a Firebase reset email.
-- `GET /api/v1/auth/me` — returns the authenticated user's profile.
-- `POST /api/v1/auth/login` — **development helper.** Exchanges email and password for a Firebase ID token via the Identity Toolkit REST API. Requires `FIREBASE_WEB_API_KEY`, and returns `501` when unset. Production clients should not use this.
+- `POST /api/v1/auth/login` — email and password in, session token out. `401` for a wrong password, `403` for an inactive account, `429` while the address is locked out.
 - `POST /api/v1/auth/token` — OAuth2 form variant for the Swagger UI auth modal.
+- `POST /api/v1/auth/refresh` — a fresh token for a session still valid; `401` once it is more than 30 days since the password was typed.
+- `POST /api/v1/auth/password/change` — `current_password`, `new_password`. Signs out every other device; the response carries a fresh `token` for this one.
+- `POST /api/v1/auth/password/reset-request` — emails a reset link to `<LMS_APP_URL>/reset-password?token=...`. Answers the same way whether or not the address has an account.
+- `POST /api/v1/auth/password/reset` — `token`, `new_password`. The link works once, for `PASSWORD_RESET_TOKEN_MINUTES`.
+- `GET /api/v1/auth/me` — returns the authenticated user's profile and `school_timezone`.
+- `POST /api/v1/auth/heartbeat` — a sign of life from an open tab, for the online indicators.
+
+There is no public registration; accounts are created by an administrator.
 
 ### Role-Based Access Control
 
@@ -966,26 +1096,31 @@ Enforced by dependencies in `app/api/v1/dependencies.py`:
 - `require_student` — `STUDENT` and `ADMIN`
 - `require_any_authenticated` — any authenticated role
 
-Roles are read from the Firestore profile regardless of authentication provider; Firebase custom claims mirror them for frontend convenience only.
+Roles are read from the stored profile on every request; the `role` claim in the session token mirrors it for frontend convenience only. `require_teacher` also admits `CLASS_TEACHER`, and `require_class_teacher` admits `CLASS_TEACHER` and `ADMIN`.
 
 ---
 
-## Firestore Usage
+## Document store
 
-Collections exposed as top-level services:
+Collections are declared once in `app/core/firebase.py` as `firestore_*` services (the names
+predate the move to Azure SQL and were kept so no caller had to change). They include:
 
-`users`, `class_rooms`, `subjects`, `teacher_subject_class_mappings`, `student_enrollments`, `attendance_records`, `topics_covered`, `live_meetings`, `study_materials`, `exam_grades`, `exams`, `exam_submissions`, `report_cards`, `drive_folders`
+`users`, `user_credentials`, `class_rooms`, `subjects`, `teacher_subject_class_mappings`, `student_enrollments`, `attendance_records`, `topics_covered`, `live_meetings`, `study_materials`, `exam_grades`, `exams`, `exam_submissions`, `report_cards`, `recording_log`, `class_room_events`, `class_room_attendance`, and the tuition, finance, admissions and workflow collections
 
-### `FirestoreService`
+### The service interface
+
+Implemented by `SqlDocumentService` (`app/core/sqldb.py`) on Azure SQL, and by
+`FirestoreService` for reading the frozen backup:
 
 - `add_document(doc_id, data)` — upsert with merge semantics; invalidates the cache entry
+- `create_document(doc_id, data)` — atomic create that fails when the id is taken; the basis of every "exactly once" claim
 - `get_document(doc_id)` — fetch by ID, served from cache for reference collections
 - `get_documents(ids)` — **fetch many in one round trip**; the core performance primitive
 - `get_document_by_field(field, value)` — resolve one document by field equality
-- `query_documents(field, op, value)` — query using `FieldFilter`
+- `query_documents(field, op, value)` — query by one field
 - `list_all()` — list every document in a collection
 - `delete_document(doc_id)` — remove a document; invalidates the cache entry
-- `get_next_numeric_id()` — generate an ID with no Firestore access
+- `get_next_numeric_id()` — generate an ID with no database access
 
 Services constructed with `cacheable=True` (users, classes, subjects) read through a TTL
 cache. Transactional collections are not cached.
@@ -1013,19 +1148,36 @@ New endpoints added in this release are marked **NEW**.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `POST` | `/api/v1/auth/register` | Register a user (`full_name`, `email`, `password?`, `role`) |
-| `POST` | `/api/v1/auth/login` | Dev-only password login; returns a Firebase ID token |
+| `POST` | `/api/v1/auth/login` | Email and password in; a session token out |
 | `POST` | `/api/v1/auth/token` | OAuth2 form login for Swagger |
+| `POST` | `/api/v1/auth/refresh` | Renew a session token before it runs out |
+| `POST` | `/api/v1/auth/password/change` | Change your own password; returns a fresh token |
+| `POST` | `/api/v1/auth/password/reset-request` | Email a password reset link |
+| `POST` | `/api/v1/auth/password/reset` | Set a new password from a reset link |
 | `GET` | `/api/v1/auth/me` | Current user profile |
+
+### Live Classes (calls)
+
+`{kind}` is `class`, `meeting` or `tuition`.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/v1/calls/config` | Whether live classes and recording are set up here, and what is missing |
+| `POST` | `/api/v1/calls/{kind}/{id}/session` | Let me in: ACS room id, identity, calling token and role. `409` with the reason when the class is not open to me now |
+| `POST` | `/api/v1/calls/{kind}/{id}/connected` | I am in the call: logs the join, starts the teacher's recording |
+| `POST` | `/api/v1/calls/{kind}/{id}/left` | I have left: logs the leave, stops any recording I started |
+| `POST` | `/api/v1/calls/{kind}/{id}/recording` | **Teacher** — start or stop recording by hand |
+| `POST` | `/api/v1/calls/events?key=<ACS_EVENTS_KEY>` | Event Grid webhook for `RecordingFileStatusUpdated` (not in the OpenAPI schema) |
+| `GET` | `/files/{blob}` | Redirect to a short-lived read link for a stored file; `?download=true` to save it |
 
 ### Admin Module
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `POST` | `/api/v1/admin/users` | Create a user (also creates the Firebase Auth account) |
+| `POST` | `/api/v1/admin/users` | Create a user; a supplied password is stored as a hash |
 | `GET` | `/api/v1/admin/users` | List users, optional `?role=` filter |
-| `PUT` | `/api/v1/admin/users/{user_id}` | Update profile; syncs email/name/disabled state to Firebase |
-| `DELETE` | `/api/v1/admin/users/{user_id}` | Deactivate, disable the Firebase account, revoke sessions. **NEW** — `?permanent=true` erases the account (`&force=true` cascades) |
+| `PUT` | `/api/v1/admin/users/{user_id}` | Update profile; deactivating signs the user out everywhere |
+| `DELETE` | `/api/v1/admin/users/{user_id}` | Deactivate and revoke sessions. **NEW** — `?permanent=true` erases the account and its stored password (`&force=true` cascades) |
 | `POST` | `/api/v1/admin/users/{user_id}/reactivate` | **NEW** — re-enable a deactivated user |
 | `POST` | `/api/v1/admin/classes` | Create a class |
 | `GET` | `/api/v1/admin/classes` | List classes |
@@ -1045,11 +1197,11 @@ New endpoints added in this release are marked **NEW**.
 | `GET` | `/api/v1/admin/materials` | **NEW** — every material system-wide; filter by `class_id`, `subject_id`, `teacher_id` |
 | `PUT` | `/api/v1/admin/materials/{material_id}` | **NEW** — rename any material or change its type |
 | `DELETE` | `/api/v1/admin/materials/{material_id}` | **NEW** — delete any material; `?keep_file=true` leaves the stored file |
-| `POST` | `/api/v1/admin/meetings` | **NEW** — schedule a live session, optionally on behalf of a `teacher_id`; generates the Meet link |
+| `POST` | `/api/v1/admin/meetings` | **NEW** — schedule a live session, optionally on behalf of a `teacher_id`; gives it its live-class room |
 | `GET` | `/api/v1/admin/meetings` | **NEW** — every meeting system-wide; filter by `class_id`, `subject_id`, `teacher_id` |
-| `PUT` | `/api/v1/admin/meetings/{meeting_id}` | **NEW** — reschedule any meeting; propagates to the Calendar event |
-| `POST` | `/api/v1/admin/meetings/{meeting_id}/regenerate-link` | **NEW** — retry Meet generation for a meeting saved without a link |
-| `DELETE` | `/api/v1/admin/meetings/{meeting_id}` | **NEW** — cancel any meeting and delete its Calendar event |
+| `PUT` | `/api/v1/admin/meetings/{meeting_id}` | **NEW** — reschedule any meeting; the join link is unchanged |
+| `POST` | `/api/v1/admin/meetings/{meeting_id}/regenerate-link` | **NEW** — give a working room to a meeting saved without one, or still carrying a Google Meet link |
+| `DELETE` | `/api/v1/admin/meetings/{meeting_id}` | **NEW** — cancel any meeting; its live-class room goes with it |
 | `POST` | `/api/v1/admin/timetable` | **NEW** — add a recurring period; `409` on a clash, `?allow_conflicts=true` overrides |
 | `POST` | `/api/v1/admin/timetable/bulk` | **NEW** — upload a week or term at once; `replace_existing` makes re-uploads idempotent |
 | `GET` | `/api/v1/admin/timetable` | **NEW** — filter by `class_id`, `teacher_id`, `subject_id`, `day_of_week` |
@@ -1060,12 +1212,12 @@ New endpoints added in this release are marked **NEW**.
 | `GET` | `/api/v1/admin/reminders/preview` | **NEW** — what the next sweep would send, sending nothing |
 | `POST` | `/api/v1/admin/reminders/run` | **NEW** — trigger a sweep now; returns a job id |
 | `GET` | `/api/v1/admin/reminders/log` | **NEW** — reminders actually delivered, newest first |
-| `GET` | `/api/v1/admin/recordings/status` | **NEW** — recording sweep health, transfer mode, last run |
+| `GET` | `/api/v1/admin/recordings/status` | **NEW** — recording sweep health, missing setup, last run |
 | `GET` | `/api/v1/admin/recordings/pending` | **NEW** — what the next sweep would file, filing nothing |
 | `POST` | `/api/v1/admin/recordings/run` | **NEW** — collect finished recordings now; returns a job id |
 | `GET` | `/api/v1/admin/recordings/log` | **NEW** — recordings filed, where they went, and why any failed |
-| `POST` | `/api/v1/admin/meetings/{meeting_id}/recording/sync` | **NEW** — fetch and file one session's recording immediately |
-| `GET` | `/api/v1/admin/integrations` | **NEW** — live health of Drive, Cloud Storage, Meet, Meet recording, and SMTP, with the exact misconfiguration named |
+| `POST` | `/api/v1/admin/meetings/{meeting_id}/recording/sync` | **NEW** — file one session's announced recording immediately |
+| `GET` | `/api/v1/admin/integrations` | **NEW** — live health of Blob storage, live classes (ACS), recording, and email, with the exact misconfiguration named |
 | `POST` | `/api/v1/admin/integrations/storage/test-upload` | **NEW** — upload a probe file, report where it landed, delete it again |
 | `GET` | `/api/v1/admin/reports/monitoring` | Overall stats, teacher activity, student performance. Cached; `?refresh=true` recomputes |
 | `POST` | `/api/v1/admin/reports/monitoring/refresh` | **NEW** — rebuild in the background, returns `202` with a job id |
@@ -1088,10 +1240,10 @@ All update and delete routes enforce ownership: teachers may only modify their o
 | `GET` | `/api/v1/teachers/topics` | Topics logged by this teacher |
 | `PUT` | `/api/v1/teachers/topics/{topic_id}` | **NEW** — edit a topic |
 | `DELETE` | `/api/v1/teachers/topics/{topic_id}` | **NEW** — remove a topic |
-| `POST` | `/api/v1/teachers/meetings` | Schedule a session; auto-creates a Meet link and arms auto-recording |
+| `POST` | `/api/v1/teachers/meetings` | Schedule a session; gives it its live-class room and arms auto-recording |
 | `GET` | `/api/v1/teachers/meetings` | Meetings created by this teacher |
-| `PUT` | `/api/v1/teachers/meetings/{meeting_id}` | **NEW** — reschedule; propagates to Calendar |
-| `DELETE` | `/api/v1/teachers/meetings/{meeting_id}` | **NEW** — cancel; deletes the Calendar event |
+| `PUT` | `/api/v1/teachers/meetings/{meeting_id}` | **NEW** — reschedule; the join link is unchanged |
+| `DELETE` | `/api/v1/teachers/meetings/{meeting_id}` | **NEW** — cancel; deletes its live-class room |
 | `POST` | `/api/v1/teachers/meetings/{meeting_id}/recording/sync` | **NEW** — file this session's recording now instead of waiting for the sweep |
 | `POST` | `/api/v1/teachers/materials` | Upload study material (multipart) |
 | `GET` | `/api/v1/teachers/materials` | Materials uploaded by this teacher |
@@ -1199,7 +1351,8 @@ up. Cards start unpublished so the class teacher can read them before the class 
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `POST` | `/api/v1/storage/upload` | Direct upload to the configured backend. Teacher or admin. Returns `access_url` and `storage_provider` |
+| `POST` | `/api/v1/storage/upload` | Direct upload to the configured backend. Teacher or admin. Returns `access_url` (a `/files/` link on Blob) and `storage_provider` |
+| `GET` | `/api/v1/storage/status` | Which storage backend is active and whether it is reachable |
 
 ---
 
@@ -1210,18 +1363,20 @@ up. Cards start unpublished so the class teacher can read them before the class 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `class_id`, `subject_id`, `title`, `scheduled_time` | — | Required |
-| `auto_create_meet` | `true` | Generate a Calendar event with a Meet link |
-| `auto_record` | `true` | Record the session automatically and file the video into the school Drive |
-| `duration_minutes` | `60` | Event length — also decides when the recording sweep starts looking |
-| `invite_students` | `true` | Add enrolled students as attendees |
-| `meeting_link` | `null` | Supply manually to skip generation |
+| `auto_create_meet` | `true` | Give the session a live-class room in the LMS (the name dates from Google Meet) |
+| `auto_record` | `true` | Record the session when its teacher joins, and file the video into Blob storage |
+| `duration_minutes` | `60` | Session length — decides when the class closes and when the recording is given up on |
+| `invite_students` | `true` | Accepted for older clients; nobody is invited ahead of time any more |
+| `meeting_link` | `null` | Supply manually (Zoom, Teams) to skip the LMS room; such a session is not recorded |
 | `recording_url`, `status` | — | Optional metadata |
 
-The response adds `google_event_id` and `google_calendar_id` when a Calendar event backs the meeting, plus `recording_status` and `recording_error` describing whether the conference was armed to record itself.
+The response carries `meeting_link` (`/call/meeting/<id>`, or the class's `/call/class/<id>` in
+class-room mode), `meet_status` and `meet_error`, plus `recording_status` and `recording_error`.
+`google_event_id` and `google_calendar_id` are only ever set on sessions from before the move.
 
-**Clients must handle a null `meeting_link` on a `201` response.** Meet generation is best-effort by design, so the meeting is always persisted even when the link cannot be created. The same applies to recording: `recording_status: "ARM_FAILED"` on a `201` means the session was scheduled and the link works, but Meet will not record it — `recording_error` says why.
+**Clients must handle a null `meeting_link` on a `201` response.** Room creation is best-effort by design, so the meeting is always persisted even when live classes are not configured; `meet_status: "FAILED"` and `meet_error` say why.
 
-`recording_url` is filled in by the background sweep once the class is over and the video has been filed. Until then it is `null` and `recording_status` says what the system is waiting for.
+`recording_url` is filled in once the class is over and ACS has delivered the video. Until then it is `null` and `recording_status` says what the system is waiting for.
 
 ---
 
@@ -1231,10 +1386,11 @@ The response adds `google_event_id` and `google_calendar_id` when a Calendar eve
 | --- | --- |
 | `400` | Empty update body, or invalid values (e.g. `marks_obtained` above `max_marks`, `max_marks` ≤ 0) |
 | `401` | Missing, malformed, expired, or revoked token |
-| `403` | Wrong role, ownership violation, inactive account, or authenticated with Google but no LMS profile exists |
+| `403` | Wrong role, ownership violation, or inactive account |
 | `404` | Resource not found |
 | `409` | Delete blocked by references. `detail` names each blocking resource and count; retry with `?force=true` to cascade |
-| `501` | `/auth/login` called while `FIREBASE_WEB_API_KEY` is unset |
+| `429` | Too many failed sign-ins for one address (`LOGIN_MAX_FAILURES` within `LOGIN_LOCKOUT_MINUTES`) |
+| `503` | The database is unreachable, or live classes are not configured (`/calls/.../session`) |
 
 Example `409` body:
 
@@ -1251,7 +1407,7 @@ Example `409` body:
 | Schema | Change |
 | --- | --- |
 | `UserCreate` | `password` is now optional |
-| `UserOut` | Added `firebase_uid` |
+| `UserOut` | `firebase_uid` was added for Firebase Auth and is no longer returned |
 | `LiveMeetingCreate` | Added `auto_create_meet`, `duration_minutes`, `invite_students`, `auto_record` |
 | `LiveMeetingOut` | Added `google_event_id`, `google_calendar_id`, `auto_record`, `recording_status`, `recording_error`, `recording_drive_file_id`, `recording_stored_at`, `recording_files` |
 | `StudyMaterialOut` | Added `storage_provider` |
@@ -1269,7 +1425,7 @@ All update models are partial: omitted fields are left unchanged, and an entirel
    python -m pip install -r requirements.txt
    ```
 
-2. Provide Firebase credentials via `firebase_credentials.json` or `GOOGLE_APPLICATION_CREDENTIALS`. The repository does not include service account credentials.
+2. Install Microsoft's ODBC Driver 18 for SQL Server, and have an Azure SQL database to point at (`DB_*` settings). The Storage and Communication Services connection strings are optional locally: without them uploads land in `LOCAL_STORAGE_DIR` and live classes report themselves unconfigured.
 
 3. Copy `.env.example` to `.env` and fill in your values.
 
@@ -1285,25 +1441,32 @@ All update models are partial: omitted fields are left unchanged, and an entirel
 
 ---
 
-## Migrating Existing Users to Firebase Auth
+## Moving off Google (one-off scripts)
 
-Run once after deploying this release. It finds or creates a Firebase Auth account for every user document lacking a `firebase_uid`, writes the role custom claims, links the uid back, and clears the legacy `hashed_password`.
+Both scripts are idempotent and report without writing unless given `--apply`.
 
-```bash
-python -m scripts.migrate_users_to_firebase_auth --dry-run     # report only
-python -m scripts.migrate_users_to_firebase_auth               # apply
-python -m scripts.migrate_users_to_firebase_auth --keep-hashes # apply, retain legacy hashes
-```
-
-Migrated accounts have **no password** in Firebase. Users either sign in with Google Workspace or complete a Firebase password-reset email.
-
-To preserve existing passwords instead, import the bcrypt hashes with the Firebase CLI *before* running the script — it will then link the imported accounts rather than create new ones:
+**Passwords.** `scripts/import_firebase_passwords.py` copied every Firebase Auth password hash
+into `user_credentials` on 2026-09-30, with the project's hash parameters stored beside them.
+Nobody had to reset a password; each imported hash is replaced by a native one on its owner's
+first sign-in. It needs `pip install firebase-admin` and the old service-account key, and only
+works while the Firebase project still answers.
 
 ```bash
-firebase auth:import users.json --hash-algo=BCRYPT --project <YOUR_PROJECT_ID>
+python -m scripts.import_firebase_passwords            # report what would be imported
+python -m scripts.import_firebase_passwords --apply    # import (keeps passwords already set here)
 ```
 
-Documents whose `email` field is not a valid address will fail; the script reports them and continues.
+**Links and files.** `scripts/migrate_google_links.py` re-points generated Meet rooms and session
+links at the LMS call pages, reports files that were on Drive or Cloud Storage (`--mark-lost`
+labels their records so the app can say why they will not open), and with `--upload-local`
+copies files found in `LOCAL_STORAGE_DIR` into Blob storage. Run that part on the App Service
+(SSH) to reach the files that live there.
+
+```bash
+python -m scripts.migrate_google_links                 # report only
+python -m scripts.migrate_google_links --apply --upload-local --mark-lost
+python -m scripts.migrate_google_links --apply --convert-manual-meet   # also hand-pasted Meet links
+```
 
 ---
 
@@ -1315,7 +1478,9 @@ Documents whose `email` field is not a valid address will fail; the script repor
 python verify_lms.py
 ```
 
-It authenticates over the dev password endpoint, so it requires `FIREBASE_WEB_API_KEY` and users that exist in Firebase Auth. Run the migration first.
+It signs in through `POST /api/v1/auth/login` with the backend's own passwords, so it needs no
+API key — only an admin account matching the credentials in the script. It creates and deletes
+real records, so point it at a development database.
 
 ---
 
@@ -1340,39 +1505,35 @@ arithmetic checks by hand (subtotal 9,975 INR; total ₹12,006). Undo with
 `python -m scripts.reset_tuition_data --confirm --student <id>`.
 
 
-`app/db/init_db.py` seeds demo data at startup when absent. Credentials are created in Firebase Auth, not stored locally:
+### Startup seed
 
-- Admin: `admin@lms.com` / `admin123`
-- Teacher: `teacher.math@lms.com` / `teacher123`
-- Students: `student.alice@lms.com`, `student.bob@lms.com` / `student123`
-- Class `CLASS-10A`, subject `MATH101`, plus the matching assignment and enrollments
+`app/db/init_db.py` creates only the bootstrap administrator (`BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD`, stored as a hash in `user_credentials`) when it is absent. With `SEED_DEMO_DATA=True` it also adds a sample class `CLASS-10A` and subject `MATH101`.
 
 ---
 
 ## Notes and Limitations
 
-- Persistence is Firebase-only; no SQLAlchemy.
-- Document IDs are millisecond timestamps generated in-process. Collisions are avoided within a single process, but two server workers creating records in the same millisecond could still collide. Firestore auto-IDs or a counter document would remove the risk entirely.
+- Persistence is a JSON document store on Azure SQL; no ORM, no SQLAlchemy.
+- Document IDs are millisecond timestamps generated in-process. Collisions are avoided within a single process, but two server workers creating records in the same millisecond could still collide. A database sequence or a counter document would remove the risk entirely.
 - The reference cache is per-process. With multiple workers each holds its own copy, so a write on one worker is invisible to another's cache for up to `REFERENCE_CACHE_TTL_SECONDS`. Lower the TTL or move to a shared cache if that matters.
 - Background job state is in-memory: it does not survive restarts, and polling across multiple workers can miss a job. Every job is a recomputation of derived data, so losing one is safe.
-- Every Google integration fails soft. Absent credentials or unauthorized delegation degrade the feature and log a warning rather than raising.
-- Google Meet and Drive require Google Workspace. Domain-wide delegation cannot be configured for personal Gmail accounts.
-- A service account has no Drive storage quota, so Drive uploads must target a Shared Drive.
-- `USE_LOCAL_STORAGE=True` silently overrides `STORAGE_PROVIDER`. Set it to `False` to use the configured provider.
+- Every Azure integration fails soft. A missing connection string or a refused request degrades the feature and logs a warning rather than raising.
+- A class is recorded only when its teacher joins through the LMS call page; a hand-pasted Zoom or Teams link is outside the LMS and cannot be recorded.
+- `/files/<blob>` asks for no sign-in (files open in new tabs and image tags that carry no token); the addresses carry a random part and the read links expire.
+- `USE_LOCAL_STORAGE=True` forces local disk only when `STORAGE_PROVIDER` is not set explicitly.
 - Emails are validated as plain strings and do not depend on `email-validator`.
-- `app/core/security.py` and the `python-jose` dependency exist only for legacy token validation and can be removed once `ALLOW_LEGACY_JWT_LOGIN` is permanently `False`.
+- The Firebase migration fallback (`FIREBASE_WEB_API_KEY`) and the imported-hash check stay in `app/core/identity.py` until every imported password has been upgraded on sign-in.
 
 ---
 
 ## Future Improvements
 
-- **Deploy the backend in the same region as the Firestore database.** This is the single
-  largest remaining performance win: the ~850 ms per-call latency is pure network distance,
-  and it sets the floor for every endpoint no matter how few calls the code makes.
-- Replace timestamp ID generation with Firestore auto-generated IDs or a counter document.
-- Move the reference cache and job registry to a shared store (Redis, Firestore) so they
+- **Keep the App Service in the same region as the Azure SQL database.** Per-call latency is
+  mostly network distance, and it sets the floor for every endpoint no matter how few calls
+  the code makes.
+- Replace timestamp ID generation with a database sequence or a counter document.
+- Move the reference cache and job registry to a shared store (Redis, or the database) so they
   work correctly across multiple server workers.
-- Auto-populate `recording_url` from the Google Meet REST API (`conferenceRecords.recordings.list`), which requires `meet.googleapis.com`, the `meetings.space.created` scope, and a Workspace tier that includes Meet recording.
 - Add comprehensive unit and integration tests.
 - Add request logging, error-handling middleware, and rate limiting.
 - Pin `CORS_ALLOW_ORIGINS` to the exact frontend origins and clear `CORS_ALLOW_ORIGIN_REGEX`,
@@ -1382,6 +1543,6 @@ arithmetic checks by hand (subtotal 9,975 INR; total ₹12,006). Undo with
 
 ## Contact
 
-This backend is a foundation for an LMS, using FastAPI as the web framework, Firebase for identity and storage, and Google Workspace for conferencing and documents.
+This backend is a foundation for an LMS, using FastAPI as the web framework on Azure: Azure SQL for data, Blob Storage for files, and Azure Communication Services for live classes and email.
 
-For issues or extensions, inspect the routers under `app/api/v1/`, the Firestore helpers in `app/core/firebase.py`, and the Google integrations in `app/core/firebase_auth.py`, `app/core/google_meet.py`, and `app/core/google_drive.py`.
+For issues or extensions, inspect the routers under `app/api/v1/`, the collections in `app/core/firebase.py` and `app/core/sqldb.py`, sign-in in `app/core/identity.py`, and the Azure integrations in `app/core/acs.py`, `app/core/azure_blob.py`, and `app/core/mailer.py`.

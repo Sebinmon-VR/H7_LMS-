@@ -14,6 +14,7 @@ for local experimentation.
 import logging
 from datetime import datetime
 
+from app.core import identity
 from app.core.config import settings
 from app.core.enums import UserRole
 from app.core.firebase import (
@@ -21,12 +22,6 @@ from app.core.firebase import (
     firestore_subjects,
     firestore_users,
     generate_id,
-)
-from app.core.firebase_auth import (
-    create_auth_user,
-    get_auth_user_by_email,
-    is_available,
-    set_role_claims,
 )
 
 logger = logging.getLogger("init_db")
@@ -36,53 +31,31 @@ def ensure_bootstrap_admin() -> dict | None:
     """
     Creates the bootstrap administrator if it does not already exist.
 
-    Idempotent and non-destructive: an existing profile is never overwritten, and an
-    existing Firebase account is linked rather than replaced. Safe to run on every startup.
+    Idempotent and non-destructive: an existing profile is never overwritten, and its
+    password is never touched - BOOTSTRAP_ADMIN_PASSWORD is a default that ships in source,
+    and writing it over a password somebody chose would reopen an account they had closed.
+    Safe to run on every startup.
     """
-    email = settings.BOOTSTRAP_ADMIN_EMAIL
+    email = (settings.BOOTSTRAP_ADMIN_EMAIL or "").strip().lower()
     if not email:
         logger.warning("BOOTSTRAP_ADMIN_EMAIL is not set; skipping admin bootstrap.")
         return None
 
     existing = firestore_users.get_document_by_field("email", email)
     if existing:
-        # Repair a profile whose Firebase link is missing, which otherwise blocks sign-in.
-        if not existing.get("firebase_uid") and is_available():
-            record = get_auth_user_by_email(email)
-            uid = record.uid if record else create_auth_user(
-                email, settings.BOOTSTRAP_ADMIN_PASSWORD, settings.BOOTSTRAP_ADMIN_NAME
-            )
-            if uid:
-                firestore_users.add_document(str(existing["id"]), {"firebase_uid": uid})
-                set_role_claims(uid, UserRole.ADMIN.value, int(existing["id"]))
-                logger.info("Linked bootstrap admin '%s' to Firebase uid %s.", email, uid)
         return existing
-
-    if not is_available():
-        logger.warning(
-            "Firebase Auth unavailable; cannot bootstrap admin '%s'. "
-            "Run scripts/provision_auth_user.py once credentials are configured.", email
-        )
-        return None
-
-    firebase_uid = create_auth_user(
-        email, settings.BOOTSTRAP_ADMIN_PASSWORD, settings.BOOTSTRAP_ADMIN_NAME
-    )
-    if not firebase_uid:
-        logger.error("Could not create the Firebase account for bootstrap admin '%s'.", email)
-        return None
 
     user_id = generate_id()
     admin = {
         "full_name": settings.BOOTSTRAP_ADMIN_NAME,
         "email": email,
-        "firebase_uid": firebase_uid,
         "role": UserRole.ADMIN.value,
         "is_active": True,
         "created_at": datetime.utcnow().isoformat(),
     }
     firestore_users.add_document(str(user_id), admin)
-    set_role_claims(firebase_uid, UserRole.ADMIN.value, user_id)
+    if settings.BOOTSTRAP_ADMIN_PASSWORD:
+        identity.set_password(user_id, settings.BOOTSTRAP_ADMIN_PASSWORD, source="bootstrap", revoke=False)
 
     admin["id"] = user_id
     logger.info("Created bootstrap administrator: %s", email)

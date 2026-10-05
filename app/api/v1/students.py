@@ -138,7 +138,8 @@ def get_student_live_meetings(
     current_user: UserOut = Depends(require_student)
 ):
     """
-    [Student Only] View live meeting links (e.g. Google Meet) and recorded lecture URLs for enrolled class.
+    [Student Only] View live meeting links (the in-LMS call page, or a pasted Zoom/Teams
+    link) and recorded lecture URLs for enrolled class.
     """
     enrollment = next(
         (e for e in firestore_student_enrollments.query_documents("student_id", "==", current_user.id)),
@@ -152,7 +153,19 @@ def get_student_live_meetings(
         meetings = [m for m in meetings if m.get("subject_id") == subject_id]
     meetings.sort(key=lambda m: m.get("scheduled_time"), reverse=True)
     prefetch_academic(meetings)
-    return [LiveMeetingOut(**hydrate_live_meeting(meeting)) for meeting in meetings]
+    return [LiveMeetingOut(**_student_view(hydrate_live_meeting(meeting))) for meeting in meetings]
+
+
+def _student_view(meeting: dict) -> dict:
+    """
+    A session as a student sees it: a class recording appears only once its teacher has
+    published it. A link the teacher pasted by hand is theirs to share and always shows.
+    """
+    stored = meeting.get("recording_files") or []
+    from_recording = bool(stored) or meeting.get("recording_status") in {"RECORDING", "WAITING", "STORED"}
+    if from_recording and not meeting.get("recording_published"):
+        return {**meeting, "recording_url": None, "recording_files": None, "recording_status": None}
+    return meeting
 
 
 @router.get("/materials", response_model=List[StudyMaterialOut])

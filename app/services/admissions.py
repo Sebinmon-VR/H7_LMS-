@@ -368,7 +368,7 @@ def year_for_date(on: date, program: str = Program.LMS.value) -> dict | None:
         2. the narrowest range, as the more specific answer
         3. the latest start, purely so the result is deterministic
 
-    Without this the answer depended on Firestore's return order, which meant the same invoice
+    Without this the answer depended on the database's return order, which meant the same invoice
     could price against different years on two runs.
     """
     wanted = on.isoformat()

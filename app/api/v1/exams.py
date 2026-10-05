@@ -235,7 +235,7 @@ async def upload_question_paper(
     [Teacher / Admin] Upload the question paper for an OFFLINE exam.
 
     Stored on the configured backend exactly like a study material. Check `question_paper_provider`
-    on the response: if it reads LOCAL when Drive or Cloud Storage was configured,
+    on the response: if it reads LOCAL when Azure Blob Storage was configured,
     `question_paper_warning` says what went wrong.
     """
     exam = _managed_exam(exam_id, current_user)

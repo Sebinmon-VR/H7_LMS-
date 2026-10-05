@@ -234,8 +234,8 @@ class TuitionSlotCreate(BaseModel):
     is_active: bool = True
     meeting_link: str | None = Field(
         None, max_length=2048,
-        description="A standing link for this slot - Meet, Zoom, Teams. When omitted each "
-                    "class gets its own Google Meet on demand.",
+        description="A standing link for this slot - Zoom, Teams, any external room. When "
+                    "omitted each class gets its own live-class room in the LMS.",
     )
     auto_create_meet: bool = True
 
@@ -508,7 +508,7 @@ class LibraryItemBase(BaseModel):
 
 class LibraryLinkCreate(LibraryItemBase):
     """
-    Shares a link rather than a file - a publisher's page, a video, a Drive folder.
+    Shares a link rather than a file - a publisher's page, a video, a shared folder.
 
     Better than uploading a copy of something already on the web: a copy goes stale, costs
     storage, and loses the source.
@@ -990,8 +990,8 @@ class ProgramSettingsUpdate(BaseModel):
     student_uploads_need_approval: bool | None = None
     currency: str | None = Field(None, max_length=8)
     auto_create_meet: bool | None = None
-    # LMS only. One standing Meet room per class that every subject teacher joins at their
-    # period, instead of a fresh link per scheduled session.
+    # LMS only. One standing live-class room per class that every subject teacher joins at
+    # their period, instead of a fresh link per scheduled session.
     class_room_mode: bool | None = None
 
 

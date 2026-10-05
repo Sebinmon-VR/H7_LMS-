@@ -30,5 +30,8 @@ class StudyMaterialOut(BaseModel):
     # Set when the configured provider could not be used and the file landed elsewhere,
     # so an upload that quietly fell back to local disk is visible in the response.
     storage_warning: str | None = None
+    # Set on a class recording published into the library (material_type RECORDING): the
+    # recording it came from. Deleting such a material unpublishes it and keeps the video.
+    recording_key: str | None = None
 
     model_config = ConfigDict(from_attributes=True)

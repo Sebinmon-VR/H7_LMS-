@@ -5,7 +5,7 @@ This is the LMS reminder design applied to one-to-one classes, and it keeps the 
 properties that matter, because the failure mode of a reminder system is not silence - it is
 spam:
 
-  * **Exactly once.** Before sending, the sweep *claims* a Firestore document keyed by
+  * **Exactly once.** Before sending, the sweep *claims* a database document keyed by
     (session, offset, recipient) with an atomic create. A second worker, a restart mid-sweep,
     or two overlapping sweeps all lose the race and skip. The claim is written before the
     email goes out, so the worst case is a dropped reminder rather than a duplicate - the
@@ -217,7 +217,7 @@ class TuitionScheduler:
     needlessly delicate.
 
     Each server worker runs its own, which is safe for exactly the reason it is safe in the
-    LMS: the Firestore claim makes duplicate delivery impossible.
+    LMS: the database claim makes duplicate delivery impossible.
     """
 
     def __init__(self) -> None:

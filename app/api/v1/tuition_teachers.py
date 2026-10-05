@@ -200,10 +200,10 @@ def create_or_replace_meeting_link(
     """
     [Tuition Teacher] Get the class a link, or replace it with your own.
 
-    With a body, your link is used as-is - Zoom, Teams, a permanent Meet room - and is never
-    overwritten afterwards. Without one, a Google Meet is generated on the spot. Meet links
-    are made on demand rather than for every class in the calendar, so a month of scheduled
-    classes does not become a month of Calendar API calls for classes that may never happen.
+    With a body, your link is used as-is - Zoom, Teams, any permanent room - and is never
+    overwritten afterwards. Without one, the class gets its live-class room in the LMS
+    (/call/tuition/<id>) on the spot. The ACS room behind it is made only when somebody first
+    joins, so a month of scheduled classes costs nothing for classes that never happen.
     """
     record = session_service.require_session(session_id)
     session_service.assert_is_teacher_of(record, current_user)

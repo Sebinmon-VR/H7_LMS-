@@ -414,6 +414,39 @@ class UnmatchedStructure(BaseModel):
     reasons: list[str] = Field(default_factory=list)
 
 
+class CurrencyOptionOut(BaseModel):
+    """
+    One row of the payer's currency switcher.
+
+    Not just a code: each currency carries its own tax and surcharge, and a payer choosing
+    between INR and AED should see that AED adds VAT and a card fee *before* choosing it.
+    `recommended` marks the base currency - the one the fees were set in and the only one
+    with no conversion - so the page can preselect it and label it as suggested.
+
+    `total_amount` and its parts are present on a fee breakdown, where the same classes have
+    been priced in every offered currency; absent on the settings screen.
+    """
+    code: str
+    symbol: str | None = None
+    is_base: bool = False
+    recommended: bool = False
+    rate_from_base: float = 1.0
+    rate_status: str | None = None
+    tax_enabled: bool = False
+    tax_percent: float = 0.0
+    tax_label: str = "Tax"
+    tax_inclusive: bool = False
+    convenience_percent: float = 0.0
+    convenience_amount: float = 0.0
+    rounding: str = "NONE"
+    # "GST 18% + 2% convenience" - ready to print beside the option.
+    charges_summary: str | None = None
+    subtotal: float | None = None
+    tax_total: float | None = None
+    convenience_total: float | None = None
+    total_amount: float | None = None
+
+
 class FeeBreakdownOut(BaseModel):
     """
     Everything a student owes, fully derived. The payment page's data.
@@ -702,39 +735,6 @@ class FinanceSettingsUpdate(BaseModel):
 # ---------------------------------------------------------------------------------------
 # Currency settings
 # ---------------------------------------------------------------------------------------
-
-class CurrencyOptionOut(BaseModel):
-    """
-    One row of the payer's currency switcher.
-
-    Not just a code: each currency carries its own tax and surcharge, and a payer choosing
-    between INR and AED should see that AED adds VAT and a card fee *before* choosing it.
-    `recommended` marks the base currency - the one the fees were set in and the only one
-    with no conversion - so the page can preselect it and label it as suggested.
-
-    `total_amount` and its parts are present on a fee breakdown, where the same classes have
-    been priced in every offered currency; absent on the settings screen.
-    """
-    code: str
-    symbol: str | None = None
-    is_base: bool = False
-    recommended: bool = False
-    rate_from_base: float = 1.0
-    rate_status: str | None = None
-    tax_enabled: bool = False
-    tax_percent: float = 0.0
-    tax_label: str = "Tax"
-    tax_inclusive: bool = False
-    convenience_percent: float = 0.0
-    convenience_amount: float = 0.0
-    rounding: str = "NONE"
-    # "GST 18% + 2% convenience" - ready to print beside the option.
-    charges_summary: str | None = None
-    subtotal: float | None = None
-    tax_total: float | None = None
-    convenience_total: float | None = None
-    total_amount: float | None = None
-
 
 class CurrencyConfigOut(BaseModel):
     """

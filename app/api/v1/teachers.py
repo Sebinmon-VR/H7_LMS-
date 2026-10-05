@@ -3,11 +3,11 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status, Query
 
 from app.api.v1.dependencies import require_teacher
-from app.core import google_meet
+from app.core import acs
 from app.core.enums import DayOfWeek
 import uuid
 
-from app.core.gcp_services import StorageError, storage_service
+from app.core.storage import StorageError, storage_service
 from app.core.firebase import (
     firestore_attendance, firestore_topics, firestore_meetings,
     firestore_materials, firestore_grades,
@@ -143,7 +143,7 @@ def mark_attendance(
 ):
     """
     [Teacher Only - Independent] Mark attendance for students in a class and subject for a date.
-    Syncs records to Firebase Cloud Firestore database.
+    Saves the records to the database.
     """
     created_records = []
     for item in batch_in.attendance_list:
@@ -253,7 +253,7 @@ def log_topic_covered(
 ):
     """
     [Teacher Only - Independent] Log covered portion/topic for a class and subject.
-    Syncs to Firebase Cloud Firestore collection.
+    Saves the topic to the database.
     """
     topic_id = firestore_topics.get_next_numeric_id()
     topic_data = {
@@ -382,7 +382,7 @@ def delete_topic_covered(
 # ------------------------------------------------------------------ topic attachments
 #
 # Notes, images and voice clips a teacher hangs on a logged topic. They live where study
-# materials do (Drive, Cloud Storage or the server disk), under the class's folder, and
+# materials do (Blob storage or the server disk), under the class's folder, and
 # are listed on the topic itself so students see them in their syllabus.
 
 MAX_TOPIC_ATTACHMENTS = 10
@@ -490,11 +490,10 @@ def create_live_meeting(
     """
     [Teacher Only - Independent] Schedule a live class session.
 
-    When `auto_create_meet` is set and no manual `meeting_link` is supplied, a real Google
-    Calendar event with an attached Meet link is created on the teacher's calendar, and
-    enrolled students are invited. If Meet generation is unavailable the meeting is still
-    saved so the schedule is never lost, and `meet_status`/`meet_error` on the response say
-    exactly why no link came back.
+    When `auto_create_meet` is set and no manual `meeting_link` is supplied, the session gets
+    a live-class room in the LMS (or joins its class's shared room). If live classes are not
+    configured the meeting is still saved so the schedule is never lost, and
+    `meet_status`/`meet_error` on the response say exactly why no link came back.
     """
     meeting_data = schedule_meeting(
         meeting_in,
@@ -531,9 +530,8 @@ def update_live_meeting(
     current_user: UserOut = Depends(require_teacher)
 ):
     """
-    [Teacher Only] Reschedule or edit a meeting.
-    Title and time changes propagate to the backing Google Calendar event, so invited
-    students see the update on their own calendars.
+    [Teacher Only] Reschedule or edit a meeting. The join link is unchanged; the class's
+    room follows the new time on its own.
     """
     meeting = require_document(firestore_meetings, meeting_id, "Meeting")
     assert_owner(meeting, current_user, "meetings")
@@ -545,17 +543,6 @@ def update_live_meeting(
     if "scheduled_time" in updated:
         updated["scheduled_time"] = updated["scheduled_time"].isoformat()
 
-    google_event_id = meeting.get("google_event_id")
-    if google_event_id and ("title" in updated or "scheduled_time" in updated):
-        google_meet.update_meeting(
-            teacher_email=current_user.email,
-            event_id=google_event_id,
-            calendar_id=meeting.get("google_calendar_id"),
-            title=update_in.title,
-            scheduled_time=update_in.scheduled_time,
-            duration_minutes=update_in.duration_minutes or meeting.get("duration_minutes") or 60,
-        )
-
     firestore_meetings.add_document(str(meeting_id), updated)
     return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
 
@@ -566,19 +553,11 @@ def delete_live_meeting(
     current_user: UserOut = Depends(require_teacher)
 ):
     """
-    [Teacher Only] Cancel a meeting.
-    The backing Google Calendar event is deleted too, so attendees are notified.
+    [Teacher Only] Cancel a meeting. Its live-class room goes with it.
     """
     meeting = require_document(firestore_meetings, meeting_id, "Meeting")
     assert_owner(meeting, current_user, "meetings")
-
-    google_event_id = meeting.get("google_event_id")
-    if google_event_id:
-        google_meet.delete_meeting(
-            teacher_email=current_user.email,
-            event_id=google_event_id,
-            calendar_id=meeting.get("google_calendar_id"),
-        )
+    acs.delete_room(meeting.get("acs_room_id"))
 
     firestore_meetings.delete_document(str(meeting_id))
     return None
@@ -590,24 +569,14 @@ def sync_meeting_recording(
     current_user: UserOut = Depends(require_teacher),
 ):
     """
-    [Teacher Only] Fetch this session's recording now rather than waiting for the sweep.
+    [Teacher Only] File this session's recording now rather than waiting for the sweep.
 
-    Recordings are collected automatically a few minutes after each class ends, so this is
-    for the impatient case - a teacher who has just finished and wants the video in front of
-    the class. A recording Meet is still processing comes back with `recording_status`
+    Recordings are filed on their own as soon as ACS finishes writing them, so this is for
+    the impatient case. A recording still being written comes back with `recording_status`
     WAITING, and calling again later is free: an already-filed video is never filed twice.
     """
     meeting = require_document(firestore_meetings, meeting_id, "Meeting")
     assert_owner(meeting, current_user, "meetings")
-
-    if not (meeting.get("meet_space_name") or meeting.get("meet_meeting_code")):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "This meeting has no Google Meet conference behind it, so there is no "
-                "recording to collect. Only sessions with a generated Meet link are recorded."
-            ),
-        )
 
     harvest_meeting(meeting)
     return LiveMeetingOut(**hydrate_live_meeting(firestore_meetings.get_document(str(meeting_id))))
@@ -625,10 +594,9 @@ async def upload_study_material(
     """
     [Teacher Only - Independent] Upload notes, books, or study materials.
 
-    Saves the file to the configured backend (Cloud Storage, Workspace Shared Drive, or
-    local disk), records which backend was used, and syncs the entry to Firebase. Check
-    `storage_provider` on the response: if it reads LOCAL when Drive or GCS was configured,
-    `storage_warning` explains what went wrong with the cloud upload.
+    Saves the file to the configured backend (Azure Blob Storage, or local disk) and records
+    which backend was used. Check `storage_provider` on the response: if it reads LOCAL when
+    Blob storage was configured, `storage_warning` explains what went wrong with the upload.
     """
     material_data = await store_material(
         file=file,
@@ -688,10 +656,19 @@ def delete_study_material(
 ):
     """
     [Teacher Only] Delete an uploaded study material.
-    The underlying file in Cloud Storage or Drive is removed too unless `keep_file=true`.
+    The underlying file in cloud storage is removed too unless `keep_file=true`.
     """
     material = require_document(firestore_materials, material_id, "Study material")
     assert_owner(material, current_user, "study materials")
+
+    # A published class recording: removing it from the library unpublishes it, and the
+    # video stays with the teacher's recordings.
+    if material.get("recording_key"):
+        from app.services import recordings
+
+        recordings.material_removed(material)
+        firestore_materials.delete_document(str(material_id))
+        return None
 
     if not keep_file:
         storage_service.delete_file(
@@ -710,7 +687,7 @@ def submit_exam_grade(
 ):
     """
     [Teacher Only - Independent] Enter subject exam/evaluation mark for a student.
-    Syncs entry to Firebase Cloud Firestore collection.
+    Saves the entry to the database.
     """
     grade_id = firestore_grades.get_next_numeric_id()
     grade_data = {

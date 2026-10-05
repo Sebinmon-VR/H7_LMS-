@@ -330,7 +330,7 @@ def resolve_structure(student: dict, academic_year_id, program: str = Program.LM
         return None
 
     # Ties broken by priority, then by the newer document. Arbitrary but stated - better
-    # than whichever Firestore happened to return first.
+    # than whichever the database happened to return first.
     candidates.sort(
         key=lambda s: (_specificity(s), int(s.get("priority") or 0), int(s.get("id") or 0)),
         reverse=True,

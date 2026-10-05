@@ -21,14 +21,41 @@ class Settings(BaseSettings):
     DEBUG: bool = True
 
     # Security & JWT Authentication settings
+    # SECRET_KEY signs every session token and password-reset link. Changing it signs
+    # everybody out, which is also the way to do that deliberately.
     SECRET_KEY: str = "lms_super_secret_development_key_change_in_production_32bytes"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours duration
 
-    # Authentication provider settings
-    AUTH_PROVIDER: str = "FIREBASE"          # FIREBASE | LEGACY_JWT
-    ALLOW_LEGACY_JWT_LOGIN: bool = True      # Transition flag; disable once all clients send Firebase ID tokens
-    FIREBASE_WEB_API_KEY: str = ""           # Only used by the dev-only password login helper endpoints
+    # ------------------------------------------------------------------------------
+    # Sign-in is owned by this backend (app.core.identity): password hashes live in the
+    # `user_credentials` collection and sessions are tokens it signs itself. Firebase Auth
+    # held both until the Google Workspace was retired; the settings below only exist to
+    # carry people across that move without a password reset.
+    # ------------------------------------------------------------------------------
+    # How long a "forgot password" link stays usable.
+    PASSWORD_RESET_TOKEN_MINUTES: int = 60
+    PASSWORD_MIN_LENGTH: int = 8
+    # Failed sign-ins allowed per address in LOGIN_LOCKOUT_MINUTES before further attempts are
+    # refused for the rest of that window. Firebase did this for us; now it is ours to do.
+    LOGIN_MAX_FAILURES: int = 10
+    LOGIN_LOCKOUT_MINUTES: int = 15
+    # Migration fallback. While set, somebody with no password stored here yet is checked
+    # against Firebase Auth's REST sign-in, and on success their password is stored here - so
+    # an account the import script missed still moves over on its owner's next sign-in.
+    # Leave blank once every account has been imported (scripts/import_firebase_passwords.py).
+    FIREBASE_WEB_API_KEY: str = ""
+    # Signature parameters of the imported Firebase password hashes. Filled from the project's
+    # own hash config by the import script; needed for as long as any imported hash has not
+    # yet been upgraded (each is re-hashed natively on its owner's first sign-in).
+    FIREBASE_HASH_SIGNER_KEY: str = ""
+    FIREBASE_HASH_SALT_SEPARATOR: str = ""
+    FIREBASE_HASH_ROUNDS: int = 8
+    FIREBASE_HASH_MEM_COST: int = 14
+    # Where people use the LMS - the frontend's origin, e.g. https://lms.example.com. Links
+    # in emails (password reset, a class's join link) are built from it. Falls back to
+    # LMS_LOGIN_URL with its path removed.
+    LMS_APP_URL: str = ""
 
     # Browser origins allowed to call the API.
     # The frontend sends `Authorization: Bearer <token>`, which makes every request
@@ -63,44 +90,35 @@ class Settings(BaseSettings):
     BOOTSTRAP_ADMIN_NAME: str = "System Administrator"
     SEED_DEMO_DATA: bool = False             # Demo classes/subjects/students; off by default
 
-    # Database Configuration Settings
-    DATABASE_PROVIDER: str = "FIREBASE_FIRESTORE"  # Primary database provider
-    DATABASE_URL: str = "sqlite:///./lms.db"       # Secondary local relational fallback
-
     # Performance tuning
-    # Firestore round trips dominate response time from outside the database's region
-    # (~850ms each), so reference data is cached and independent queries run concurrently.
+    # Database round trips dominate response time, so reference data is cached and
+    # independent queries run concurrently.
     REFERENCE_CACHE_TTL_SECONDS: float = 60.0
     QUERY_CONCURRENCY: int = 8
     MONITORING_REPORT_TTL_SECONDS: float = 300.0
 
-    # Google Cloud & Firebase Integration Settings
+    # The retired Google project, for the read-only tools that still look at it: the frozen
+    # Firestore backup (scripts/migrate_firestore_to_sql.py) and the one-off password import
+    # (scripts/import_firebase_passwords.py). Nothing the server does at runtime uses these;
+    # leave them unset on App Service.
     GCP_PROJECT_ID: str = "lms-demo-project"
-    GCP_BUCKET_NAME: str = "lms-study-materials-bucket"
     GOOGLE_APPLICATION_CREDENTIALS: str = "./service_account.json"
     FIREBASE_CREDENTIALS_PATH: str = "./firebase_credentials.json"
-    # The service account key as a *value* rather than a file, for hosts where there is no
-    # credentials file to point at. The deployment artifact is built from a repository
-    # checkout and the key files are gitignored, so on App Service the paths above resolve
-    # to nothing and every Firestore read silently returns empty. Set this application
-    # setting to the contents of firebase_credentials.json (raw JSON on one line, or the
-    # same bytes base64-encoded) and it is written to a private temp file at startup that
-    # the two path settings then point at.
+    # The same key as a value rather than a file, written to a private temp file at startup
+    # when set. Kept for those tools on a host with no key file; not needed by the server.
     FIREBASE_CREDENTIALS_JSON: str = ""
-    USE_FIREBASE_DB: bool = True
     USE_LOCAL_STORAGE: bool = False
     LOCAL_STORAGE_DIR: str = "./uploads"
 
     # ------------------------------------------------------------------------------
     # Which database holds the documents.
     #
-    # `firestore` is the original. `azuresql` keeps the same document model - one JSON
-    # document per row, one table per collection - inside an Azure SQL database, in a
-    # schema of its own so it can share a server with other applications without touching
-    # their tables. Every service reads and writes through the same interface either way;
-    # see `app.core.sqldb`. Firebase Auth still issues logins whichever is chosen.
+    # `azuresql` keeps the document model - one JSON document per row, one table per
+    # collection - inside an Azure SQL database, in a schema of its own so it can share a
+    # server with other applications without touching their tables; see `app.core.sqldb`.
+    # `firestore` was the original, and is kept only to read the frozen pre-Azure backup.
     # ------------------------------------------------------------------------------
-    DATABASE_BACKEND: str = "firestore"       # firestore | azuresql
+    DATABASE_BACKEND: str = "azuresql"        # azuresql | firestore (the frozen pre-Azure backup)
     DB_SERVER: str = ""                       # e.g. myserver.database.windows.net
     DB_NAME: str = ""
     DB_USER: str = ""
@@ -111,81 +129,68 @@ class Settings(BaseSettings):
     # A full ODBC connection string overrides the five fields above when set.
     DB_CONNECTION_STRING: str = ""
 
-    # Google Workspace integration settings (requires domain-wide delegation)
-    GOOGLE_WORKSPACE_DOMAIN: str = ""
-    GOOGLE_IMPERSONATION_FALLBACK: str = ""  # Workspace user impersonated when a teacher email is unusable
-    ENABLE_GOOGLE_MEET: bool = True
-    GOOGLE_CALENDAR_ID: str = "primary"
-    # Calendar rejects a naive dateTime unless a timeZone accompanies it, so every event
-    # carries this IANA zone. Times that already include a UTC offset keep their own.
+    # Retained only as the fallback for SCHOOL_TIMEZONE on deployments that set nothing else;
+    # the Google Workspace integration that introduced it is gone.
     GOOGLE_CALENDAR_TIMEZONE: str = "Asia/Dubai"
-    # Turn off on a non-Workspace project: the service account then writes to a calendar
-    # shared directly with it instead of impersonating a user (which requires delegation).
-    GOOGLE_CALENDAR_IMPERSONATION: bool = True
-    # Comma-separated OAuth scopes to request for Calendar. Leave blank to let the client
-    # probe the usual candidates and settle on whichever set delegation actually grants:
-    # Google fails the whole token exchange if *any* requested scope is unauthorized, so
-    # asking for more than was authorized breaks a working setup.
-    GOOGLE_CALENDAR_SCOPES: str = ""
-    # Invite enrolled students as Calendar attendees. Non-Workspace projects cannot invite
-    # external guests, so this can be turned off without losing the Meet link itself.
-    GOOGLE_MEET_INVITE_ATTENDEES: bool = True
+    # The school's own email domain, used for generated login addresses when USER_EMAIL_DOMAIN
+    # is blank. Named for the Workspace it once belonged to.
+    GOOGLE_WORKSPACE_DOMAIN: str = ""
 
-    # Automatic class recording (Google Meet REST API v2).
+    # ------------------------------------------------------------------------------
+    # Live classes: Azure Communication Services (app.core.acs)
     #
-    # Every generated Meet conference is configured to record itself, so a teacher never has
-    # to remember to press record. Requires the Meet API enabled on the GCP project, the
-    # meetings.space.settings and meetings.space.readonly scopes authorized for the service
-    # account under domain-wide delegation, and a Workspace edition that can record at all
-    # (Business Standard/Plus, Enterprise, Education Plus, Teaching & Learning Upgrade).
-    ENABLE_MEET_AUTO_RECORDING: bool = True
-    # Who may walk into a generated Meet without asking. OPEN: anyone with the link; TRUSTED
-    # (Google's default): the organiser, invited guests and the school's own Workspace users;
-    # RESTRICTED: invited guests only. Blank leaves Google's default alone.
+    # Every live class happens inside the LMS itself. A class, a scheduled session and a
+    # tuition class each get an ACS *room*; the LMS decides who may enter (the same join
+    # windows as before), adds them to the room with the right role, and hands their browser
+    # a short-lived token. Nobody needs a Microsoft or Google account, so teachers and
+    # students keep signing in with whatever address the school gave them.
+    # ------------------------------------------------------------------------------
+    # From the Communication Services resource: Settings -> Keys -> Connection string.
+    ACS_CONNECTION_STRING: str = ""
+    ENABLE_ACS_CALLING: bool = True
+    # How long a room is valid for. ACS allows up to 180 days; a standing class room is
+    # extended automatically when somebody joins inside the last RENEW window.
+    ACS_ROOM_VALIDITY_DAYS: int = 180
+    ACS_ROOM_RENEW_DAYS: int = 14
+    # Lifetime of the calling token a browser receives. The page asks for a fresh one when it
+    # runs out, so this only bounds how long a leaked token is any use.
+    ACS_TOKEN_HOURS: int = 6
+
+    # Automatic class recording (ACS Call Recording).
     #
-    # OPEN, because teachers and students sign into Google with personal addresses the LMS
-    # does not know, so a guest list cannot let them in and TRUSTED makes them knock on their
-    # own class. Set on the space through the Meet API, which needs the
-    # meetings.space.settings scope authorised under domain-wide delegation - the same grant
-    # recording needs. Until it is, the room's `room_access_error` says exactly what to add.
-    MEET_ACCESS_TYPE: str = "OPEN"
-    # Comma-separated override for the Meet OAuth scopes, in the same spirit as
-    # GOOGLE_CALENDAR_SCOPES: leave blank to let the client settle on whichever set the
-    # delegation grant actually authorizes.
-    MEET_RECORDING_SCOPES: str = ""
-    # Meet writes the video into the meeting organiser's own Drive. What the LMS then does
-    # with it: MOVE it into the Shared Drive (organisation-owned, no duplicate storage),
-    # COPY it there (the teacher keeps the original), or LINK to it where it lies.
-    RECORDING_TRANSFER_MODE: str = "MOVE"
-    # Folder under the Drive root that holds the per-class recording folders.
-    RECORDING_DRIVE_FOLDER_NAME: str = "Class Recordings"
-    # Grant each enrolled student read access to their class's recording.
-    RECORDING_SHARE_WITH_STUDENTS: bool = True
-    # How long after a session's scheduled end to start looking for its recording. Meet needs
-    # a few minutes to finish writing the file, and asking sooner just burns quota.
-    RECORDING_HARVEST_DELAY_MINUTES: int = 5
-    # How often the background sweep looks for finished sessions whose recording has landed.
-    RECORDING_SCAN_INTERVAL_SECONDS: float = 300.0
+    # A session set to record starts recording when its teacher's call connects and stops when
+    # they leave. ACS announces each finished file through Event Grid; the webhook at
+    # /api/v1/calls/events copies it into Blob storage and attaches it to the session. Needs an
+    # Event Grid subscription on the Communication resource for
+    # Microsoft.Communication.RecordingFileStatusUpdated pointing at that URL with
+    # ?key=<ACS_EVENTS_KEY>.
+    ENABLE_AUTO_RECORDING: bool = True
+    ACS_EVENTS_KEY: str = ""
+    # Blob folder the finished videos are filed under, one sub-folder per class.
+    RECORDING_FOLDER_NAME: str = "recordings"
     # A session with no recording this long after it ended is marked UNAVAILABLE and stops
-    # being polled - a class nobody attended produces no recording, and retrying it forever
-    # would cost a Meet API call per sweep for the life of the deployment.
+    # being looked at - a class nobody taught produces no recording.
     RECORDING_MAX_AGE_HOURS: int = 48
+    # A recording nobody stopped (the teacher's browser died) is stopped after this long.
+    RECORDING_MAX_MINUTES: int = 180
+    # How often the background sweep retries failed copies and closes stale recordings.
+    RECORDING_SCAN_INTERVAL_SECONDS: float = 300.0
 
-    # Storage backend selection
-    STORAGE_PROVIDER: str = "GCS"            # GCS | DRIVE | LOCAL
-    GOOGLE_DRIVE_SHARED_DRIVE_ID: str = ""
-    # Alternative to a Shared Drive: the ID of an ordinary Drive folder shared with the
-    # service account (or owned by GOOGLE_IMPERSONATION_FALLBACK when impersonating).
-    GOOGLE_DRIVE_FOLDER_ID: str = ""
-    GOOGLE_DRIVE_ROOT_FOLDER_NAME: str = "H7 LMS Materials"
-    # Impersonate GOOGLE_IMPERSONATION_FALLBACK for Drive calls. Required when uploading
-    # into a My Drive folder (a bare service account has no personal Drive quota).
-    GOOGLE_DRIVE_IMPERSONATION: bool = True
-    # Grant "anyone with the link can view" on uploads so students can open a material
-    # without a Workspace account. Turn off for domain-only distribution.
-    GOOGLE_DRIVE_LINK_SHARING: bool = True
-    # When True an upload that cannot reach the configured cloud provider returns 502
-    # instead of quietly landing on the API server's local disk.
+    # ------------------------------------------------------------------------------
+    # File storage: Azure Blob Storage (app.core.azure_blob)
+    #
+    # Files are private blobs. What the database stores is an LMS path, /files/<blob>, which
+    # the API answers with a redirect to a short-lived read link - so a link copied out of the
+    # app stops working within the hour, and the storage account itself stays private.
+    # ------------------------------------------------------------------------------
+    STORAGE_PROVIDER: str = "AZURE_BLOB"     # AZURE_BLOB | LOCAL
+    # Storage account -> Security + networking -> Access keys -> Connection string.
+    AZURE_STORAGE_CONNECTION_STRING: str = ""
+    AZURE_STORAGE_CONTAINER: str = "lms-files"
+    # Lifetime of the read link /files/<blob> redirects to.
+    AZURE_BLOB_LINK_MINUTES: int = 60
+    # When True an upload that cannot reach Blob storage returns 502 instead of quietly
+    # landing on the API server's local disk.
     STORAGE_STRICT: bool = False
 
     # Timetable and class reminders.
@@ -200,7 +205,7 @@ class Settings(BaseSettings):
     # How often the background sweep looks for periods entering a reminder window. Must be
     # smaller than the tightest reminder offset or a window can be stepped over entirely.
     # Five minutes rather than two. Each sweep reads the timetable and the enrolments of
-    # every class in its window, and on Firestore's free tier that alone was most of the
+    # every class in its window, and on the old Firestore free tier that alone was most of the
     # day's read quota. The lead time is measured from the class, so a slower sweep only
     # moves when a reminder goes out by up to the interval, never whether it goes out.
     REMINDER_SCAN_INTERVAL_SECONDS: float = 300.0
@@ -235,16 +240,18 @@ class Settings(BaseSettings):
         return sorted(offsets, reverse=True) or [15]
 
     @property
-    def recording_transfer_mode(self) -> str:
-        """
-        What to do with a finished recording: MOVE, COPY or LINK.
+    def resolved_app_url(self) -> str:
+        """The frontend's origin, for links in emails. Blank when neither setting is given."""
+        explicit = (self.LMS_APP_URL or "").strip().rstrip("/")
+        if explicit:
+            return explicit
+        login = (self.LMS_LOGIN_URL or "").strip()
+        if not login:
+            return ""
+        from urllib.parse import urlsplit
 
-        An unrecognised value falls back to MOVE rather than raising. A typo here would
-        otherwise take down the whole recording sweep, and the safe reading of "the school
-        wants recordings in its Drive" is to put them there.
-        """
-        mode = (self.RECORDING_TRANSFER_MODE or "").strip().upper()
-        return mode if mode in {"MOVE", "COPY", "LINK"} else "MOVE"
+        parts = urlsplit(login)
+        return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
 
     # Credential provisioning.
     # Admins create users by name; the login email is derived as firstname.lastname@domain
@@ -253,10 +260,20 @@ class Settings(BaseSettings):
     GENERATED_PASSWORD_LENGTH: int = 12
     LMS_LOGIN_URL: str = ""                  # Included in the credentials email when set
 
-    # Outbound email (Gmail / Google Workspace SMTP).
-    # SMTP_PASSWORD must be a Google App Password, not the account password.
+    # Outbound email.
+    #
+    # ACS (default when configured): Azure Communication Services Email, through the same
+    # Communication resource the live classes use once an email domain is connected to it.
+    # ACS_EMAIL_SENDER is the MailFrom address of that domain, e.g.
+    # DoNotReply@<guid>.azurecomm.net for the Azure-managed domain.
+    # SMTP: any relay (smtp.office365.com, SendGrid, ...), for a school that has one.
     ENABLE_EMAIL_NOTIFICATIONS: bool = True
-    SMTP_HOST: str = "smtp.gmail.com"
+    EMAIL_PROVIDER: str = ""                 # ACS | SMTP; blank picks whichever is configured
+    # Defaults to ACS_CONNECTION_STRING: the email domain is usually connected to the same
+    # resource that hosts the rooms.
+    ACS_EMAIL_CONNECTION_STRING: str = ""
+    ACS_EMAIL_SENDER: str = ""
+    SMTP_HOST: str = ""
     SMTP_PORT: int = 587                     # 587 = STARTTLS, 465 = implicit TLS
     SMTP_USE_TLS: bool = True
     SMTP_USER: str = ""
@@ -268,8 +285,8 @@ class Settings(BaseSettings):
     @property
     def resolved_user_email_domain(self) -> str:
         """
-        Domain used for generated login emails. Prefers the dedicated setting so LMS
-        accounts can live on a different domain than the Workspace integration.
+        Domain used for generated login emails: USER_EMAIL_DOMAIN, else the school's domain
+        as GOOGLE_WORKSPACE_DOMAIN recorded it.
         """
         return (self.USER_EMAIL_DOMAIN or self.GOOGLE_WORKSPACE_DOMAIN or "").strip().lstrip("@")
 
@@ -287,7 +304,12 @@ class Settings(BaseSettings):
         explicit = "STORAGE_PROVIDER" in self.model_fields_set
         if self.USE_LOCAL_STORAGE and not explicit:
             return "LOCAL"
-        return (self.STORAGE_PROVIDER or "GCS").upper()
+        provider = (self.STORAGE_PROVIDER or "AZURE_BLOB").strip().upper()
+        # GCS and DRIVE were the Google providers. An App Service still carrying one of them
+        # from before the move means "cloud storage", which is Blob now.
+        if provider in {"GCS", "DRIVE", "AZURE", "BLOB"}:
+            return "AZURE_BLOB"
+        return provider
 
     @property
     def storage_config_conflict(self) -> str | None:
@@ -307,8 +329,8 @@ class Settings(BaseSettings):
     #
     # The tuition product is one-to-one: a slot belongs to one student and one teacher, and
     # is billed by the class rather than by the term. These are *deployment defaults*; the
-    # values an administrator actually operates on live in the `app_settings` Firestore
-    # document and are edited from the admin API, because a school that wants a 45-minute
+    # values an administrator actually operates on live in the `app_settings` document and
+    # are edited from the admin API, because a school that wants a 45-minute
     # class instead of 60 should not need a redeploy. See `app.services.tuition.settings`.
     # ---------------------------------------------------------------------------------
     ENABLE_TUITION_MODULE: bool = True
@@ -426,13 +448,13 @@ class Settings(BaseSettings):
     # "can I join yet?" and "how long is left?" are the same questions in both and a student
     # who takes both should not meet two different answers.
     SCHOOL_AUTO_START_CLASS: bool = False
-    # One standing Google Meet room per class, rather than a fresh link per period.
+    # One standing live-class room per class, rather than a fresh room per period.
     #
     # On (the default), a school class has a single room: students join it and stay, and
     # each subject teacher joins the same room at their timetabled period. Scheduling a
-    # session reuses the class's room instead of minting a Calendar event per subject.
-    # Off restores the previous behaviour of one Meet link per scheduled session. Editable
-    # from the admin's School Settings; this is only the default.
+    # session reuses the class's room instead of giving each subject its own. Off gives
+    # every scheduled session a room of its own. Editable from the admin's School Settings;
+    # this is only the default.
     SCHOOL_CLASS_ROOM_MODE: bool = True
     # How early the join button opens. Zero means exactly on the hour, which in practice
     # means every student presses a dead button for the minute before class.
@@ -583,10 +605,8 @@ def _materialize_service_account(config: Settings) -> None:
     """
     Writes FIREBASE_CREDENTIALS_JSON to a file and repoints the credential path settings at it.
 
-    Every consumer in this codebase — the Firebase Admin SDK, the GCS client, Drive, and
-    Calendar — loads credentials from a path, so materializing once here keeps all of them
-    working unchanged instead of teaching each one a second way to authenticate. Runs before
-    anything imports those clients because they all import this module first.
+    Only the read-only tools for the retired Google project use this key (see the settings
+    above); they load credentials from a path, so materializing once here serves them all.
 
     A malformed value is logged and ignored rather than raised: a key that cannot be parsed
     should degrade the deployment to the same state it is in today, not stop the API from
@@ -607,8 +627,8 @@ def _materialize_service_account(config: Settings) -> None:
         service_account = _decode_credentials_blob(config.FIREBASE_CREDENTIALS_JSON)
     except (ValueError, json.JSONDecodeError) as exc:
         logger.error(
-            "FIREBASE_CREDENTIALS_JSON could not be read (%s). Firestore will be unavailable "
-            "and every collection will read as empty.",
+            "FIREBASE_CREDENTIALS_JSON could not be read (%s). The retired Google project "
+            "cannot be read by the migration tools.",
             exc,
         )
         return
@@ -622,7 +642,7 @@ def _materialize_service_account(config: Settings) -> None:
             json.dump(service_account, handle)
     except OSError as exc:
         logger.error(
-            "Could not write the service account key to %s (%s). Firestore will be unavailable.",
+            "Could not write the service account key to %s (%s). The migration tools cannot use it.",
             target, exc,
         )
         return
@@ -646,7 +666,7 @@ def _materialize_service_account(config: Settings) -> None:
     elif config.GCP_PROJECT_ID != key_project:
         logger.warning(
             "GCP_PROJECT_ID is '%s' but the service account key belongs to '%s'. "
-            "Firestore reads will be empty unless this is intentional.",
+            "Backup reads will be empty unless this is intentional.",
             config.GCP_PROJECT_ID, key_project,
         )
 

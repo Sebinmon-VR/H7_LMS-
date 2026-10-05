@@ -1,7 +1,7 @@
 """
 Exam, submission, and report-card records.
 
-These dataclasses document the shape of the three Firestore collections the exam module
+These dataclasses document the shape of the three database collections the exam module
 owns. As elsewhere in this codebase they are descriptive rather than load-bearing - the
 routers read and write plain dicts - but they are the one place to look to answer "what is
 actually stored on an exam?" without reading the service.

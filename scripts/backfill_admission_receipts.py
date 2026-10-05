@@ -49,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.core.enums import PaymentMethod, Program  # noqa: E402
 from app.core.firebase import (  # noqa: E402
     firestore_academic_years, firestore_admission_categories, firestore_fee_heads,
-    firestore_users, initialize_firebase,
+    firestore_users,
 )
 from app.schemas.finance import FeeReceiptCreate  # noqa: E402
 from app.services import receipts  # noqa: E402
@@ -200,7 +200,6 @@ def main() -> None:
     parser.add_argument("--all", action="store_true", help="Every school student, not only those whose category waives the charge.")
     args = parser.parse_args()
 
-    initialize_firebase()
 
     if args.undo:
         undo(args)

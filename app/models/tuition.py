@@ -96,8 +96,9 @@ class TuitionSlot:
     effective_from: date | None = None
     effective_to: date | None = None
     is_active: bool = True
-    # Where the class meets. A slot may carry a standing link (a teacher's permanent Meet
-    # room); when it does not, each session gets its own.
+    # Where the class meets. A slot may carry a standing link (a teacher's permanent Zoom or
+    # Teams room); when it does not, each session gets its own live-class room in the LMS.
+    # `auto_create_meet` keeps its Google Meet-era name.
     meeting_link: str | None = None
     auto_create_meet: bool = True
 
@@ -184,10 +185,12 @@ class TuitionSession:
 
     # --- The meeting -------------------------------------------------------------------
     meeting_link: str | None = None
-    # MANUAL when a link was pasted in, CREATED when this system made a Meet, FAILED when it
-    # tried and could not. The session is always saved either way.
+    # MANUAL when a link was pasted in, CREATED when the class has its LMS room
+    # (/call/tuition/<id>), FAILED when live classes are not configured. The session is
+    # always saved either way. The field names date from Google Meet.
     meet_status: str | None = None
     meet_error: str | None = None
+    # Set on sessions from before the move to Azure; always empty on new ones.
     google_event_id: str | None = None
     google_calendar_id: str | None = None
     recording_url: str | None = None

@@ -14,8 +14,9 @@ comes from.
 
 **Join gating.** `assert_may_join` refuses before the class opens, which is what makes the
 join button safe to disable: the button is a courtesy, the check is the rule. Without the
-server-side half, a student who bookmarks the Meet link joins an empty room twenty minutes
-early and the teacher finds them already there.
+server-side half, a student who bookmarks the class link joins an empty room twenty minutes
+early and the teacher finds them already there. The in-LMS call page asks this same gate
+before it puts anybody into the room (app/services/calls.py), so a bookmark is no way round it.
 
 Three things decide whether a class has begun, and they are deliberately distinguishable:
 
@@ -42,7 +43,7 @@ logger = logging.getLogger("live_classes")
 
 # Statuses a meeting can be in. Kept as plain strings because the existing LiveMeeting model
 # already stores them that way and an enum here would have to be reconciled with the rows
-# already in Firestore.
+# already in the database.
 SCHEDULED = "SCHEDULED"
 IN_PROGRESS = "IN_PROGRESS"
 COMPLETED = "COMPLETED"
@@ -57,7 +58,7 @@ def _now() -> datetime:
 
 def _as_datetime(value) -> datetime | None:
     """
-    Parses a stored timestamp, tolerating what Firestore hands back.
+    Parses a stored timestamp, tolerating every shape the database hands back.
 
     Returns None rather than raising on anything unreadable: a meeting with a corrupted time
     should render as "time unknown", not take down the whole timetable request.
@@ -208,6 +209,40 @@ def _join_blocked_reason(window_open: bool, has_started: bool, is_closed: bool,
             return "This class has not started yet."
         return "Waiting for the teacher to start the class."
     return None
+
+
+def assert_may_see(meeting: dict, user) -> None:
+    """
+    Whether this user is entitled to the class at all, before any timing question.
+
+    Separate from `assert_may_join`, which answers "yet?". Conflating them gives a student
+    from another class the message "this class has not started yet", which quietly confirms
+    the class exists.
+    """
+    from app.services import permissions
+
+    if user.role == UserRole.ADMIN:
+        return
+
+    class_id = meeting.get("class_id")
+    if user.role in (UserRole.TEACHER, UserRole.CLASS_TEACHER):
+        if int(meeting.get("teacher_id", -1)) == int(user.id):
+            return
+        if class_id is not None and permissions.is_class_teacher_of(user, class_id):
+            return
+        raise HTTPException(status_code=403, detail="This is not your class.")
+
+    if user.role == UserRole.STUDENT:
+        from app.core.firebase import firestore_student_enrollments
+        mine = {
+            int(e["class_id"]) for e in
+            firestore_student_enrollments.query_documents("student_id", "==", int(user.id))
+            if e.get("class_id") is not None
+        }
+        if class_id is not None and int(class_id) in mine:
+            return
+
+    raise HTTPException(status_code=404, detail="Meeting not found")
 
 
 def assert_may_join(meeting: dict, user, config: dict | None = None) -> dict:
@@ -369,7 +404,6 @@ def sweep(reference: datetime | None = None) -> dict:
         "ran_at": now.isoformat(),
         "rooms_created": 0,
         "rooms_failed": 0,
-        "teachers_invited": 0,
         "attendance_synced": 0,
         "auto_started": 0,
         "closed_stale": 0,
@@ -395,15 +429,13 @@ def sweep(reference: datetime | None = None) -> dict:
         log_backend_failure(logger, "Class room sweep failed", exc)
         result["errors"].append(f"class_rooms: {exc}")
 
-    # Meet's own attendance for today's rooms, copied every few minutes. Costs nothing but
-    # one refused token every half hour until the school authorises the Meet read scope.
+    # Today's attendance rows, rebuilt from the room log every few minutes so the office's
+    # attendance view is current without anybody pressing refresh.
     try:
         from app.services import class_rooms
 
         attendance = class_rooms.sync_attendance_for_today()
         result["attendance_synced"] = len(attendance["synced"])
-        # Reported once, not per class: every class fails the same way when the scope is
-        # the problem, and the sweep stops after the first.
         if attendance["failed"]:
             result["errors"].append(
                 f"attendance for {attendance['failed'][0]['class']}: {attendance['failed'][0]['error']}"
@@ -411,20 +443,6 @@ def sweep(reference: datetime | None = None) -> dict:
     except Exception as exc:  # pragma: no cover
         log_backend_failure(logger, "Attendance sync failed", exc)
         result["errors"].append(f"attendance: {exc}")
-
-    # Teachers who would otherwise knock on their own upcoming sessions. Stamped once per
-    # session, so this is a handful of Calendar calls after a deploy and nothing after.
-    try:
-        from app.services.content import repair_teacher_access
-
-        repaired = repair_teacher_access(days_ahead=2)
-        result["teachers_invited"] = repaired["invited"]
-        result["sessions_opened"] = repaired["opened"]
-        for failure in repaired["failures"]:
-            result["errors"].append(f"invite for '{failure['title']}': {failure['error']}")
-    except Exception as exc:  # pragma: no cover
-        log_backend_failure(logger, "Teacher invite sweep failed", exc)
-        result["errors"].append(f"teacher_access: {exc}")
 
     # Each step is caught separately. A failure in one must not stop the others, or a bad
     # meeting record silently stops every class in the school from being closed.
@@ -500,7 +518,7 @@ class ClassMaintenanceScheduler:
 
     def _loop(self) -> None:
         # Floored rather than trusted: a misconfigured interval of 0 would spin the thread
-        # against Firestore as fast as it could.
+        # against the database as fast as it could.
         interval = max(float(settings.CLASS_MAINTENANCE_INTERVAL_SECONDS), 30.0)
         while not self._stop.is_set():
             try:

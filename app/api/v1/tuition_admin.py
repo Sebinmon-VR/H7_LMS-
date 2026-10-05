@@ -533,8 +533,9 @@ def set_session_meeting_link(session_id: str, payload: MeetingLinkUpdate,
     """
     [Admin Only] Point a class at a different meeting provider.
 
-    The brief asks for links other than Google Meet to be usable; this is where a Zoom or
-    Teams link goes. A hand-entered link is never overwritten by Meet generation afterwards.
+    The brief asks for links other than the built-in live-class room to be usable; this is
+    where a Zoom or Teams link goes. A hand-entered link is never overwritten by room
+    generation afterwards.
     """
     record = session_service.require_session(session_id)
     updated = session_service.set_meeting_link(record, current_user, payload.meeting_link)
@@ -1201,7 +1202,7 @@ def list_student_subjects(
     [Tuition Admin] Every subject a student takes, with its teacher and class count.
 
     The subject-list view of `/enrollments`. Ordered by subject name so the screen is stable
-    between reloads rather than following whatever order Firestore returned.
+    between reloads rather than following whatever order the database returned.
     """
     student = enrollment_service.require_tuition_user(
         student_id, UserRole.STUDENT.value, "Student"

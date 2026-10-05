@@ -19,14 +19,14 @@ set -euo pipefail
 WORKERS="${GUNICORN_WORKERS:-1}"
 
 # App Service terminates an idle request at 230s. Gunicorn's 30s default is well under the
-# tail of a cold Firestore round trip, so it would recycle workers mid-request.
+# tail of a slow report or a large upload, so it would recycle workers mid-request.
 TIMEOUT="${GUNICORN_TIMEOUT:-600}"
 
 # The Azure SQL backend needs Microsoft's ODBC driver, which the App Service Python image
 # may or may not ship. Install it on first boot when it is missing, from Microsoft's Debian
 # repository; skipped in a second when it is already there. A failed install is logged and
 # the app still starts - the driver fallback in app/core/sqldb.py picks whatever exists.
-if [ "${DATABASE_BACKEND:-firestore}" = "azuresql" ] && command -v apt-get >/dev/null 2>&1; then
+if [ "${DATABASE_BACKEND:-azuresql}" = "azuresql" ] && command -v apt-get >/dev/null 2>&1; then
     if ! (odbcinst -q -d 2>/dev/null | grep -q "ODBC Driver 1[78] for SQL Server"); then
         echo "startup: no Microsoft ODBC driver for SQL Server found; installing msodbcsql18"
         (

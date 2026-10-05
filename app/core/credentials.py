@@ -2,8 +2,9 @@
 Credential generation for admin-provisioned accounts.
 
 Admins create a teacher or student by name only; this module derives the login email from
-that name and mints the password. Nothing here touches Firebase or Firestore — callers own
-persistence, which keeps the generators trivially testable and side-effect free.
+that name and mints the password. Nothing here touches the database or the stored password
+hashes — callers own persistence, which keeps the generators trivially testable and
+side-effect free.
 
 Passwords are drawn from `secrets`, never `random`, and deliberately exclude visually
 ambiguous characters (0/O, 1/l/I) because these credentials get read off a screen or an
@@ -23,7 +24,7 @@ _SYMBOLS = "!@#$%*?"
 
 _NON_SLUG = re.compile(r"[^a-z0-9]+")
 
-# Firebase Auth rejects anything shorter than 6.
+# Matches the backend's own default floor (settings.PASSWORD_MIN_LENGTH).
 MIN_PASSWORD_LENGTH = 8
 DEFAULT_PASSWORD_LENGTH = 12
 
@@ -43,7 +44,7 @@ def _shuffled(items: list[str]) -> list[str]:
 def generate_password(length: int = DEFAULT_PASSWORD_LENGTH) -> str:
     """
     Returns a random password containing at least one lowercase letter, uppercase letter,
-    digit, and symbol, so it satisfies any password policy Firebase may later enforce.
+    digit, and symbol, so it satisfies any password policy the school may later enforce.
     """
     length = max(length, MIN_PASSWORD_LENGTH)
 

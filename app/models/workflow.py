@@ -8,7 +8,7 @@ rejection, and the thing the approval produces (a class, an absence, a reply) mu
 separate step from the approval itself.
 
 That last point is the one worth stating. An approval that also creates the class in the same
-write cannot report "approved, but the Meet link failed" - it either lies or rolls back a
+write cannot report "approved, but the room could not be made" - it either lies or rolls back a
 decision a human already made. Keeping them apart means a request can sit in APPROVED with no
 class yet, which is visible and fixable, instead of silently reverting to pending.
 """
@@ -35,7 +35,7 @@ class ExtraClassRequest:
     `created_meeting_id` and `created_session_id` are filled in when the approved class is
     actually made. Until one of them is set, an APPROVED request is an approval that has not
     yet produced a class - a state that has to be visible, because the creation can fail on a
-    timetable clash or a Meet error long after the admin has pressed approve.
+    timetable clash or a live-class room error long after the admin has pressed approve.
     """
     requested_by: int
     title: str

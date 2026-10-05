@@ -31,7 +31,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.concurrency import run_parallel  # noqa: E402
-from app.core.config import settings  # noqa: E402
 from app.core.firebase import (  # noqa: E402
     document_cache,
     firestore_discount_rules,
@@ -44,7 +43,8 @@ from app.core.firebase import (  # noqa: E402
     firestore_tuition_invoices,
     firestore_tuition_package_assignments,
     firestore_tuition_packages,
-    initialize_firebase,
+    database_backend,
+    database_ready,
 )
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -105,15 +105,15 @@ def main() -> int:
                              "plans and discount rules.")
     args = parser.parse_args()
 
-    if initialize_firebase() is None:
-        print("ERROR: Firestore is unavailable. Check FIREBASE_CREDENTIALS_PATH.")
+    if not database_ready():
+        print("ERROR: the database is unavailable. Check the DB_* settings.")
         return 1
 
     collections = list(RECORD_COLLECTIONS)
     if args.include_structure:
         collections += STRUCTURE_COLLECTIONS
 
-    print(f"\nProject: {settings.GCP_PROJECT_ID}")
+    print(f"\nDatabase: {database_backend()}")
     print("Surveying billing collections...\n")
     contents = survey(collections)
     total = sum(len(rows) for rows in contents.values())

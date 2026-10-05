@@ -17,16 +17,15 @@ def login(email: str, password: str) -> dict:
     """
     Signs in and returns auth headers.
 
-    Login is delegated to Firebase Auth, so the dev-only password endpoint needs
-    FIREBASE_WEB_API_KEY. Without it the endpoint answers 501 and this suite cannot run.
+    Sign-in is the backend's own (app/core/identity.py): POST /auth/login checks the password
+    against the hash stored in `user_credentials` and returns a session token. Nothing outside
+    this server is involved, so no API key is needed.
     """
     res = client.post("/api/v1/auth/login", json={"email": email, "password": password})
 
-    if res.status_code == 501:
-        print("\n❌ Password login is not configured on this server.")
-        print("   Authentication now runs through Firebase Auth. To run this suite, set")
-        print("   FIREBASE_WEB_API_KEY in .env (Firebase Console -> Project settings ->")
-        print("   General -> Web API Key), then re-run.")
+    if res.status_code == 429:
+        print(f"\n[FAIL] Too many failed sign-ins for {email}; the address is locked out for")
+        print(f"       {settings.LOGIN_LOCKOUT_MINUTES} minutes. Wait, or restart the server to clear it.")
         sys.exit(1)
 
     assert res.status_code == 200, f"Login failed for {email}: {res.text}"
@@ -35,19 +34,19 @@ def login(email: str, password: str) -> dict:
 
 def run_verification():
     print("\n==========================================")
-    print("🚀 LMS BACKEND SYSTEM VERIFICATION SUITE")
+    print("LMS BACKEND SYSTEM VERIFICATION SUITE")
     print("==========================================\n")
-    print(f"Auth provider: {settings.AUTH_PROVIDER} | Storage provider: {settings.resolved_storage_provider}")
-    print(f"Google Meet auto-creation: {'enabled' if settings.ENABLE_GOOGLE_MEET else 'disabled'}\n")
+    print(f"Database: {settings.DATABASE_BACKEND} | Storage provider: {settings.resolved_storage_provider}")
+    print(f"Live classes (ACS calling): {'enabled' if settings.ENABLE_ACS_CALLING else 'disabled'}\n")
 
     # 1. Health Check
     res = client.get("/")
     assert res.status_code == 200, f"Health check failed: {res.text}"
-    print("✅ 1. Health Check Endpoint Passed:", res.json())
+    print("[OK] 1. Health Check Endpoint Passed:", res.json())
 
     # 2. Login as Admin
     admin_headers = login("admin@lms.com", "admin123")
-    print("✅ 2. Admin Firebase Authentication Passed")
+    print("[OK] 2. Admin Password Sign-In Passed")
 
     # 3. Admin creates Class
     class_res = client.post("/api/v1/admin/classes", json={
@@ -57,7 +56,7 @@ def run_verification():
     }, headers=admin_headers)
     assert class_res.status_code == 201
     class_id = class_res.json()["id"]
-    print(f"✅ 3. Admin Class Creation Passed (Class ID: {class_id})")
+    print(f"[OK] 3. Admin Class Creation Passed (Class ID: {class_id})")
 
     # 4. Admin creates Subject
     subject_res = client.post("/api/v1/admin/subjects", json={
@@ -67,7 +66,7 @@ def run_verification():
     }, headers=admin_headers)
     assert subject_res.status_code == 201
     subject_id = subject_res.json()["id"]
-    print(f"✅ 4. Admin Subject Creation Passed (Subject ID: {subject_id})")
+    print(f"[OK] 4. Admin Subject Creation Passed (Subject ID: {subject_id})")
 
     # 5. Admin creates Teacher and Student
     teacher_res = client.post("/api/v1/admin/users", json={
@@ -87,7 +86,7 @@ def run_verification():
     }, headers=admin_headers)
     assert student_res.status_code == 201
     student_id = student_res.json()["id"]
-    print(f"✅ 5. Admin User Accounts Created (Teacher ID: {teacher_id}, Student ID: {student_id})")
+    print(f"[OK] 5. Admin User Accounts Created (Teacher ID: {teacher_id}, Student ID: {student_id})")
 
     # 6. Admin Maps Teacher to Class & Subject
     map_res = client.post("/api/v1/admin/mappings/teacher-subject-class", json={
@@ -97,7 +96,7 @@ def run_verification():
     }, headers=admin_headers)
     assert map_res.status_code == 201
     mapping_id = map_res.json()["id"]
-    print("✅ 6. Admin Teacher-Subject-Class Mapping Passed")
+    print("[OK] 6. Admin Teacher-Subject-Class Mapping Passed")
 
     # 7. Admin Enrolls Student
     enroll_res = client.post("/api/v1/admin/enrollments", json={
@@ -106,7 +105,7 @@ def run_verification():
     }, headers=admin_headers)
     assert enroll_res.status_code == 201
     enrollment_id = enroll_res.json()["id"]
-    print("✅ 7. Admin Student Enrollment Passed")
+    print("[OK] 7. Admin Student Enrollment Passed")
 
     # 8. Teacher Login
     t_headers = login("grace.hopper@lms.com", "teacherpass123")
@@ -122,7 +121,7 @@ def run_verification():
     }, headers=t_headers)
     assert att_res.status_code == 201
     attendance_id = att_res.json()[0]["id"]
-    print("✅ 8a. Teacher Independent Attendance Entry Passed")
+    print("[OK] 8a. Teacher Independent Attendance Entry Passed")
 
     # 8b. Topic Log
     topic_res = client.post("/api/v1/teachers/topics", json={
@@ -134,22 +133,22 @@ def run_verification():
     }, headers=t_headers)
     assert topic_res.status_code == 201
     topic_id = topic_res.json()["id"]
-    print("✅ 8b. Teacher Independent Topic Progress Logging Passed")
+    print("[OK] 8b. Teacher Independent Topic Progress Logging Passed")
 
     # 8c. Meeting Scheduler (manual link; auto_create_meet is exercised separately)
     meet_res = client.post("/api/v1/teachers/meetings", json={
         "class_id": class_id,
         "subject_id": subject_id,
         "title": "Live Lecture: Graph Algorithms",
-        "meeting_link": "https://meet.google.com/abc-defg-hij",
-        "recording_url": "https://drive.google.com/file/d/sample-id/view",
+        "meeting_link": "https://zoom.us/j/1234567890",
+        "recording_url": "https://example.com/recordings/graph-algorithms.mp4",
         "scheduled_time": "2026-08-10T10:00:00",
         "status": "SCHEDULED",
         "auto_create_meet": False
     }, headers=t_headers)
     assert meet_res.status_code == 201
     meeting_id = meet_res.json()["id"]
-    print("✅ 8c. Teacher Independent Meeting & Recording Link Creation Passed")
+    print("[OK] 8c. Teacher Independent Meeting & Recording Link Creation Passed")
 
     # 8d. Grade Entry
     grade_res = client.post("/api/v1/teachers/grades", json={
@@ -163,35 +162,35 @@ def run_verification():
     }, headers=t_headers)
     assert grade_res.status_code == 201
     grade_id = grade_res.json()["id"]
-    print("✅ 8d. Teacher Independent Exam Grade Submission Passed")
+    print("[OK] 8d. Teacher Independent Exam Grade Submission Passed")
 
     # 9. Student Portal Access
     s_headers = login("charlie.brown@lms.com", "studentpass123")
 
     s_classes = client.get("/api/v1/students/my-classes", headers=s_headers)
     assert len(s_classes.json()) > 0
-    print("✅ 9a. Student Enrolled Classes View Passed")
+    print("[OK] 9a. Student Enrolled Classes View Passed")
 
     s_att = client.get("/api/v1/students/attendance", headers=s_headers)
     assert len(s_att.json()) > 0
-    print("✅ 9b. Student Personal Attendance View Passed")
+    print("[OK] 9b. Student Personal Attendance View Passed")
 
     s_topics = client.get("/api/v1/students/topics", headers=s_headers)
     assert len(s_topics.json()) > 0
-    print("✅ 9c. Student Covered Topics View Passed")
+    print("[OK] 9c. Student Covered Topics View Passed")
 
     s_meetings = client.get("/api/v1/students/meetings", headers=s_headers)
     assert len(s_meetings.json()) > 0
-    print("✅ 9d. Student Live Meetings & Recordings View Passed")
+    print("[OK] 9d. Student Live Meetings & Recordings View Passed")
 
     s_grades = client.get("/api/v1/students/grades", headers=s_headers)
     assert len(s_grades.json()) > 0
-    print("✅ 9e. Student Grades Report Card View Passed")
+    print("[OK] 9e. Student Grades Report Card View Passed")
 
     # 10. Admin Monitoring Report
     rep_res = client.get("/api/v1/admin/reports/monitoring", headers=admin_headers)
     assert rep_res.status_code == 200
-    print("✅ 10. Admin System Monitoring & Activity Report Passed:")
+    print("[OK] 10. Admin System Monitoring & Activity Report Passed:")
     print(json.dumps(rep_res.json()["overall_stats"], indent=2))
 
     # 11. Update endpoints
@@ -211,17 +210,17 @@ def run_verification():
         "marks_obtained": 250.0
     }, headers=t_headers)
     assert over_max.status_code == 400, "Grade above max_marks should be rejected"
-    print("✅ 11. Update Endpoints & Grade Validation Passed")
+    print("[OK] 11. Update Endpoints & Grade Validation Passed")
 
     # 12. Delete dependency guard: the class is still referenced
     blocked = client.delete(f"/api/v1/admin/classes/{class_id}", headers=admin_headers)
     assert blocked.status_code == 409, f"Expected 409 for a referenced class, got {blocked.status_code}"
-    print(f"✅ 12. Delete Dependency Guard Passed: {blocked.json()['detail'][:90]}...")
+    print(f"[OK] 12. Delete Dependency Guard Passed: {blocked.json()['detail'][:90]}...")
 
     # 13. Ownership enforcement: a student may not delete a teacher's topic
     forbidden = client.delete(f"/api/v1/teachers/topics/{topic_id}", headers=s_headers)
     assert forbidden.status_code == 403, f"Expected 403 for a student, got {forbidden.status_code}"
-    print("✅ 13. Role & Ownership Enforcement Passed")
+    print("[OK] 13. Role & Ownership Enforcement Passed")
 
     # 14. Teacher deletes their own records
     for label, path in [
@@ -232,7 +231,7 @@ def run_verification():
     ]:
         res = client.delete(path, headers=t_headers)
         assert res.status_code == 204, f"Deleting {label} failed: {res.status_code} {res.text}"
-    print("✅ 14. Teacher Record Deletions Passed")
+    print("[OK] 14. Teacher Record Deletions Passed")
 
     # 15. Admin deletes mapping and enrollment, then the now-unreferenced class
     assert client.delete(f"/api/v1/admin/mappings/teacher-subject-class/{mapping_id}",
@@ -243,20 +242,20 @@ def run_verification():
     cleared = client.delete(f"/api/v1/admin/classes/{class_id}", headers=admin_headers)
     assert cleared.status_code == 204, f"Expected 204 once unreferenced, got {cleared.status_code}: {cleared.text}"
     assert client.delete(f"/api/v1/admin/subjects/{subject_id}", headers=admin_headers).status_code == 204
-    print("✅ 15. Admin Cascade-Free Deletions Passed")
+    print("[OK] 15. Admin Cascade-Free Deletions Passed")
 
     # 16. Deactivate and reactivate a user
     assert client.delete(f"/api/v1/admin/users/{student_id}", headers=admin_headers).status_code == 204
     reactivated = client.post(f"/api/v1/admin/users/{student_id}/reactivate", headers=admin_headers)
     assert reactivated.status_code == 200 and reactivated.json()["is_active"] is True
-    print("✅ 16. User Soft Delete & Reactivation Passed")
+    print("[OK] 16. User Soft Delete & Reactivation Passed")
 
     # 17. Missing resources answer 404
     assert client.delete("/api/v1/admin/classes/99999999", headers=admin_headers).status_code == 404
-    print("✅ 17. Not-Found Handling Passed")
+    print("[OK] 17. Not-Found Handling Passed")
 
     print("\n==========================================")
-    print("🎉 LMS BACKEND FULLY VERIFIED AND WORKING PERFECTLY!")
+    print("LMS BACKEND FULLY VERIFIED AND WORKING PERFECTLY!")
     print("==========================================\n")
 
 

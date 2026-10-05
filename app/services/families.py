@@ -78,7 +78,7 @@ def group_for_student(student_id) -> dict | None:
     """
     The household a student belongs to, or None.
 
-    Scans rather than queries: Firestore's `array_contains` would serve this, but the
+    Scans rather than queries: an array-contains query would serve this, but the
     collection is small, it is cached, and the scan keeps the "at most one group" invariant
     checkable in the same pass - a query returning two rows would need this loop anyway to
     decide which one is real.
@@ -455,7 +455,7 @@ def children_of(parent_id) -> list[dict]:
     The switcher: every child this parent may open, with the permissions attached.
 
     Sorted with the primary link first and then by name, so the parent of three sees a stable
-    order rather than whatever Firestore returned that second.
+    order rather than whatever the database returned that second.
     """
     summaries = []
     for link in links_for_parent(parent_id):

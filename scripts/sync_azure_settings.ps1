@@ -1,17 +1,16 @@
 <#
 .SYNOPSIS
-    Signs in to Azure, finds the web app, and pushes .env plus the Firebase service account
-    key into its App Service application settings.
+    Signs in to Azure, finds the web app, and pushes .env into its App Service application
+    settings.
 
 .DESCRIPTION
-    Nothing secret is committed anywhere. This reads .env and firebase_credentials.json from
-    the working copy (both gitignored) and writes them into the App Service configuration,
-    where they arrive in the container as ordinary environment variables. Pydantic reads them
-    there exactly as it reads .env locally.
+    Nothing secret is committed anywhere. This reads .env from the working copy (gitignored)
+    and writes it into the App Service configuration, where it arrives in the container as
+    ordinary environment variables. Pydantic reads them there exactly as it reads .env locally.
 
-    The service account key is sent as FIREBASE_CREDENTIALS_JSON, base64-encoded so the PEM
-    body survives every layer between here and the container. The app decodes it at startup
-    and writes it to a private temp file that FIREBASE_CREDENTIALS_PATH then points at.
+    The Google service-account settings from before the move to Azure are cleared on the way
+    (FIREBASE_CREDENTIALS_JSON and the two key paths): nothing on the server uses them now,
+    and a key left in app settings is a key that can leak.
 
     Sign-in is handled here rather than assumed. The usual failure on this project is not a
     failed login but a successful login to the wrong place: the account has several tenants
@@ -40,7 +39,7 @@
 
 .NOTES
     Applying settings restarts the app. The script waits for it to come back and then checks
-    /health/firestore, so a run that prints "read_probe: ok" has proved the fix end to end.
+    /health/database, so a run that prints "available: True" has proved it end to end.
 #>
 param(
     [string]$AppName = "h7-lms-bknd",
@@ -48,7 +47,6 @@ param(
     [string]$Subscription,
     [string]$Tenant,
     [string]$EnvFile = ".env",
-    [string]$CredentialsFile = "firebase_credentials.json",
     [switch]$DeviceCode,
     [switch]$WhatIf
 )
@@ -98,18 +96,14 @@ function Invoke-Az {
 # ------------------------------------------------------------------------------------------
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not [System.IO.Path]::IsPathRooted($EnvFile)) { $EnvFile = Join-Path $repoRoot $EnvFile }
-if (-not [System.IO.Path]::IsPathRooted($CredentialsFile)) {
-    $CredentialsFile = Join-Path $repoRoot $CredentialsFile
-}
 
 if (-not (Test-Path $EnvFile)) { throw "No env file at $EnvFile" }
-if (-not (Test-Path $CredentialsFile)) { throw "No service account key at $CredentialsFile" }
 
 # Settings that must not be copied from a development .env into production as-is.
 $devOnlyDefaults = @{
     "DEBUG"                    = "Leaves tracebacks and verbose errors on in production."
     "BOOTSTRAP_ADMIN_PASSWORD" = "The bootstrap admin password is live on the public API."
-    "SECRET_KEY"               = "Signs legacy JWTs; a shared development key is forgeable."
+    "SECRET_KEY"               = "Signs every session and reset link; a shared development key is forgeable."
 }
 
 Write-Step "Reading local configuration"
@@ -137,32 +131,11 @@ foreach ($line in Get-Content $EnvFile) {
     if ($name) { $settings[$name] = $value }
 }
 
-$keyJson = Get-Content $CredentialsFile -Raw
-try {
-    $key = $keyJson | ConvertFrom-Json
-} catch {
-    throw "$CredentialsFile is not valid JSON: $_"
-}
-foreach ($field in @("client_email", "private_key", "project_id")) {
-    if (-not $key.$field) { throw "$CredentialsFile has no '$field' - not a service account key." }
+# Retired with Google. Cleared rather than left behind: nothing reads them any more.
+foreach ($retired in @("FIREBASE_CREDENTIALS_JSON", "FIREBASE_CREDENTIALS_PATH", "GOOGLE_APPLICATION_CREDENTIALS")) {
+    $settings[$retired] = ""
 }
 
-$settings["FIREBASE_CREDENTIALS_JSON"] =
-    [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($keyJson))
-
-# The key file never lands in the deployment artifact, so a path setting copied from .env
-# points at nothing. Clearing both makes the app fall through to the env var above.
-$settings["FIREBASE_CREDENTIALS_PATH"] = ""
-$settings["GOOGLE_APPLICATION_CREDENTIALS"] = ""
-
-if ($settings["GCP_PROJECT_ID"] -and $settings["GCP_PROJECT_ID"] -ne $key.project_id) {
-    Write-Warning ("GCP_PROJECT_ID in .env is '{0}' but the key belongs to '{1}'. " +
-                   "Firestore reads will be empty unless that is deliberate." -f
-                   $settings["GCP_PROJECT_ID"], $key.project_id)
-}
-
-Write-Host "  Service account : $($key.client_email)"
-Write-Host "  Key project     : $($key.project_id)"
 Write-Host "  Settings parsed : $($settings.Count)"
 Write-Host ""
 Write-Host "  Will set (values hidden):"
@@ -353,12 +326,12 @@ Write-Host "  Applied $($settings.Count) settings." -ForegroundColor Green
 # ------------------------------------------------------------------------------------------
 # 5. Prove it worked, rather than reporting success for having sent the request.
 # ------------------------------------------------------------------------------------------
-Write-Step "Verifying /health/firestore"
+Write-Step "Verifying /health/database"
 
 $hostName = Invoke-Az @("webapp", "show", "--resource-group", $ResourceGroup, "--name", $AppName,
                         "--query", "defaultHostName", "-o", "tsv")
 $hostName = "$hostName".Trim()
-$healthUrl = "https://$hostName/health/firestore"
+$healthUrl = "https://$hostName/health/database"
 
 Write-Host "  $healthUrl"
 Write-Host "  Waiting for the app to restart..."
@@ -383,14 +356,9 @@ if (-not $health) {
 
 $health | Format-List
 
-if ($health.firestore_available -and $health.read_probe -eq "ok") {
-    Write-Host "Firestore is reachable and a live read succeeded." -ForegroundColor Green
-    Write-Host "If the UI is still empty, the cause is downstream: CORS, auth, or an empty database."
+if ($health.backend -eq "azuresql" -and $health.available) {
+    Write-Host "Azure SQL is reachable from the app." -ForegroundColor Green
+    Write-Host "Check the rest (storage, live classes, email) in the admin's Integrations screen."
 } else {
-    Write-Warning "Firestore is still not reachable. The fields above name the credential source and the actual read error."
-    Write-Host ""
-    Write-Host "Most likely: the deployed code predates FIREBASE_CREDENTIALS_JSON support, so it"
-    Write-Host "ignores the setting entirely (pydantic is configured with extra='ignore')."
-    Write-Host "Confirm 'credentials_json_env_set' above is true. If it is false, commit and push"
-    Write-Host "the app/core/config.py change and let the GitHub Actions deploy finish, then re-run."
+    Write-Warning "The database is not reachable. The fields above name the server and the error."
 }

@@ -138,7 +138,7 @@ def program_timezone() -> ZoneInfo:
 
 
 def _field(user: Any, name: str):
-    """Reads a field off either a Pydantic profile or a raw Firestore dict."""
+    """Reads a field off either a Pydantic profile or a raw stored dict."""
     value = getattr(user, name, None)
     if value is None and isinstance(user, dict):
         value = user.get(name)
@@ -201,7 +201,7 @@ def apply_detected_timezone(user: Any, reported: str | None) -> str | None:
         would give a student in London class times in Indian hours by email and London hours
         on screen - the worst of both.
       * **It only writes when the value actually changes.** Otherwise every request from
-        every user would be a Firestore write.
+        every user would be a database write.
       * **It never overrides an explicit choice.** Someone who set their zone by hand keeps
         it, even while travelling; `detected_timezone` is still updated underneath so the UI
         can offer to switch, but nothing moves without them saying so.
@@ -257,7 +257,7 @@ def to_utc(value: datetime | str | None) -> datetime | None:
 
 
 def store_dt(value: datetime | None) -> str | None:
-    """Serializes an instant for Firestore, always as UTC ISO-8601."""
+    """Serializes an instant for the database, always as UTC ISO-8601."""
     moment = to_utc(value)
     return moment.isoformat() if moment else None
 
@@ -278,7 +278,7 @@ def parse_time(value: time | str | None) -> time:
 
 
 def format_time(value: time | str) -> str:
-    """Serializes a slot time to the 'HH:MM' form stored in Firestore."""
+    """Serializes a slot time to the 'HH:MM' form stored in the database."""
     if isinstance(value, str):
         return parse_time(value).strftime(TIME_FORMAT)
     return value.strftime(TIME_FORMAT)

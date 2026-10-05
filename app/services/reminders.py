@@ -9,7 +9,7 @@ a "in an hour" and a "in 5 minutes" nudge.
 Two properties matter more than anything else here, because the failure mode of a reminder
 system is not silence - it is spam:
 
-  * **Exactly once.** Before sending, the sweep *claims* a Firestore document keyed by
+  * **Exactly once.** Before sending, the sweep *claims* a database document keyed by
     (entry, date, offset, recipient) using an atomic create. A second worker, a restart
     mid-sweep, or two overlapping sweeps all lose the race and skip. The claim is written
     before the email goes out, so the worst case is a dropped reminder rather than a
@@ -34,7 +34,7 @@ from app.core.firebase import (
 from app.core.mailer import is_configured as mail_is_configured, send_class_reminder_email
 from app.core.firebase import log_backend_failure
 from app.services.timetable import (
-    entry_active_on, now_local, parse_time, school_timezone,
+    entry_active_on, now_local, parse_time, school_timezone, school_timezone_name,
 )
 # Reminder timing is administrator-editable at runtime, not only at deploy time: the lead
 # time is a decision the school makes and changes, and an engineer plus a restart is the
@@ -61,7 +61,7 @@ class _SweepContext:
 
     A sweep resolves the same handful of classes, subjects and teachers for every recipient
     of every period. Reading them once per sweep keeps the whole pass to a small, constant
-    number of Firestore round trips regardless of how many students are being emailed.
+    number of database round trips regardless of how many students are being emailed.
     """
 
     def __init__(self) -> None:
@@ -261,8 +261,8 @@ def sweep(
 
     if not dry_run and not summary["mail_configured"]:
         summary["detail"] = (
-            "SMTP is not configured, so no reminder could be delivered. Set SMTP_USER and "
-            "SMTP_PASSWORD (a Google App Password) to enable delivery."
+            "Email is not configured, so no reminder could be delivered. Set ACS_EMAIL_SENDER "
+            "(Azure Communication Services Email) or the SMTP_* settings to enable delivery."
         )
         return summary
 
@@ -367,7 +367,7 @@ class ReminderScheduler:
 
     Held in memory like the job registry, with the same honest limitation: each server
     worker runs its own scheduler. That is safe rather than merely tolerable here, because
-    the Firestore claim makes duplicate delivery impossible - a second worker's sweep finds
+    the database claim makes duplicate delivery impossible - a second worker's sweep finds
     every reminder already claimed and does nothing.
     """
 
@@ -401,7 +401,7 @@ class ReminderScheduler:
             "Class reminder scheduler started: every %.0fs, offsets %s, timezone %s.",
             settings.REMINDER_SCAN_INTERVAL_SECONDS,
             lms_settings()["reminder_minutes_before"],
-            settings.resolved_school_timezone,
+            school_timezone_name(),
         )
         return True
 
@@ -434,7 +434,7 @@ class ReminderScheduler:
         return {
             "enabled": lms_settings()["reminders_enabled"],
             "running": self.is_running,
-            "timezone": settings.resolved_school_timezone,
+            "timezone": school_timezone_name(),
             "offsets_minutes": lms_settings()["reminder_minutes_before"],
             "scan_interval_seconds": settings.REMINDER_SCAN_INTERVAL_SECONDS,
             "max_lateness_minutes": lms_settings()["reminder_max_lateness_minutes"],

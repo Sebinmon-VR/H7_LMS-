@@ -1,22 +1,22 @@
 """
 Wipes the LMS database and re-creates a single administrator.
 
-DESTRUCTIVE. This deletes every document in every LMS collection, and optionally every
-Firebase Authentication account, then recreates the bootstrap admin so you can sign in and
-build real data from an empty system.
+DESTRUCTIVE. This deletes every document in every LMS collection, including every stored
+password, then recreates the bootstrap admin so you can sign in and build real data from an
+empty system.
 
 Usage:
     # See exactly what would be deleted, change nothing
     python -m scripts.reset_data --dry-run
 
-    # Wipe Firestore collections, keep Firebase Auth accounts, recreate the admin
+    # Wipe everything and recreate the admin
     python -m scripts.reset_data --confirm
 
-    # Also delete every Firebase Auth account (full clean slate)
-    python -m scripts.reset_data --confirm --include-auth
+Passwords always go with their accounts: user ids are reused after a wipe, and a password
+left behind would sign somebody into a stranger's new account.
 
 `--confirm` is mandatory: without it the script refuses to delete anything. There is no
-undo, and Firestore has no built-in restore for this.
+undo.
 """
 
 import argparse
@@ -38,8 +38,10 @@ from app.core.firebase import (  # noqa: E402
     firestore_subjects,
     firestore_teacher_mappings,
     firestore_topics,
+    firestore_user_credentials,
     firestore_users,
-    initialize_firebase,
+    database_backend,
+    database_ready,
 )
 from app.core.concurrency import run_parallel  # noqa: E402
 
@@ -56,6 +58,7 @@ COLLECTIONS = [
     ("class_rooms", firestore_classes),
     ("subjects", firestore_subjects),
     ("users", firestore_users),
+    ("user_credentials", firestore_user_credentials),
 ]
 
 
@@ -80,37 +83,19 @@ def wipe_collections(contents: dict[str, list]) -> int:
     return deleted
 
 
-def wipe_auth_accounts() -> int:
-    from firebase_admin import auth
-
-    accounts = list(auth.list_users().iterate_all())
-    if not accounts:
-        return 0
-
-    uids = [u.uid for u in accounts]
-    for start in range(0, len(uids), 1000):  # delete_users caps at 1000 per call
-        auth.delete_users(uids[start:start + 1000])
-
-    for account in accounts:
-        print(f"  deleted auth account {account.email or account.uid}")
-    return len(accounts)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Wipe LMS data and recreate the bootstrap admin.")
     parser.add_argument("--confirm", action="store_true",
                         help="Required. Without it nothing is deleted.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Report what would be deleted and exit.")
-    parser.add_argument("--include-auth", action="store_true",
-                        help="Also delete every Firebase Authentication account.")
     args = parser.parse_args()
 
-    if initialize_firebase() is None:
-        print("ERROR: Firestore is unavailable. Check FIREBASE_CREDENTIALS_PATH.")
+    if not database_ready():
+        print("ERROR: the database is unavailable. Check the DB_* settings.")
         return 1
 
-    print(f"\nProject: {settings.GCP_PROJECT_ID}")
+    print(f"\nDatabase: {database_backend()}")
     print("Surveying collections...\n")
     contents = survey()
 
@@ -121,15 +106,6 @@ def main() -> int:
         print(f"{name:<36}{len(contents[name]):>10}")
     print("-" * 46)
     print(f"{'TOTAL':<36}{total:>10}")
-
-    auth_count = 0
-    if args.include_auth:
-        try:
-            from firebase_admin import auth
-            auth_count = sum(1 for _ in auth.list_users().iterate_all())
-            print(f"\nFirebase Auth accounts to delete: {auth_count}")
-        except Exception as exc:
-            print(f"\nCould not enumerate Firebase Auth accounts: {exc}")
 
     if args.dry_run:
         print("\nDry run - nothing was deleted.")
@@ -143,13 +119,6 @@ def main() -> int:
 
     print(f"\nDeleting {total} document(s)...")
     deleted = wipe_collections(contents)
-
-    if args.include_auth:
-        print(f"\nDeleting {auth_count} Firebase Auth account(s)...")
-        try:
-            wipe_auth_accounts()
-        except Exception as exc:
-            print(f"  ERROR deleting auth accounts: {exc}")
 
     document_cache.clear()
 

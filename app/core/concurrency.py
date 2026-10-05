@@ -1,7 +1,7 @@
 """
-Concurrency helpers for latency-bound Firestore work.
+Concurrency helpers for latency-bound database work.
 
-Firestore round trips from outside the database's region cost hundreds of milliseconds
+Database round trips from outside the database's region cost hundreds of milliseconds
 each, and that latency dominates response time. The work is almost entirely spent waiting
 on the network, so running independent reads on a thread pool collapses many sequential
 waits into a single one. Measured locally: eight sequential document reads take ~6.8s, the

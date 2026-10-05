@@ -222,8 +222,8 @@ def normalize_programs(value) -> list[str]:
 
     Accepts a list, a single string, or None, and drops anything unrecognized. Written
     permissively because this is read on every authenticated request: a profile hand-edited
-    in the Firestore console should cost that user their tuition access at worst, never a
-    500 on login.
+    in the database should cost that user their tuition access at worst, never a 500 on
+    login.
     """
     if value is None:
         return list(DEFAULT_PROGRAMS)
@@ -675,8 +675,8 @@ class ExtraClassStatus(str, enum.Enum):
     timetable and very different conversations.
 
     SCHEDULED is the state after approval, once the meeting or session actually exists. The
-    approval and the creation are separate steps because the creation can fail - a Meet link,
-    a timetable clash - and an approved request whose class was never made must stay visible
+    approval and the creation are separate steps because the creation can fail - a live-class
+    room, a timetable clash - and an approved request whose class was never made must stay visible
     rather than silently reverting to pending.
     """
     PENDING = "PENDING"

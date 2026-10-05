@@ -105,7 +105,7 @@ class UserProfileFields(BaseModel):
         Trims whitespace and turns an empty string into None.
 
         A form that submits "" for every untouched field would otherwise write empty strings
-        into Firestore, which then defeat the uniqueness checks on admission and employee
+        into the database, which then defeat the uniqueness checks on admission and employee
         numbers - two blank ids would read as a genuine collision.
         """
         if isinstance(value, str):
@@ -129,7 +129,7 @@ class UserCreate(UserProfileFields):
     `email` may be omitted, in which case it is generated as firstname.lastname@<domain>
     from `full_name` using USER_EMAIL_DOMAIN, with a numeric suffix on collision.
 
-    `password` is forwarded to Firebase Auth and never stored by this backend. Omit it to
+    `password` is stored only as a hash, in `user_credentials` (app/core/identity.py). Omit it to
     provision an account without a password; the admin then issues one with
     `POST /admin/users/{user_id}/generate-credentials`, which mails it to the user.
 
@@ -197,7 +197,8 @@ class UserUpdate(UserProfileFields):
     email: str | None = None
     is_active: bool | None = None
     role: UserRole | None = Field(
-        None, description="Changing this re-issues the user's Firebase role claims"
+        None, description="Takes effect on the user's next request: roles are read from the "
+                          "profile, not from their session token"
     )
     programs: List[Program] | None = Field(
         None, description="Replaces the account's product access outright when supplied."
@@ -217,7 +218,6 @@ class UserOut(BaseModel):
     role: UserRole
     is_active: bool
     created_at: datetime
-    firebase_uid: str | None = None
 
     phone: str | None = None
     alternate_phone: str | None = None
@@ -272,19 +272,32 @@ class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class MeOut(UserOut):
+    """
+    The signed-in user's own profile, plus the school-wide facts a client needs to render it.
+
+    `school_timezone` is the IANA zone the school timetable is written in. Timetable periods
+    are wall-clock strings in that zone, and a client showing them to somebody sitting
+    elsewhere has to know which zone "09:00" means before it can label or convert it.
+    """
+    school_timezone: str | None = Field(
+        None, description="IANA zone timetable periods are written in, e.g. 'Asia/Dubai'."
+    )
+
+
 class UserDeleted(BaseModel):
     """
     Outcome of a permanent user delete.
 
     Returned instead of a bare 204 because a hard delete removes rows across several
-    collections and the admin needs to see what actually went; `firebase_auth_deleted`
-    being false means an orphaned login may still exist and needs manual cleanup.
+    collections and the admin needs to see what actually went; `login_deleted` false means
+    the stored password could not be removed (harmless: no profile remains to sign in to).
     """
     user_id: int
     email: str | None = None
     full_name: str | None = None
     mode: str = Field(..., description="SOFT or PERMANENT")
-    firebase_auth_deleted: bool = False
+    login_deleted: bool = True
     deleted_records: dict[str, int] = Field(
         default_factory=dict, description="Collection label -> number of records removed"
     )

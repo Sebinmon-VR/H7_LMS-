@@ -2,8 +2,7 @@
 Creating user accounts, shared by the school LMS and the online tuition programme.
 
 Both products create people, and they create them the same way: derive a login address,
-check the identifiers are free, make the Firebase Auth account, write the profile, and stamp
-the role claims. What differs is only *which products the new account may reach* - the
+check the identifiers are free, write the profile, and store the password if one was given. What differs is only *which products the new account may reach* - the
 `programs` list - so that is the one parameter this takes, and everything else is one
 implementation rather than two that drift apart.
 
@@ -14,11 +13,10 @@ school at all. Making the tuition admin borrow the LMS's create-user endpoint wo
 forced every tuition account to look like a school account first, and the "grant tuition
 access afterwards" step is a box somebody eventually forgets to tick.
 
-The rollback in `create_account` is the part worth reading: the Firebase Auth account is
-made *before* the Firestore profile, because it supplies the uid the profile stores. If the
-profile write then fails, the auth account is deleted - otherwise the email is taken by a
-login with no profile behind it, and a retry fails forever with "email already exists" while
-the admin can see no such user anywhere.
+Passwords live in `user_credentials`, never on the profile (see app/core/identity.py). The
+profile is written first and the password second, so a failure between the two leaves an
+account that simply has no password yet - which "Generate credentials" fixes - rather than a
+password with nobody behind it.
 """
 
 import logging
@@ -30,8 +28,8 @@ from fastapi import HTTPException
 from app.core.config import settings
 from app.core.credentials import generate_email
 from app.core.enums import TEACHING_ROLES, Program, UserRole, normalize_programs
+from app.core import identity
 from app.core.firebase import firestore_users
-from app.core.firebase_auth import create_auth_user, delete_auth_user, set_role_claims
 from app.schemas.user import UserProfileFields
 
 logger = logging.getLogger("accounts")
@@ -71,10 +69,10 @@ def assert_identifiers_free(stored: dict, exclude_user_id: int | None = None) ->
 
 def profile_fields(payload: UserProfileFields, exclude_unset: bool = True) -> dict:
     """
-    The profile portion of a create/update payload, as a Firestore-ready dict.
+    The profile portion of a create/update payload, as a document-ready dict.
 
-    Dates become ISO strings and enums their values, because Firestore has no native date
-    type here and the rest of the codebase already stores ISO strings.
+    Dates become ISO strings and enums their values, because documents are stored as JSON
+    and the rest of the codebase already stores ISO strings.
     """
     known = set(UserProfileFields.model_fields)
     raw = payload.model_dump(exclude_unset=exclude_unset, exclude_none=True)
@@ -121,7 +119,7 @@ def resolve_email(payload) -> str:
 def create_account(payload, role: UserRole | None = None,
                    programs: list[str] | None = None) -> dict:
     """
-    Creates one user: Firebase Auth account, Firestore profile, and role claims.
+    Creates one user: the profile, and the password when the payload carries one.
 
     `role` and `programs` override whatever the payload carries. That is how the tuition
     endpoints guarantee what they create - a route called "add a tuition student" must not be
@@ -149,14 +147,16 @@ def create_account(payload, role: UserRole | None = None,
             and not profile.get("admission_year_id"):
         profile["admission_year_id"] = int(profile["academic_year_id"])
 
-    firebase_uid = create_auth_user(email, payload.password, payload.full_name)
+    if payload.password:
+        problem = identity.password_problem(payload.password)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
 
     user_id = firestore_users.get_next_numeric_id()
     document = {
         **profile,
         "full_name": payload.full_name,
         "email": email,
-        "firebase_uid": firebase_uid,
         "role": effective_role.value,
         "programs": effective_programs,
         "is_active": True,
@@ -166,17 +166,9 @@ def create_account(payload, role: UserRole | None = None,
         "created_at": datetime.utcnow().isoformat(),
     }
 
-    try:
-        firestore_users.add_document(str(user_id), document)
-    except Exception:
-        # See the module docstring: an auth account with no profile behind it takes the
-        # email address hostage and makes every retry fail.
-        if firebase_uid:
-            delete_auth_user(firebase_uid)
-        raise
-
-    if firebase_uid:
-        set_role_claims(firebase_uid, effective_role, user_id)
+    firestore_users.add_document(str(user_id), document)
+    if payload.password:
+        identity.set_password(user_id, payload.password, source="created", revoke=False)
 
     document["id"] = user_id
     logger.info(
@@ -189,7 +181,7 @@ def create_account(payload, role: UserRole | None = None,
 def issue_credentials(user: dict, send_email: bool = True, revoke_sessions: bool = True,
                       deliver_to: str | None = None) -> dict:
     """
-    Generates a password for an existing account, sets it on Firebase Auth and emails it.
+    Generates a password for an existing account, stores it and emails it.
 
     Backs the admin's "Generate credentials" button and the admission flow that creates a
     student and hands the family their login in one go. Safe to run again to reset a
@@ -199,12 +191,9 @@ def issue_credentials(user: dict, send_email: bool = True, revoke_sessions: bool
     school pupil's login is `firstname.lastname@<domain>`, a mailbox that may not exist yet,
     while the parent's own address on the admission form certainly does.
 
-    The password is returned once, in the result, and is never stored by this backend.
+    The password is returned once, in the result; only its hash is kept.
     """
     from app.core.credentials import generate_password
-    from app.core.firebase_auth import (
-        create_auth_user, revoke_tokens, set_auth_password, set_role_claims, set_user_disabled,
-    )
     from app.core.mailer import is_configured as mail_is_configured, send_credentials_email
 
     user_id = int(user["id"])
@@ -219,34 +208,12 @@ def issue_credentials(user: dict, send_email: bool = True, revoke_sessions: bool
     full_name = user.get("full_name") or email
     role = user.get("role", UserRole.STUDENT.value)
 
-    # An account created while Firebase Auth was unreachable has no uid yet, so the auth
-    # account is created now and linked rather than failing the request.
-    firebase_uid = user.get("firebase_uid")
-    if firebase_uid:
-        applied = set_auth_password(firebase_uid, password)
-    else:
-        firebase_uid = create_auth_user(email, password, full_name)
-        applied = firebase_uid is not None
-        if applied:
-            firestore_users.add_document(str(user_id), {"firebase_uid": firebase_uid})
-
-    if not applied:
-        raise HTTPException(
-            status_code=503,
-            detail="Could not set the password on Firebase Auth. "
-                   "Check the Admin SDK credentials and try again.",
-        )
-
-    set_role_claims(firebase_uid, role, user_id)
-
     # A password reset must not leave old sessions alive on someone else's device.
-    if revoke_sessions:
-        revoke_tokens(firebase_uid)
+    identity.set_password(user_id, password, source="issued", revoke=revoke_sessions)
 
     # Re-enable the account, otherwise fresh credentials still cannot sign in.
     if not user.get("is_active", False):
         firestore_users.add_document(str(user_id), {"is_active": True})
-        set_user_disabled(firebase_uid, False)
 
     recipient = (deliver_to or email).strip()
     email_sent = False
@@ -258,8 +225,8 @@ def issue_credentials(user: dict, send_email: bool = True, revoke_sessions: bool
     elif not send_email:
         detail = "Credentials generated. Email delivery was skipped as requested."
     elif not mail_is_configured():
-        detail = ("Credentials generated, but SMTP is not configured, so no email was sent. "
-                  "Set SMTP_USER and SMTP_PASSWORD (a Google App Password) to enable delivery.")
+        detail = ("Credentials generated, but email is not configured, so none was sent. "
+                  "Set ACS_EMAIL_SENDER (Azure Communication Services Email) to enable delivery.")
     else:
         detail = ("Credentials generated, but the email could not be delivered. "
                   "Share the password with the user directly and check the server logs.")

@@ -1,3 +1,20 @@
+"""
+The document collections every service reads and writes, and the Firestore backend.
+
+The module keeps its name from the Google era. What it holds now:
+
+* **The collection registry.** Every `firestore_*` variable below is one collection, served by
+  whichever backend DATABASE_BACKEND names - Azure SQL (`app.core.sqldb`) in every real
+  deployment. The names stayed so the fifty files that import them did not have to change.
+* **The Firestore backend** (`FirestoreService`, `initialize_firebase`). No longer the live
+  store: it is kept to read the frozen pre-migration backup, and runs only when
+  DATABASE_BACKEND=firestore.
+* **Shared plumbing** both backends use: the reference-document cache, id generation,
+  hydration of references and the delete-with-dependents guard.
+
+Sign-in does not live here; see `app.core.identity`.
+"""
+
 import os
 import copy
 import logging
@@ -9,7 +26,16 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Type, TypeVar, get_args, get_origin
 
-from google.api_core.exceptions import GoogleAPICallError, ResourceExhausted
+try:
+    from google.api_core.exceptions import GoogleAPICallError, ResourceExhausted
+except ModuleNotFoundError:
+    # The Google libraries are only needed by the retired Firestore backend (kept to read the
+    # frozen backup), and are no longer installed on the Azure deployment.
+    class GoogleAPICallError(Exception):
+        pass
+
+    class ResourceExhausted(GoogleAPICallError):
+        pass
 
 from app.core.config import settings
 from app.core.enums import UserRole
@@ -35,7 +61,7 @@ class _DocumentCache:
     """
     Process-wide TTL cache for documents.
 
-    Every Firestore round trip costs hundreds of milliseconds from outside the database's
+    Every database round trip costs hundreds of milliseconds from outside the database's
     region, so the dominant cost of a request is the number of calls it makes, not the
     volume of data. Reference collections (users, classes, subjects) are small, change
     rarely, and are read repeatedly while hydrating list responses - caching them removes
@@ -271,7 +297,8 @@ def _create_default_app(firebase_admin, credentials):
 def initialize_firebase():
     """
     Initializes Firebase Admin SDK using service account JSON credentials certificate or Application Default Credentials.
-    Provides Cloud Firestore DB client (`db_firestore`).
+    Provides Cloud Firestore DB client (`db_firestore`). Only reached when DATABASE_BACKEND is
+    `firestore`, i.e. when reading the frozen pre-Azure backup.
 
     Safe to call repeatedly and from several threads. That matters because the default app
     outlives a failure anywhere later in this function: if `firestore.client()` raised after
@@ -322,6 +349,9 @@ def initialize_firebase():
 class FirestoreService:
     """
     Firestore repository helper for CRUD operations on a specific Firestore collection.
+
+    The retired backend, kept for reading the frozen backup. `app.core.sqldb.SqlDocumentService`
+    implements the same interface on Azure SQL and is what DATABASE_BACKEND=azuresql serves.
     """
 
     def __init__(self, collection_name: str, cacheable: bool = False):
@@ -871,6 +901,24 @@ def hydrate_topic(topic: dict) -> dict:
     }
 
 
+def _signed(url):
+    """Private files (class recordings) as a signed link; everything else unchanged."""
+    if not url:
+        return url
+    from app.core.azure_blob import sign_private
+
+    return sign_private(url)
+
+
+def _signed_files(files):
+    if not files:
+        return files
+    return [
+        {**f, "file_url": _signed(f.get("file_url")), "web_view_link": _signed(f.get("web_view_link"))}
+        for f in files
+    ]
+
+
 def hydrate_live_meeting(meeting: dict) -> dict:
     return {
         "id": meeting["id"],
@@ -882,7 +930,8 @@ def hydrate_live_meeting(meeting: dict) -> dict:
         "teacher": _resolve_document(firestore_users, meeting.get("teacher_id")),
         "title": meeting.get("title"),
         "meeting_link": meeting.get("meeting_link"),
-        "recording_url": meeting.get("recording_url"),
+        "recording_url": _signed(meeting.get("recording_url")),
+        "recording_published": bool(meeting.get("recording_published")),
         "scheduled_time": meeting.get("scheduled_time"),
         "status": meeting.get("status"),
         "created_at": meeting.get("created_at"),
@@ -895,7 +944,7 @@ def hydrate_live_meeting(meeting: dict) -> dict:
         "recording_error": meeting.get("recording_error"),
         "recording_drive_file_id": meeting.get("recording_drive_file_id"),
         "recording_stored_at": meeting.get("recording_stored_at"),
-        "recording_files": meeting.get("recording_files"),
+        "recording_files": _signed_files(meeting.get("recording_files")),
         "duration_minutes": meeting.get("duration_minutes"),
         "uses_class_room": meeting.get("uses_class_room"),
         "meet_access_type": meeting.get("meet_access_type"),
@@ -914,8 +963,9 @@ def hydrate_study_material(material: dict) -> dict:
         "teacher": _resolve_document(firestore_users, material.get("teacher_id")),
         "title": material.get("title"),
         "material_type": material.get("material_type"),
-        "file_url": material.get("file_url"),
+        "file_url": _signed(material.get("file_url")),
         "uploaded_at": material.get("uploaded_at"),
+        "recording_key": material.get("recording_key"),
         "storage_provider": material.get("storage_provider"),
         "storage_warning": material.get("storage_warning"),
     }
@@ -970,7 +1020,7 @@ def hydrate_exam_grade(grade: dict) -> dict:
 # Declared once, here, on whichever backend `DATABASE_BACKEND` names. The variables keep
 # their `firestore_` names whatever is underneath: fifty files import them, and the point
 # of the Azure SQL backend (`app.core.sqldb`) is that none of those files can tell the
-# difference. Firebase Auth still signs people in either way.
+# difference. Sign-in is the backend's own either way (`app.core.identity`).
 # ---------------------------------------------------------------------------------------
 
 def _service(collection_name: str, cacheable: bool = False):
@@ -986,10 +1036,13 @@ def _service(collection_name: str, cacheable: bool = False):
     return FirestoreService(collection_name, cacheable=cacheable)
 
 
-# Global Firestore Collection Helper Services.
+# The collections, on whichever backend DATABASE_BACKEND names.
 # `cacheable=True` marks small, slow-changing reference data that hydration reads over and
 # over; writes invalidate the affected key immediately.
 firestore_users = _service("users", cacheable=True)
+# Password hashes, one document per user id, kept out of `users` so that no endpoint returning
+# a profile can ever return one. Read only at sign-in and password change. See core/identity.py.
+firestore_user_credentials = _service("user_credentials")
 firestore_classes = _service("class_rooms", cacheable=True)
 firestore_subjects = _service("subjects", cacheable=True)
 firestore_teacher_mappings = _service("teacher_subject_class_mappings")
@@ -1009,7 +1062,8 @@ firestore_timetable = _service("timetable_entries", cacheable=True)
 # One document per reminder actually sent, so a restart or an overlapping sweep cannot
 # email the same student about the same period twice.
 firestore_reminder_log = _service("reminder_log")
-# One document per (meeting, Meet recording), claimed atomically before the video is moved.
+# One document per ACS recording (and per file chunk while it is copied), claimed atomically
+# before the video is moved into Blob storage.
 # It is what stops two server workers filing the same recording twice, and it doubles as the
 # audit trail for where each class recording ended up.
 firestore_recording_log = _service("recording_log")
@@ -1100,9 +1154,10 @@ firestore_admission_categories = _service("admission_categories", cacheable=True
 firestore_class_room_events = _service("class_room_events")
 # One row per user: when the LMS last heard from them. See services/presence.py.
 firestore_user_presence = _service("user_presence")
-# What Google Meet itself saw in a class's room: one row per participant per conference, with
-# their join and leave times. Filled by a sync that needs the Meet read scope; until that is
-# authorised the collection stays empty and the LMS's own event log is the record.
+# Who was in a class's room each day: one row per participant, with their join and leave
+# times. Rebuilt from the room log, which the in-LMS call writes on every connect and hang-up
+# (`class_rooms.sync_room_attendance`). Google Meet's own participant records filled it before
+# the move to Azure.
 firestore_class_room_attendance = _service("class_room_attendance")
 # Admission requests posted from the public website form. One document per application,
 # carrying the student, parent and address detail the office needs to decide, plus the
@@ -1234,6 +1289,15 @@ def all_collections() -> list:
         value for name, value in globals().items()
         if name.startswith("firestore_") and hasattr(value, "collection_name")
     ]
+
+
+def database_ready() -> bool:
+    """Whether the configured backend can be reached at all - for scripts, before they start."""
+    if database_backend() == "azuresql":
+        from app.core import sqldb
+
+        return sqldb.is_configured()
+    return initialize_firebase() is not None
 
 
 def database_backend() -> str:

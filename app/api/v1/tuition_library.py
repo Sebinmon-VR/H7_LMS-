@@ -115,7 +115,7 @@ def share_link(payload: LibraryLinkCreate,
     """
     [Tuition Admin/Teacher/Student] Share a link instead of a file.
 
-    A publisher's page, a video, a Drive folder. Better than uploading a copy of something
+    A publisher's page, a video, a shared folder. Better than uploading a copy of something
     already on the web: a copy goes stale, costs storage, and loses the source. Same
     visibility and approval rules as an upload.
     """

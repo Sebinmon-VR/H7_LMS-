@@ -370,11 +370,11 @@ def _claim(key: str, payload: dict) -> bool:
     """
     Claims the right to send, atomically.
 
-    `create_document` maps onto Firestore's `create` and fails when the id is taken - the
+    `create_document` is an atomic create that fails when the id is taken - the
     same mechanism the class reminders use, and the reason two workers waking up on Sunday
     night send one email rather than two.
 
-    It also returns False when Firestore is unreachable, which reads here as "do not send".
+    It also returns False when the database is unreachable, which reads here as "do not send".
     That is the right way round: a digest that is late because the database was down is a
     nuisance, and one sent twice because the claim could not be recorded is a complaint.
     """

@@ -15,7 +15,7 @@ Base URL: `/api/v1`. All admin endpoints require `Authorization: Bearer <token>`
 | Generated password is returned once in the response | Needs a one-time reveal modal — it cannot be fetched again |
 | Credentials are emailed to the user automatically | Show delivery status from `email_sent` |
 
-Nothing else changed. Login, roles, and all other endpoints are unchanged.
+Sign-in moved off Firebase Auth on 2026-09-30: the backend now holds the password hashes itself and issues its own session tokens. The login request and response shapes are unchanged; token lifetime, renewal and the new password endpoints are described under [Login](#4-login).
 
 ---
 
@@ -50,8 +50,7 @@ Nothing else changed. Login, roles, and all other endpoints are unchanged.
   "email": "anita.fernandes@h7ed.com",
   "role": "TEACHER",
   "is_active": true,
-  "created_at": "2026-08-08T10:22:41.123456",
-  "firebase_uid": "xYz..."
+  "created_at": "2026-08-08T10:22:41.123456"
 }
 ```
 
@@ -100,7 +99,7 @@ Placed on each row of the user list and on the user detail page. This is the act
 **Errors**
 - `404` — user not found
 - `400` — `"This user has no email address..."`
-- `503` — Firebase Auth unreachable; nothing was changed, safe to retry
+- `503` — the database is unreachable; nothing was changed, safe to retry
 - `403` — caller is not an admin
 
 **Confirmation dialog required.** If the user already has credentials, this resets their password and signs them out. Warn before firing: *"Generate new credentials for Anita Fernandes? Their current password will stop working."*
@@ -114,7 +113,7 @@ Opens on success. This is the only time the password exists in the UI.
 - Show `email` and `password` with a **copy** button on each and a copy-all.
 - Drive the status line off `email_sent`:
   - `true` → success state, show `detail`.
-  - `false` → **warning state, not an error.** The account works; only delivery failed. Show `detail` verbatim — it explains whether SMTP is unconfigured, delivery failed, or email was skipped on purpose. Tell the admin to copy the password now.
+  - `false` → **warning state, not an error.** The account works; only delivery failed. Show `detail` verbatim — it explains whether email (Azure Communication Services Email, or SMTP) is unconfigured, delivery failed, or email was skipped on purpose. Tell the admin to copy the password now.
 - Require an explicit "I've saved this" / Close action. Do not auto-dismiss on timer or outside-click.
 - Never log the password to the console, analytics, or error reporting. Don't persist it in client state after the modal closes.
 
@@ -122,7 +121,7 @@ Opens on success. This is the only time the password exists in the UI.
 
 ### 4. Login
 
-Unchanged, but this is the only login the provisioned users have. Email and password only — no Google button needed for these accounts.
+This is the only login there is. Email and password only — there is no Google (or any other) sign-in button. The backend checks the password against the hash it stores and returns a session token it signs itself; accounts moved over from Firebase Auth keep their existing passwords.
 
 `POST /api/v1/auth/login`
 
@@ -135,6 +134,7 @@ Unchanged, but this is the only login the provisioned users have. Email and pass
 {
   "access_token": "eyJhbGci...",
   "token_type": "bearer",
+  "expires_in": 86400,
   "role": "TEACHER",
   "user_id": 1754912345678,
   "full_name": "Anita Fernandes"
@@ -145,10 +145,20 @@ Send as `Authorization: Bearer <access_token>` on every subsequent call. Route b
 
 **Errors**
 - `401` — `"Incorrect email or password"`
-- `403` — `"No LMS profile exists for this account..."` or `"Inactive user account"`
-- `501` — password login not configured on the server (`FIREBASE_WEB_API_KEY` unset). Surface as a server config message, not a credentials error.
+- `403` — `"Inactive user account"`
+- `429` — too many failed attempts for this address (`LOGIN_MAX_FAILURES` within `LOGIN_LOCKOUT_MINUTES`, 10 in 15 minutes by default). Show the `detail`; it suggests waiting or resetting the password.
 
-⚠️ **Token expiry:** `access_token` is a Firebase ID token valid for **1 hour**, and this endpoint returns no refresh token. Handle `401` on any call by redirecting to login. If you want silent refresh, use the Firebase Web SDK for sign-in instead and send its ID token as the bearer — the backend accepts both.
+⚠️ **Token expiry and renewal:** `access_token` is a session token signed by the backend, valid for `expires_in` seconds (`ACCESS_TOKEN_EXPIRE_MINUTES`, 24 hours by default). Renew it before it runs out with `POST /api/v1/auth/refresh` (bearer = the current token), which returns the same `Token` shape. A session can be renewed for up to 30 days after the password was last typed; after that `/auth/refresh` answers `401` and the user signs in again. Handle `401` on any other call by redirecting to login — it also means the session was revoked (password changed or reset, account deactivated, or credentials regenerated with `revoke_sessions`).
+
+**Password endpoints**
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| `POST` | `/auth/password/change` | `{ "current_password", "new_password" }` | Signed-in user. Signs out every other device; the response carries a fresh `token` for this one — replace the stored token with it |
+| `POST` | `/auth/password/reset-request` | `{ "email" }` | Public. Always answers the same way, whether or not the address has an account. Emails a link to `<LMS_APP_URL>/reset-password?token=...` |
+| `POST` | `/auth/password/reset` | `{ "token", "new_password" }` | Public. The page at `/reset-password` posts the token from its query string. `400` when the link has expired or was already used |
+
+New passwords must be at least `PASSWORD_MIN_LENGTH` (8) characters and may not start or end with a space; a refused password answers `400` with the reason in `detail`.
 
 ---
 
@@ -158,7 +168,7 @@ Send as `Authorization: Bearer <access_token>` on every subsequent call. Route b
 |---|---|---|
 | `GET` | `/admin/users?role=TEACHER` | List users, optional role filter |
 | `PUT` | `/admin/users/{id}` | Edit `full_name`, `email`, `is_active` |
-| `DELETE` | `/admin/users/{id}` | Deactivate (soft delete, `204`) |
+| `DELETE` | `/admin/users/{id}` | Deactivate (soft delete; `200` with a `UserDeleted` summary) — signs the user out everywhere |
 | `POST` | `/admin/users/{id}/reactivate` | Re-enable |
 | `GET` | `/auth/me` | Current user profile |
 

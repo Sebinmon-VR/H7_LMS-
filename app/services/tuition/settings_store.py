@@ -5,12 +5,12 @@ Environment variables are the right place for credentials and for facts about th
 They are the wrong place for "remind people 10 minutes before class" and "a class is 45
 minutes", which are decisions the person running the school makes, changes their mind about,
 and cannot make at all if it needs an engineer and a restart. The brief asks for exactly
-these to be settable by the admin - for both products - so they live in Firestore.
+these to be settable by the admin - for both products - so they live in the database.
 
 The resolution order is: the stored document, then the environment default, then a hardcoded
 constant. That ordering matters more than it looks. It means the feature ships working with
 no configuration at all, an existing deployment's `.env` keeps deciding behaviour until
-somebody actually changes something in the admin UI, and a Firestore outage degrades to the
+somebody actually changes something in the admin UI, and a database outage degrades to the
 environment values rather than to nothing.
 
 One document per program, in `app_settings`. Cached, because the reminder sweep reads it
@@ -204,7 +204,7 @@ def tuition_settings() -> dict:
         "library_syllabus_filter": _bool(
             stored.get("library_syllabus_filter"), env_settings.LIBRARY_SYLLABUS_FILTER
         ),
-        "auto_create_meet": _bool(stored.get("auto_create_meet"), env_settings.ENABLE_GOOGLE_MEET),
+        "auto_create_meet": _bool(stored.get("auto_create_meet"), env_settings.ENABLE_ACS_CALLING),
     }
 
 
@@ -362,10 +362,10 @@ def program_settings(program: str) -> dict:
 
 # Which keys each program will accept from an update. An unknown key is rejected rather than
 # stored, so a typo in the admin UI ("remind_teacher") fails loudly at the API instead of
-# being written to Firestore and silently ignored forever after.
+# being written to the database and silently ignored forever after.
 #
 # Written out rather than derived from the resolver functions above: deriving it would mean
-# a Firestore read at import time, which is the least reliable moment in the process to
+# a database read at import time, which is the least reliable moment in the process to
 # reach a network service and the exact failure this codebase has been bitten by before.
 #
 # Split into a shared core and a per-program remainder. The identifier keys below are LMS

@@ -1,10 +1,9 @@
 """
-Outbound email over SMTP, targeting Gmail and Google Workspace.
+Outbound email, through Azure Communication Services Email or any SMTP relay.
 
-Workspace does not accept an ordinary account password over SMTP. `SMTP_PASSWORD` must be
-a 16-character App Password generated at https://myaccount.google.com/apppasswords, which
-in turn requires 2-Step Verification on the sending account. Workspace admins must also
-leave SMTP relay / "less secure app" restrictions permissive enough for the sending user.
+ACS is the default: it is the same Communication resource the live classes run on, once an
+email domain is connected to it, and it needs no mailbox or app password. ACS_EMAIL_SENDER is
+the MailFrom address of that domain. SMTP remains for a school that already has a relay.
 
 Delivery is best-effort by design: `send_email` returns False instead of raising, so a mail
 outage never rolls back an account that was successfully provisioned. Callers surface the
@@ -14,6 +13,7 @@ boolean to the admin and fall back to reading the credentials off the screen.
 import logging
 import smtplib
 import ssl
+import threading
 from email.message import EmailMessage
 from email.utils import formataddr
 
@@ -21,38 +21,114 @@ from app.core.config import settings
 
 logger = logging.getLogger("mailer")
 
-# Gmail's implicit-TLS port. Anything else is treated as STARTTLS on a plaintext connect.
+# The implicit-TLS port. Anything else is treated as STARTTLS on a plaintext connect.
 _IMPLICIT_TLS_PORT = 465
+
+PROVIDER_ACS = "ACS"
+PROVIDER_SMTP = "SMTP"
+
+_acs_client = None
+_acs_lock = threading.Lock()
+
+
+def _acs_connection_string() -> str:
+    return (settings.ACS_EMAIL_CONNECTION_STRING or settings.ACS_CONNECTION_STRING or "").strip()
+
+
+def _acs_ready() -> bool:
+    return bool(_acs_connection_string() and (settings.ACS_EMAIL_SENDER or "").strip())
+
+
+def _smtp_ready() -> bool:
+    address = (settings.SMTP_FROM or settings.SMTP_USER or "").strip()
+    return bool(settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASSWORD and address)
+
+
+def provider() -> str | None:
+    """Which transport sends mail: the one asked for, else whichever is configured."""
+    wanted = (settings.EMAIL_PROVIDER or "").strip().upper()
+    if wanted == PROVIDER_SMTP:
+        return PROVIDER_SMTP if _smtp_ready() else None
+    if wanted == PROVIDER_ACS:
+        return PROVIDER_ACS if _acs_ready() else None
+    if _acs_ready():
+        return PROVIDER_ACS
+    if _smtp_ready():
+        return PROVIDER_SMTP
+    return None
 
 
 def _sender() -> tuple[str, str]:
     """Returns the (display name, address) the message is sent from."""
-    address = (settings.SMTP_FROM or settings.SMTP_USER or "").strip()
-    return (settings.SMTP_FROM_NAME or settings.PROJECT_NAME, address)
+    name = settings.SMTP_FROM_NAME or settings.resolved_school_name or settings.PROJECT_NAME
+    if provider() == PROVIDER_ACS:
+        return name, settings.ACS_EMAIL_SENDER.strip()
+    return name, (settings.SMTP_FROM or settings.SMTP_USER or "").strip()
 
 
 def is_configured() -> bool:
-    """True when enough SMTP settings are present to attempt a send."""
-    if not settings.ENABLE_EMAIL_NOTIFICATIONS:
-        return False
-    _, address = _sender()
-    return bool(settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASSWORD and address)
+    """True when enough settings are present to attempt a send."""
+    return bool(settings.ENABLE_EMAIL_NOTIFICATIONS and provider())
 
 
-def send_email(to: str, subject: str, body_text: str, body_html: str | None = None) -> bool:
+def describe() -> dict:
+    """Non-secret summary for the admin's integrations screen."""
+    chosen = provider()
+    return {
+        "enabled": settings.ENABLE_EMAIL_NOTIFICATIONS,
+        "configured": is_configured(),
+        "provider": chosen,
+        "sender": _sender()[1] if chosen else None,
+        "acs_configured": _acs_ready(),
+        "smtp_configured": _smtp_ready(),
+        "smtp_host": settings.SMTP_HOST or None,
+    }
+
+
+def absolute_link(link: str | None) -> str | None:
     """
-    Sends one message and reports whether the SMTP server accepted it.
-
-    Never raises: every failure path is logged and returns False.
+    A link that works from an inbox. Class links are stored as app paths (/call/...), which
+    only mean something inside the LMS; an email needs the app's origin in front.
     """
-    if not is_configured():
-        logger.warning(
-            "Email not sent to '%s': SMTP is not configured "
-            "(set ENABLE_EMAIL_NOTIFICATIONS, SMTP_HOST, SMTP_USER, SMTP_PASSWORD).",
-            to,
-        )
-        return False
+    if not link:
+        return link
+    if link.lower().startswith(("http://", "https://")):
+        return link
+    base = settings.resolved_app_url
+    return f"{base}{link if link.startswith('/') else '/' + link}" if base else None
 
+
+def _send_acs(to: str, subject: str, body_text: str, body_html: str | None) -> bool:
+    global _acs_client
+    from azure.communication.email import EmailClient
+
+    with _acs_lock:
+        if _acs_client is None:
+            _acs_client = EmailClient.from_connection_string(_acs_connection_string())
+    # ACS takes the display name from the sender configured on the email domain, not from
+    # the message, so only the address is sent.
+    _, from_address = _sender()
+    content = {"subject": subject, "plainText": body_text}
+    if body_html:
+        content["html"] = body_html
+    poller = _acs_client.begin_send({
+        "senderAddress": from_address,
+        "recipients": {"to": [{"address": to}]},
+        "content": content,
+    })
+    # ACS accepts the message at once and delivers it in the background. Wait a little for
+    # the verdict, but a message still in flight counts as sent: it was accepted.
+    poller.wait(timeout=settings.SMTP_TIMEOUT_SECONDS)
+    if poller.done():
+        result = poller.result()
+        status = str((result or {}).get("status") or "").lower()
+        if status and status not in ("succeeded", "running", "notstarted"):
+            logger.error("ACS did not send '%s' to %s: %s", subject, to, (result or {}).get("error"))
+            return False
+    return True
+
+
+def _send_smtp(to: str, subject: str, body_text: str, body_html: str | None) -> bool:
     from_name, from_address = _sender()
 
     message = EmailMessage()
@@ -63,38 +139,53 @@ def send_email(to: str, subject: str, body_text: str, body_html: str | None = No
     if body_html:
         message.add_alternative(body_html, subtype="html")
 
-    try:
-        context = ssl.create_default_context()
-        if settings.SMTP_PORT == _IMPLICIT_TLS_PORT:
-            with smtplib.SMTP_SSL(
-                settings.SMTP_HOST, settings.SMTP_PORT,
-                timeout=settings.SMTP_TIMEOUT_SECONDS, context=context,
-            ) as server:
-                server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
-                server.send_message(message)
-        else:
-            with smtplib.SMTP(
-                settings.SMTP_HOST, settings.SMTP_PORT,
-                timeout=settings.SMTP_TIMEOUT_SECONDS,
-            ) as server:
+    context = ssl.create_default_context()
+    if settings.SMTP_PORT == _IMPLICIT_TLS_PORT:
+        with smtplib.SMTP_SSL(
+            settings.SMTP_HOST, settings.SMTP_PORT,
+            timeout=settings.SMTP_TIMEOUT_SECONDS, context=context,
+        ) as server:
+            server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+            server.send_message(message)
+    else:
+        with smtplib.SMTP(
+            settings.SMTP_HOST, settings.SMTP_PORT,
+            timeout=settings.SMTP_TIMEOUT_SECONDS,
+        ) as server:
+            server.ehlo()
+            if settings.SMTP_USE_TLS:
+                server.starttls(context=context)
                 server.ehlo()
-                if settings.SMTP_USE_TLS:
-                    server.starttls(context=context)
-                    server.ehlo()
-                server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
-                server.send_message(message)
+            server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+            server.send_message(message)
+    return True
 
-        logger.info("Sent '%s' to %s", subject, to)
-        return True
-    except smtplib.SMTPAuthenticationError as exc:
-        logger.error(
-            "SMTP authentication failed for '%s'. Gmail and Workspace require an App "
-            "Password, not the account password: %s",
-            settings.SMTP_USER, exc,
+
+def send_email(to: str, subject: str, body_text: str, body_html: str | None = None) -> bool:
+    """
+    Sends one message and reports whether the mail service accepted it.
+
+    Never raises: every failure path is logged and returns False.
+    """
+    if not is_configured():
+        logger.warning(
+            "Email not sent to '%s': no mail transport is configured "
+            "(set ACS_EMAIL_SENDER with ACS_CONNECTION_STRING, or the SMTP_* settings).",
+            to,
         )
         return False
+
+    transport = provider()
+    try:
+        sent = (_send_acs if transport == PROVIDER_ACS else _send_smtp)(to, subject, body_text, body_html)
+        if sent:
+            logger.info("Sent '%s' to %s via %s", subject, to, transport)
+        return sent
+    except smtplib.SMTPAuthenticationError as exc:
+        logger.error("SMTP authentication failed for '%s': %s", settings.SMTP_USER, exc)
+        return False
     except Exception as exc:
-        logger.error("Failed to send '%s' to %s: %s", subject, to, exc)
+        logger.error("Failed to send '%s' to %s via %s: %s", subject, to, transport, exc)
         return False
 
 
@@ -117,6 +208,7 @@ def send_class_reminder_email(
     the zone arithmetic.
     """
     display_name = full_name or to
+    meeting_link = absolute_link(meeting_link)
     lead = (
         f"starts in {minutes_before} minutes"
         if minutes_before > 0 else "is starting now"
@@ -394,6 +486,44 @@ def send_credentials_email(
     return send_email(
         to=to,
         subject=f"Your {settings.PROJECT_NAME} login details",
+        body_text=body_text,
+        body_html=body_html,
+    )
+
+
+def send_password_reset_email(to: str, full_name: str, reset_url: str) -> bool:
+    """
+    Sends a "forgot password" link. The link works once, for PASSWORD_RESET_TOKEN_MINUTES.
+
+    Wording is deliberate about the case where the person did not ask: nothing has changed
+    on their account until the link is used, so ignoring the message is always safe.
+    """
+    display_name = full_name or to
+    minutes = settings.PASSWORD_RESET_TOKEN_MINUTES
+    school = settings.resolved_school_name
+
+    body_text = (
+        f"Hello {display_name},\n\n"
+        f"Somebody asked to reset the password of your {school} account.\n"
+        f"Choose a new password here (the link works once, for {minutes} minutes):\n\n"
+        f"{reset_url}\n\n"
+        f"If you did not ask for this, ignore this email - your password has not changed.\n"
+    )
+    body_html = (
+        f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#202124;">'
+        f"<p>Hello {display_name},</p>"
+        f"<p>Somebody asked to reset the password of your <strong>{school}</strong> account.</p>"
+        f'<p style="margin:24px 0;">'
+        f'<a href="{reset_url}" style="background:#1a73e8;color:#ffffff;padding:10px 20px;'
+        f'border-radius:4px;text-decoration:none;display:inline-block;">Choose a new password</a></p>'
+        f'<p style="color:#5f6368;">The link works once, for {minutes} minutes. If you did not '
+        f"ask for this, ignore this email - your password has not changed.</p>"
+        f"</div>"
+    )
+
+    return send_email(
+        to=to,
+        subject=f"Reset your {school} password",
         body_text=body_text,
         body_html=body_html,
     )

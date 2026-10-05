@@ -143,10 +143,11 @@ class ClassRoomAccessOut(BaseModel):
     """
     A class's standing room, as one person sees it right now.
 
-    The school runs one Google Meet room per class: students join it and stay, and each
-    subject teacher joins at their period. `may_join` is the single flag a join button
-    binds to - for a student it is true while any period of the class is on (within the
-    join window) or any scheduled session is live; a teacher or admin may always enter.
+    The school runs one live-class room per class, joined inside the LMS: students join it
+    and stay, and each subject teacher joins at their period. `may_join` is the single flag
+    a join button binds to - for a student it is true while any period of the class is on
+    (within the join window) or any scheduled session is live; a teacher or admin may always
+    enter.
     `join_blocked_reason` is the sentence to show when it is false.
     """
     class_id: int
@@ -154,7 +155,7 @@ class ClassRoomAccessOut(BaseModel):
     class_code: str | None = None
 
     has_room: bool = False
-    # GOOGLE_MEET or MANUAL.
+    # AZURE_ACS or MANUAL (GOOGLE_MEET on a room from before the move to Azure).
     room_provider: str | None = None
     # NONE, CREATED, MANUAL or FAILED; `room_error` explains FAILED.
     room_status: str | None = None
@@ -193,7 +194,8 @@ class ClassRoomAccessOut(BaseModel):
     my_last_at: datetime | None = None
     in_room: bool = False
 
-    # Present only when the caller may enter, the same rule the session join applies.
+    # Present only when the caller may enter, the same rule the session join applies. For an
+    # LMS room this is the in-app call page, /call/class/<id>.
     room_link: str | None = None
 
 
@@ -206,9 +208,9 @@ class JoinRoomOut(BaseModel):
 
 class ClassRoomEventOut(BaseModel):
     """
-    One line of a class's room log: a join the LMS handed a link out for, a period a teacher
-    opened or closed, a room made or removed. What the LMS itself saw - Google does not
-    report who is inside a Meet to this app.
+    One line of a class's room log: a connect or hang-up reported by the in-LMS call, a join
+    the LMS handed a pasted external link out for, a period a teacher opened or closed, a
+    room made or removed.
     """
     id: int | None = None
     class_id: int
@@ -216,7 +218,7 @@ class ClassRoomEventOut(BaseModel):
     user_id: int | None = None
     user_name: str | None = None
     role: str | None = None
-    # JOINED_ROOM, JOINED_SESSION, STARTED, ENDED, ROOM_CREATED, ROOM_REPLACED,
+    # JOINED_ROOM, LEFT_ROOM, JOINED_SESSION, STARTED, ENDED, ROOM_CREATED, ROOM_REPLACED,
     # ROOM_LINK_SET, ROOM_CLEARED.
     action: str
     detail: str | None = None
@@ -236,9 +238,8 @@ class LiveClassBoardRow(ClassRoomAccessOut):
     One class on the admin's live board: the room and today's clock, plus who has come in.
 
     `students_joined_today` counts distinct students the LMS let into the room or a session
-    today; `teacher_present` says a teacher came in since the current period opened.
-    Neither can see somebody who left, so they are attendance as the LMS knows it, not as
-    Google does.
+    today; `teacher_present` says a teacher came in since the current period opened. Both
+    come from the room log, which the in-LMS call writes on every connect and hang-up.
     """
     enrolled_count: int = 0
     students_joined_today: int = 0
@@ -250,7 +251,8 @@ class LiveClassBoardRow(ClassRoomAccessOut):
     live_sessions: list[LiveSessionOut] = Field(default_factory=list)
     last_event: ClassRoomEventOut | None = None
     is_live: bool = False
-    # Meet's own attendance record: when it was last copied, or why it cannot be yet.
+    # The day's attendance rows (`ClassRoomAttendanceOut`): when they were last rebuilt from
+    # the room log, or why they could not be.
     room_attendance_synced_at: datetime | None = None
     room_attendance_error: str | None = None
 
@@ -267,7 +269,7 @@ class RoomPresenceOut(BaseModel):
     """
     Who is in a class's room right now, by name, from the LMS log: a person is in when
     their last word today was a join, out when it was a leave. For the teacher in front of
-    the class and for the office; Meet's own record is `ClassRoomAttendanceOut`.
+    the class and for the office; the per-day summary is `ClassRoomAttendanceOut`.
     """
     class_id: int
     class_name: str
@@ -281,9 +283,11 @@ class RoomPresenceOut(BaseModel):
 
 class ClassRoomAttendanceOut(BaseModel):
     """
-    One participant of one Meet conference in a class's room, as Google recorded it: when
-    they joined and left, in sessions. Meet gives a display name, not an email, so
-    `matched_user_*` is the LMS's best match by name and may be empty for a guest.
+    One participant's day in a class's room: when they joined and left, in sessions, and the
+    minutes in between. Rebuilt from the room log the in-LMS call writes, so every row is an
+    LMS user (`user_kind` LMS) and `matched_user_*` is that user. Rows from before the move to
+    Azure were copied from Google Meet's records, matched by display name, and carry the
+    `conference_*` fields; those stay empty on rows built since.
     """
     id: str | None = None
     class_id: int
@@ -293,7 +297,7 @@ class ClassRoomAttendanceOut(BaseModel):
     conference_end_at: datetime | None = None
     participant: str | None = None
     display_name: str | None = None
-    # SIGNED_IN, ANONYMOUS or PHONE.
+    # LMS for rows built from the room log; SIGNED_IN, ANONYMOUS or PHONE on Meet-era rows.
     user_kind: str | None = None
     matched_user_id: int | None = None
     matched_user_name: str | None = None

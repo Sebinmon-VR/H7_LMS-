@@ -62,7 +62,7 @@ def _iso(value) -> str | None:
 
 def _as_datetime(value) -> datetime | None:
     """
-    Parses a stored timestamp, tolerating the shapes Firestore hands back.
+    Parses a stored timestamp, tolerating the shapes the database hands back.
 
     Returns None on anything unreadable rather than raising. A notice with a corrupted
     `expires_at` should stay on the board, not take down every request that lists it.

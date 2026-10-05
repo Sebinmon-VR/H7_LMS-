@@ -5,14 +5,15 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from google.api_core.exceptions import GoogleAPICallError, ResourceExhausted
 
 from app.core import firebase
 from app.core.sqldb import DatabaseUnavailable
 
 from app.api.v1.auth import router as auth_router
+from app.api.v1.calls import router as calls_router
+from app.api.v1.class_recordings import router as class_recordings_router
 from app.api.v1.admin import router as admin_router
 from app.api.v1.admissions import router as admissions_router
 from app.api.v1.admission_requests import (
@@ -161,7 +162,8 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
     description=(
         "API-First Backend for LMS (Learning Management System). "
-        "Integrated with Firebase Cloud Firestore & Google Cloud Storage APIs. "
+        "Runs on Azure: Azure SQL for data, Blob Storage for files, and Azure Communication "
+        "Services for live classes and email. "
         "Supports Authentication & RBAC, Students Module, Teachers Module, Admin Module, "
         "Independent Attendance Logging, Syllabus Topic Tracker, Live Meetings & Recordings, "
         "Book/Notes File Uploads, Online & Offline Exams with Answer Keys and Valuation, "
@@ -242,29 +244,10 @@ async def public_admission_form_cors(request: Request, call_next):
 # ---------------------------------------------------------------------------------------
 # When the database says no
 #
-# Every request here ends in Firestore, and Firestore fails in two ways worth telling the
-# caller apart: it is over quota, or it is unreachable. Left unhandled either surfaces as a
-# bare "Internal Server Error" with no body, which the frontend renders verbatim and the
-# person reading it takes for a bug in the app. A 503 with the reason - and, for quota, when
-# it lifts - is the same failure made actionable.
+# Left unhandled, a database outage surfaces as a bare "Internal Server Error" with no body,
+# which the frontend renders verbatim and the person reading it takes for a bug in the app. A
+# 503 with the reason is the same failure made actionable.
 # ---------------------------------------------------------------------------------------
-
-QUOTA_EXHAUSTED_DETAIL = (
-    "The database's daily read quota is used up, so nothing can be loaded until it resets. "
-    "On the Firebase Spark plan that is 50,000 document reads a day, resetting at midnight "
-    "Pacific time (12:30 pm IST). Upgrade the Firebase project to the Blaze plan to lift "
-    "the limit."
-)
-
-
-@app.exception_handler(ResourceExhausted)
-async def firestore_quota_exhausted(request: Request, exc: ResourceExhausted):
-    logger.error("Firestore quota exhausted on %s %s: %s", request.method, request.url.path, exc)
-    return JSONResponse(
-        status_code=503,
-        headers={"Retry-After": "3600"},
-        content={"detail": QUOTA_EXHAUSTED_DETAIL, "code": "database_quota_exhausted"},
-    )
 
 
 @app.exception_handler(DatabaseUnavailable)
@@ -277,26 +260,12 @@ async def sql_unavailable(request: Request, exc: DatabaseUnavailable):
     )
 
 
-@app.exception_handler(GoogleAPICallError)
-async def firestore_unavailable(request: Request, exc: GoogleAPICallError):
-    logger.error("Firestore call failed on %s %s: %s", request.method, request.url.path, exc)
-    return JSONResponse(
-        status_code=503,
-        headers={"Retry-After": "30"},
-        content={
-            "detail": f"The database is not responding ({exc.__class__.__name__}). "
-                      "Try again in a moment.",
-            "code": "database_unavailable",
-        },
-    )
-
-
 @app.middleware("http")
 async def add_timing_header(request: Request, call_next):
     """
     Stamps every response with its server-side duration.
 
-    Response time here is dominated by Firestore round trips, so having the number on each
+    Response time here is dominated by database round trips, so having the number on each
     response makes a regression visible immediately instead of being guessed at. Slow
     requests are logged so they surface without needing a profiler attached.
     """
@@ -312,13 +281,40 @@ async def add_timing_header(request: Request, call_next):
                        request.method, request.url.path, elapsed_ms)
     return response
 
-# Serve uploaded study materials static files for local testing
+# Files saved to the API server's own disk: local development, and anything uploaded while
+# cloud storage was unreachable.
 uploads_path = Path(settings.LOCAL_STORAGE_DIR)
 uploads_path.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=settings.LOCAL_STORAGE_DIR), name="uploads")
 
+
+@app.get("/files/{blob_path:path}", include_in_schema=False)
+def open_stored_file(blob_path: str, download: bool = False):
+    """
+    Every file in Blob storage is addressed as /files/<blob>, and answered here with a
+    redirect to a read link that expires in AZURE_BLOB_LINK_MINUTES. The container itself is
+    private, so a copied link stops working rather than serving the file for ever.
+
+    No sign-in is asked for, because files open in new tabs, image tags and iframes that
+    carry no bearer token - the same "anyone with the link" the files had on Google. The
+    addresses carry a random part, so they cannot be guessed.
+    """
+    from app.core import azure_blob
+
+    if not blob_path or ".." in blob_path.split("/"):
+        return JSONResponse(status_code=404, content={"detail": "File not found"})
+    if azure_blob.is_private(blob_path):
+        # Class recordings: watched through the LMS, which signs a link for whoever may see it.
+        return JSONResponse(status_code=403, content={"detail": "Open this recording from the LMS."})
+    try:
+        return RedirectResponse(azure_blob.read_url(blob_path, download=download), status_code=307)
+    except azure_blob.BlobStorageError as exc:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
 # Mount API Routers under /api/v1
 app.include_router(auth_router, prefix=settings.API_V1_STR)
+app.include_router(calls_router, prefix=settings.API_V1_STR)
+app.include_router(class_recordings_router, prefix=settings.API_V1_STR)
 app.include_router(admin_router, prefix=settings.API_V1_STR)
 app.include_router(teacher_router, prefix=settings.API_V1_STR)
 app.include_router(student_router, prefix=settings.API_V1_STR)
@@ -380,74 +376,21 @@ def root():
     }
 
 
-@app.get("/health/firestore", tags=["Health Check"])
-def firestore_health():
-    """
-    Whether the database is actually reachable, and which credentials got it there.
-
-    An unauthenticated Firestore client is not an error anywhere in this codebase: every
-    read short-circuits to an empty list, so a misconfigured deployment answers every
-    endpoint with `200 []` and looks like a database that was never populated. This
-    endpoint is the difference between those two states. It reports no secret material -
-    only the service account's address, which is what you would grant IAM roles to anyway.
-    """
-    import os
-
-    from app.core.firebase import initialize_firebase
-
-    database = initialize_firebase()
-    source = None
-    client_email = None
-
-    for label, path in (
-        ("FIREBASE_CREDENTIALS_PATH", settings.FIREBASE_CREDENTIALS_PATH),
-        ("GOOGLE_APPLICATION_CREDENTIALS", settings.GOOGLE_APPLICATION_CREDENTIALS),
-    ):
-        if path and os.path.exists(path):
-            source = f"{label}={path}"
-            try:
-                import json
-                with open(path, encoding="utf-8") as handle:
-                    client_email = json.load(handle).get("client_email")
-            except Exception:  # pragma: no cover - diagnostics must never raise
-                pass
-            break
-
-    probe = "not attempted"
-    if database is not None:
-        try:
-            # One trivial round trip. A client can construct successfully and still fail
-            # here when the key is valid but the project or IAM role is wrong.
-            next(iter(database.collection("users").limit(1).stream()), None)
-            probe = "ok"
-        except Exception as exc:
-            probe = f"failed: {exc}"
-
-    return {
-        "firestore_available": database is not None,
-        "read_probe": probe,
-        "project_id": settings.GCP_PROJECT_ID,
-        "credentials_source": source or "application default credentials (no key file found)",
-        "credentials_json_env_set": bool(settings.FIREBASE_CREDENTIALS_JSON),
-        "service_account": client_email,
-    }
-
-
 @app.get("/health/database", tags=["Health Check"])
 def database_health():
     """
     Which document backend is in use, and whether it answers.
 
-    `firestore` is the original; `azuresql` is the same collections as JSON-document tables
-    inside one schema of an Azure SQL database. The rest of the API cannot tell them apart,
-    which is the point - this is where somebody checks which one a deployment is on.
+    `azuresql` keeps the collections as JSON-document tables inside one schema of an Azure
+    SQL database. `firestore` was the original, kept only as a frozen backup of the data
+    from before the move to Azure.
     """
     backend = firebase.database_backend()
     if backend == "azuresql":
         from app.core import sqldb
 
         return {"backend": backend, **sqldb.health()}
-    return {"backend": backend, "see": "/health/firestore"}
+    return {"backend": backend, "detail": "Firestore is retired; set DATABASE_BACKEND=azuresql."}
 
 
 @app.get("/health/cache", tags=["Health Check"])
@@ -455,7 +398,7 @@ def cache_health():
     """
     Reference-cache effectiveness.
 
-    A low hit rate under normal traffic means responses are making more Firestore round
+    A low hit rate under normal traffic means responses are making more database round
     trips than necessary, which is the main driver of latency in this deployment.
     """
     from app.core.firebase import document_cache

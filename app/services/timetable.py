@@ -33,18 +33,37 @@ logger = logging.getLogger("timetable")
 TIME_FORMAT = "%H:%M"
 
 
+def school_timezone_name() -> str:
+    """
+    The IANA zone the school's timetable is written in.
+
+    The admin's School Settings value, falling back to SCHOOL_TIMEZONE only when that is
+    blank. There used to be two answers - School Settings said India while SCHOOL_TIMEZONE
+    said Dubai, and the timetable followed the latter - so a period an admin typed as 09:00
+    opened at 10:30 on a student's screen in India. One source now decides.
+    """
+    from app.services.tuition.settings_store import lms_settings
+
+    try:
+        name = (lms_settings().get("timezone") or "").strip()
+    except Exception as exc:  # the database being down must not stop the clock
+        logger.warning("School Settings unreadable (%s); using SCHOOL_TIMEZONE.", exc)
+        name = ""
+    return name or settings.resolved_school_timezone
+
+
 def school_timezone() -> ZoneInfo:
     """
-    The zone timetable times are interpreted in.
+    The zone timetable times are interpreted in; see `school_timezone_name`.
 
-    Falls back to UTC rather than raising: a typo in SCHOOL_TIMEZONE should make reminders
-    land at the wrong hour and say so loudly in the log, not stop the server from booting.
+    Falls back to UTC rather than raising: a typo in the setting should make reminders land
+    at the wrong hour and say so loudly in the log, not stop the server from booting.
     """
-    name = settings.resolved_school_timezone
+    name = school_timezone_name()
     try:
         return ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError, KeyError):
-        logger.error("SCHOOL_TIMEZONE '%s' is not a known IANA zone; falling back to UTC.", name)
+        logger.error("School timezone '%s' is not a known IANA zone; falling back to UTC.", name)
         return ZoneInfo("UTC")
 
 
@@ -54,7 +73,7 @@ def now_local() -> datetime:
 
 
 def format_time(value: time | str) -> str:
-    """Serializes a time to the 'HH:MM' form stored in Firestore."""
+    """Serializes a time to the 'HH:MM' form stored in the database."""
     if isinstance(value, str):
         return parse_time(value).strftime(TIME_FORMAT)
     return value.strftime(TIME_FORMAT)
@@ -157,7 +176,7 @@ def list_entries(
     """
     Reads timetable entries, filtered.
 
-    The most selective available field drives the Firestore query and the rest is filtered
+    The most selective available field drives the database query and the rest is filtered
     in memory - the collection is one row per period per class, so it stays small enough
     that a second query would cost more than the filtering saves.
     """

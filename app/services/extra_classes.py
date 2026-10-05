@@ -8,7 +8,7 @@ request with a different subject line.
 
 **Approving and creating are two steps.** `decide` records the decision; `materialise` builds
 the meeting or the session. They are apart because creation can fail - a timetable clash, a
-Meet link that would not generate - long after a human has pressed approve, and an approval
+live-class room that could not be made - long after a human has pressed approve, and an approval
 that rolls itself back because of an API error is worse than one that sits visibly in
 APPROVED with no class attached yet. The admin sees exactly what happened and can retry.
 
@@ -319,9 +319,9 @@ def _materialise_school(request: dict, start: datetime, actor):
     """
     Creates the school live meeting, reusing the path every other meeting goes through.
 
-    Deliberately not a shortcut straight to Firestore: going through `schedule_meeting` is
-    what gets the extra class a real Meet link, the students invited and the recording armed,
-    exactly like a timetabled one. An extra class that quietly lacked a link would be the
+    Deliberately not a shortcut straight to the database: going through `schedule_meeting`
+    is what gets the extra class its live-class room and the recording armed, exactly like a
+    timetabled one. An extra class that quietly lacked a link would be the
     first thing anybody noticed.
     """
     from app.schemas.meeting import LiveMeetingCreate

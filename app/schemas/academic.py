@@ -23,11 +23,13 @@ class ClassRoomOut(BaseModel):
     code: str
     description: str | None = None
 
-    # The class's standing live-class room - one Google Meet link the whole class shares,
-    # which every subject teacher joins at their period. All optional: a class created
-    # before rooms existed, or one whose room has not been set up, simply carries none.
-    # `room_status` is NONE, CREATED (a Meet room the LMS made), MANUAL (a pasted link) or
-    # FAILED (creation was attempted; `room_error` says why).
+    # The class's standing live-class room - one link the whole class shares, joined inside
+    # the LMS (/call/class/<id>), which every subject teacher joins at their period. All
+    # optional: a class created before rooms existed, or one whose room has not been set up,
+    # simply carries none. `room_status` is NONE, CREATED (an ACS room the LMS made), MANUAL
+    # (a pasted link) or FAILED (creation was attempted; `room_error` says why).
+    # `room_provider` is AZURE_ACS or MANUAL; GOOGLE_MEET marks a room from before the move
+    # to Azure, which is replaced by an ACS room on next need.
     room_link: str | None = None
     room_provider: str | None = None
     room_status: str | None = None
@@ -36,11 +38,11 @@ class ClassRoomOut(BaseModel):
     room_owner_email: str | None = None
     room_auto_record: bool | None = None
     room_recording_status: str | None = None
-    # Teachers on the room's Calendar guest list - the ones Meet lets in without asking.
+    # The Google Meet era's guest list and access setting. An ACS room admits exactly the
+    # people the LMS lets in at the moment they join, so there is no list to keep and these
+    # stay empty on rooms made since the move to Azure.
     room_guest_emails: list[str] | None = None
     room_guest_error: str | None = None
-    # Who may walk in without asking: OPEN (anyone with the link), TRUSTED or RESTRICTED.
-    # None means Google has not accepted the setting; `room_access_error` says why.
     room_access_type: str | None = None
     room_access_error: str | None = None
     room_created_at: datetime | None = None
@@ -52,16 +54,20 @@ class ClassRoomSetup(BaseModel):
     """
     Body of `POST /admin/classes/{id}/room`.
 
-    Leave everything blank to create a Google Meet room owned by the school's Workspace
-    identity. `owner_id` puts it on a particular teacher's calendar instead - the class
-    teacher, usually - which is also whose Drive its recordings land in. `manual_link` skips
-    Meet entirely and records a link the school already has (Zoom, Teams, an existing Meet).
+    Leave everything blank to create the class's live-class room in the LMS (an Azure
+    Communication Services room, joined at /call/class/<id>). Its recordings are filed into
+    Blob storage under the class. `manual_link` skips the LMS room entirely and records a
+    link the school already has (Zoom, Teams); nothing outside the LMS can be recorded.
     """
-    owner_id: int | None = Field(None, description="Teacher whose calendar hosts the room.")
-    auto_record: bool = Field(True, description="Arm the room to record itself.")
+    owner_id: int | None = Field(
+        None, description="Accepted for older clients and ignored: an LMS room has no owner."
+    )
+    auto_record: bool = Field(
+        True, description="Record each teacher's period in the room, starting when they join."
+    )
     manual_link: str | None = Field(None, max_length=2048, description="Use this link as-is.")
     replace: bool = Field(
-        False, description="Replace an existing room. The old Calendar event is deleted."
+        False, description="Replace an existing room. The old room is deleted."
     )
 
 

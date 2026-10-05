@@ -13,7 +13,8 @@ this deployment's size, and it carries two honest limitations:
   * With multiple server workers, a poll may land on a worker that never saw the job, so a
     client can get 404 for a job that is genuinely running elsewhere.
 
-Moving to a shared store (Firestore, Redis) or a real task queue (Celery, Cloud Tasks) is
+Moving to a shared store (the database, Redis) or a real task queue (Celery, Azure Queue
+Storage) is
 the fix when either becomes a problem. Until then, jobs are safe to lose: every one is a
 recomputation of derived data, never a source of truth.
 """
@@ -172,7 +173,7 @@ class ResultCache:
     TTL cache for expensive derived results such as the monitoring report.
 
     Kept separate from the document cache because entries are whole computed responses
-    rather than Firestore documents, and they carry a generation timestamp so clients can
+    rather than database documents, and they carry a generation timestamp so clients can
     show how fresh the figures are.
     """
 
