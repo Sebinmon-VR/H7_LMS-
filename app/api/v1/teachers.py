@@ -21,7 +21,7 @@ from app.core.firebase import (
 from app.services import timetable as timetable_service
 from app.services.content import (
     active_students_in_class as _active_students_in_class,
-    schedule_meeting, store_material,
+    material_update_fields, schedule_meeting, store_material, store_material_link,
 )
 from app.services.permissions import visible_records
 from app.services.recordings import harvest_meeting
@@ -31,7 +31,7 @@ from app.schemas.user import UserOut
 from app.schemas.attendance import BatchAttendanceCreate, AttendanceUpdate, AttendanceOut
 from app.schemas.topic import PendingTopicOut, TopicCreate, TopicUpdate, TopicOut
 from app.schemas.meeting import LiveMeetingCreate, LiveMeetingUpdate, LiveMeetingOut
-from app.schemas.material import StudyMaterialUpdate, StudyMaterialOut
+from app.schemas.material import StudyMaterialLinkCreate, StudyMaterialUpdate, StudyMaterialOut
 from app.schemas.grade import GradeEntryCreate, GradeEntryUpdate, ExamGradeOut
 
 router = APIRouter(prefix="/teachers", tags=["Teachers Module"])
@@ -609,6 +609,21 @@ async def upload_study_material(
     return StudyMaterialOut(**hydrate_study_material(material_data))
 
 
+@router.post("/materials/links", response_model=StudyMaterialOut, status_code=status.HTTP_201_CREATED)
+def share_study_link(
+    link_in: StudyMaterialLinkCreate,
+    current_user: UserOut = Depends(require_teacher)
+):
+    """
+    [Teacher Only] Share a web page or YouTube video into a class's library.
+
+    A YouTube address comes back with `link_kind` YOUTUBE and its `youtube_id`, and students
+    watch it in place; any other address is a WEB link that opens in a new tab.
+    """
+    material_data = store_material_link(link_in, teacher_id=current_user.id)
+    return StudyMaterialOut(**hydrate_study_material(material_data))
+
+
 @router.get("/materials", response_model=List[StudyMaterialOut])
 def list_uploaded_materials(
     class_id: Optional[int] = Query(None),
@@ -640,7 +655,7 @@ def update_study_material(
     material = require_document(firestore_materials, material_id, "Study material")
     assert_owner(material, current_user, "study materials")
 
-    updated = update_in.model_dump(exclude_unset=True, exclude_none=True)
+    updated = material_update_fields(material, update_in)
     if not updated:
         raise HTTPException(status_code=400, detail="No fields provided to update")
 
@@ -670,7 +685,8 @@ def delete_study_material(
         firestore_materials.delete_document(str(material_id))
         return None
 
-    if not keep_file:
+    # A shared link has no stored file to remove.
+    if not keep_file and not material.get("external_url"):
         storage_service.delete_file(
             material.get("file_url", ""),
             provider=material.get("storage_provider"),

@@ -175,18 +175,25 @@ def get_student_study_materials(
 ):
     """
     [Student Only] Access & download uploaded study notes, textbooks, and resources.
+
+    Covers every class the student is enrolled in, not only the first: a student holding two
+    enrollments otherwise sees the older class's library and nothing shared with the other.
     """
-    enrollment = next(
-        (e for e in firestore_student_enrollments.query_documents("student_id", "==", current_user.id)),
-        None
-    )
-    if not enrollment:
+    class_ids = {
+        e.get("class_id")
+        for e in firestore_student_enrollments.query_documents("student_id", "==", current_user.id)
+        if e.get("class_id") is not None
+    }
+    if not class_ids:
         return []
 
-    materials = firestore_materials.query_documents("class_id", "==", enrollment.get("class_id"))
+    materials = [
+        m for class_id in class_ids
+        for m in firestore_materials.query_documents("class_id", "==", class_id)
+    ]
     if subject_id is not None:
         materials = [m for m in materials if m.get("subject_id") == subject_id]
-    materials.sort(key=lambda m: m.get("uploaded_at"), reverse=True)
+    materials.sort(key=lambda m: m.get("uploaded_at") or "", reverse=True)
     prefetch_academic(materials)
     return [StudyMaterialOut(**hydrate_study_material(material)) for material in materials]
 

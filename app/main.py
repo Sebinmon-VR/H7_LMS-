@@ -15,6 +15,7 @@ from app.api.v1.auth import router as auth_router
 from app.api.v1.calls import router as calls_router
 from app.api.v1.class_recordings import router as class_recordings_router
 from app.api.v1.admin import router as admin_router
+from app.api.v1.arena import manage_router as arena_manage_router, router as arena_router
 from app.api.v1.admissions import router as admissions_router
 from app.api.v1.admission_requests import (
     PUBLIC_PREFIX as ADMISSION_REQUESTS_PUBLIC_PREFIX,
@@ -361,6 +362,9 @@ app.include_router(parent_reports_router, prefix=settings.API_V1_STR)
 app.include_router(support_router, prefix=settings.API_V1_STR)
 app.include_router(support_admin_router, prefix=settings.API_V1_STR)
 app.include_router(me_router, prefix=settings.API_V1_STR)
+# Quiz battles, rewards and leaderboards (docs/ARENA.md).
+app.include_router(arena_router, prefix=settings.API_V1_STR)
+app.include_router(arena_manage_router, prefix=settings.API_V1_STR)
 
 
 @app.get("/", tags=["Health Check"])

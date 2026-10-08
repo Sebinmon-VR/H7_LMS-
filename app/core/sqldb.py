@@ -83,6 +83,12 @@ INDEXED_FIELDS: dict[str, list[str]] = {
     "extra_class_requests": ["requested_by"],
     "leave_requests": ["teacher_id"],
     "homework_assignments": ["teacher_id"],
+    "syllabus_chapters": ["class_id"],
+    "question_bank": ["scope", "class_id", "chapter_id"],
+    "arena_answers": ["match_id"],
+    "arena_points": ["board_period", "student_id"],
+    "arena_invites": ["to_id", "match_id"],
+    "arena_matches": ["code"],
 }
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

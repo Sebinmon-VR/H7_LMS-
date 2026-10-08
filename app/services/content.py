@@ -21,6 +21,7 @@ from app.core.firebase import (
     firestore_student_enrollments, firestore_users,
 )
 from app.schemas.meeting import LiveMeetingCreate
+from app.services.links import LINK_KIND_YOUTUBE, parse_link
 
 logger = logging.getLogger("content_service")
 
@@ -284,3 +285,55 @@ async def store_material(
     firestore_materials.add_document(str(material_id), material_data)
     material_data["id"] = material_id
     return material_data
+
+
+def store_material_link(link_in, teacher_id: int) -> dict:
+    """
+    Records a web page or YouTube video in the library. Nothing is uploaded: the address is
+    validated, a YouTube video id is picked out so it can play in place, and the material
+    is filed against the class and subject like any upload.
+    """
+    assert_class_and_subject_exist(link_in.class_id, link_in.subject_id)
+    link = parse_link(link_in.external_url)
+
+    material_type = (link_in.material_type or "").strip().upper() or (
+        "VIDEO" if link["link_kind"] == LINK_KIND_YOUTUBE else "LINK"
+    )
+    material_id = firestore_materials.get_next_numeric_id()
+    material_data = {
+        "class_id": link_in.class_id,
+        "subject_id": link_in.subject_id,
+        "teacher_id": teacher_id,
+        "title": link_in.title.strip(),
+        "material_type": material_type,
+        "description": (link_in.description or "").strip() or None,
+        # The same address in file_url, so a screen that only knows files still opens it.
+        "file_url": link["external_url"],
+        "storage_provider": "EXTERNAL",
+        **link,
+        "uploaded_at": datetime.utcnow().isoformat(),
+    }
+    firestore_materials.add_document(str(material_id), material_data)
+    material_data["id"] = material_id
+    return material_data
+
+
+def material_update_fields(material: dict, update_in) -> dict:
+    """
+    The fields a metadata edit writes. A new address is only taken on a shared link (an
+    uploaded file is replaced by deleting and uploading again) and is re-checked first.
+    """
+    updated = update_in.model_dump(exclude_unset=True, exclude_none=True)
+    new_url = updated.pop("external_url", None)
+    if new_url is not None:
+        if not material.get("external_url"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only a shared link can change its address. Delete the file and upload again.",
+            )
+        link = parse_link(new_url)
+        updated.update(link)
+        updated["file_url"] = link["external_url"]
+    if "description" in updated:
+        updated["description"] = updated["description"].strip() or None
+    return updated

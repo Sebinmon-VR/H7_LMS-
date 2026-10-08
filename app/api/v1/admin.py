@@ -22,6 +22,7 @@ from app.core.firebase import (
     firestore_materials, firestore_grades, firestore_timetable, firestore_reminder_log,
     firestore_recording_log, firestore_exams, firestore_exam_submissions,
     firestore_report_cards, firestore_parent_links,
+    firestore_syllabus_chapters, firestore_question_bank,
     hydrate_teacher_mapping, hydrate_class_teacher_mapping, hydrate_student_enrollment,
     hydrate_live_meeting, hydrate_study_material, hydrate_timetable_entry,
     require_document, delete_with_dependencies, prefetch_references, prefetch_academic
@@ -32,15 +33,15 @@ from app.services import class_rooms as class_room_service
 from app.services import families as family_service
 from app.services import timetable as timetable_service
 from app.services.content import (
-    is_legacy_meet_link, regenerate_meeting_link, resolve_teacher, schedule_meeting,
-    store_material,
+    is_legacy_meet_link, material_update_fields, regenerate_meeting_link, resolve_teacher,
+    schedule_meeting, store_material, store_material_link,
 )
 from app.services.recordings import (
     get_scheduler as get_recording_scheduler, harvest_meeting, sweep as run_recording_sweep,
 )
 from app.services.reminders import get_scheduler, sweep as run_reminder_sweep
 from app.schemas.meeting import AdminLiveMeetingCreate, LiveMeetingUpdate, LiveMeetingOut
-from app.schemas.material import StudyMaterialUpdate, StudyMaterialOut
+from app.schemas.material import AdminStudyMaterialLinkCreate, StudyMaterialUpdate, StudyMaterialOut
 from app.schemas.timetable import (
     ScheduledPeriod, TimetableBulkCreate, TimetableBulkResult,
     TimetableEntryCreate, TimetableEntryOut, TimetableEntryUpdate,
@@ -645,6 +646,8 @@ def delete_class_room(
             ("exam(s)", firestore_exams, "class_id"),
             ("exam submission(s)", firestore_exam_submissions, "class_id"),
             ("report card(s)", firestore_report_cards, "class_id"),
+            ("syllabus chapter(s)", firestore_syllabus_chapters, "class_id"),
+            ("arena question(s)", firestore_question_bank, "class_id"),
         ],
         force=force,
     )
@@ -730,6 +733,8 @@ def delete_subject(
             ("exam grade(s)", firestore_grades, "subject_id"),
             ("exam(s)", firestore_exams, "subject_id"),
             ("exam submission(s)", firestore_exam_submissions, "subject_id"),
+            ("syllabus chapter(s)", firestore_syllabus_chapters, "subject_id"),
+            ("arena question(s)", firestore_question_bank, "subject_id"),
         ],
         force=force,
     )
@@ -1471,6 +1476,25 @@ async def admin_upload_material(
     return StudyMaterialOut(**hydrate_study_material(material_data))
 
 
+@router.post("/materials/links", response_model=StudyMaterialOut, status_code=status.HTTP_201_CREATED)
+def admin_share_study_link(
+    link_in: AdminStudyMaterialLinkCreate,
+    current_user: UserOut = Depends(require_admin)
+):
+    """
+    [Admin Only] Share a web page or YouTube video into a class's library, optionally on
+    behalf of a teacher. YouTube addresses play in place for students.
+    """
+    teacher_id = link_in.teacher_id
+    if teacher_id is not None:
+        resolve_teacher(teacher_id)
+    else:
+        teacher_id = current_user.id
+
+    material_data = store_material_link(link_in, teacher_id=teacher_id)
+    return StudyMaterialOut(**hydrate_study_material(material_data))
+
+
 @router.get("/materials", response_model=List[StudyMaterialOut])
 def admin_list_materials(
     class_id: Optional[int] = Query(None),
@@ -1505,9 +1529,9 @@ def admin_update_material(
     [Admin Only] Rename any study material or change its type.
     To replace the file itself, delete the material and upload again.
     """
-    require_document(firestore_materials, material_id, "Study material")
+    material = require_document(firestore_materials, material_id, "Study material")
 
-    updated = update_in.model_dump(exclude_unset=True, exclude_none=True)
+    updated = material_update_fields(material, update_in)
     if not updated:
         raise HTTPException(status_code=400, detail="No fields provided to update")
 
@@ -1535,7 +1559,8 @@ def admin_delete_material(
         firestore_materials.delete_document(str(material_id))
         return None
 
-    if not keep_file:
+    # A shared link has no stored file to remove.
+    if not keep_file and not material.get("external_url"):
         storage_service.delete_file(
             material.get("file_url", ""),
             provider=material.get("storage_provider"),

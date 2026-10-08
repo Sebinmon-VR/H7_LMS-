@@ -968,6 +968,10 @@ def hydrate_study_material(material: dict) -> dict:
         "recording_key": material.get("recording_key"),
         "storage_provider": material.get("storage_provider"),
         "storage_warning": material.get("storage_warning"),
+        "external_url": material.get("external_url"),
+        "link_kind": material.get("link_kind"),
+        "youtube_id": material.get("youtube_id"),
+        "description": material.get("description"),
     }
 
 
@@ -1222,6 +1226,34 @@ firestore_support_contacts = _service("support_contacts", cacheable=True)
 # update rather than a second script.
 firestore_homework = _service("homework_assignments")
 firestore_homework_submissions = _service("homework_submissions")
+
+# ---------------------------------------------------------------------------------------
+# Arena: quiz battles, rewards and leaderboards. See docs/ARENA.md.
+# ---------------------------------------------------------------------------------------
+
+# One ordered list of chapters per class and subject. Read on every arena home and every
+# class battle; written by a teacher now and then, so it earns the cache.
+firestore_syllabus_chapters = _service("syllabus_chapters", cacheable=True)
+# Questions for chapters (scope CLASS) and the school-wide pool (scope GLOBAL).
+firestore_question_bank = _service("question_bank")
+# Admin-made themed competitions over the global pool.
+firestore_arena_challenges = _service("arena_challenges", cacheable=True)
+# One document per battle: players, questions (with their keys - never sent as stored),
+# bot plan and outcome. The live phase is derived from it and the answers, never stored.
+firestore_arena_matches = _service("arena_matches")
+# One document per answer, keyed `{match}:{round}:{user}` and created atomically, so a
+# player can answer a round once and two players answering together never collide.
+firestore_arena_answers = _service("arena_answers")
+# One per student: XP, coins, level, stats, items, badges, the battle they are in.
+firestore_arena_profiles = _service("arena_profiles")
+# Leaderboard rows, keyed `{board}|{period}|{student}`.
+firestore_arena_points = _service("arena_points")
+# Challenges sent to a classmate.
+firestore_arena_invites = _service("arena_invites")
+# Quick-match waiting slots, one per pool, claimed with an atomic create.
+firestore_arena_queue = _service("arena_queue")
+# One-shot claims: finalising a match, starting it, pairing a queue slot.
+firestore_arena_claims = _service("arena_claims")
 
 
 def hydrate_tuition_enrollment(enrollment: dict) -> dict:
