@@ -225,6 +225,9 @@ BADGES = [
     _badge("dedicated", "Dedicated", "📅", "Battle 3 days in a row.", "COMMON", 30, "best_day_streak", 3),
     _badge("devoted", "Devoted", "🗓️", "Battle 7 days in a row.", "EPIC", 120, "best_day_streak", 7),
     _badge("collector", "Collector", "🎒", "Own 10 items.", "RARE", 60, "items_owned", 10),
+    _badge("lab_first", "First Experiment", "🧪", "Complete an experiment in the virtual lab.", "COMMON", 25, "experiments", 1),
+    _badge("lab_scientist", "Lab Scientist", "🔬", "Complete 5 different lab experiments.", "RARE", 80, "experiments", 5),
+    _badge("lab_master", "Master Chemist", "⚗️", "Complete 12 different lab experiments.", "EPIC", 200, "experiments", 12),
     _badge("top_of_class", "Top of the Class", "🥇", "Reach number 1 on your class's weekly board.", "EPIC", 150),
 ]
 BADGES_BY_ID = {badge["id"]: badge for badge in BADGES}

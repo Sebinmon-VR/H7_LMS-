@@ -18,6 +18,7 @@ from app.services.arena import catalog
 STAT_KEYS = (
     "matches", "wins", "losses", "draws", "correct", "answered", "win_streak", "best_win_streak",
     "perfect_matches", "human_matches", "global_matches", "bot_wins", "day_streak", "best_day_streak",
+    "experiments",
 )
 
 

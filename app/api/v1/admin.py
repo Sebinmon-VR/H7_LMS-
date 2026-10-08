@@ -22,7 +22,7 @@ from app.core.firebase import (
     firestore_materials, firestore_grades, firestore_timetable, firestore_reminder_log,
     firestore_recording_log, firestore_exams, firestore_exam_submissions,
     firestore_report_cards, firestore_parent_links,
-    firestore_syllabus_chapters, firestore_question_bank,
+    firestore_syllabus_chapters, firestore_question_bank, firestore_lab_assignments,
     hydrate_teacher_mapping, hydrate_class_teacher_mapping, hydrate_student_enrollment,
     hydrate_live_meeting, hydrate_study_material, hydrate_timetable_entry,
     require_document, delete_with_dependencies, prefetch_references, prefetch_academic
@@ -648,6 +648,7 @@ def delete_class_room(
             ("report card(s)", firestore_report_cards, "class_id"),
             ("syllabus chapter(s)", firestore_syllabus_chapters, "class_id"),
             ("arena question(s)", firestore_question_bank, "class_id"),
+            ("lab assignment(s)", firestore_lab_assignments, "class_id"),
         ],
         force=force,
     )

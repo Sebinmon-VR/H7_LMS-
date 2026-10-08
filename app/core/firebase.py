@@ -1254,6 +1254,9 @@ firestore_arena_invites = _service("arena_invites")
 firestore_arena_queue = _service("arena_queue")
 # One-shot claims: finalising a match, starting it, pairing a queue slot.
 firestore_arena_claims = _service("arena_claims")
+# Virtual lab: experiments set for a class, and students' finished runs (app/services/lab.py).
+firestore_lab_assignments = _service("lab_assignments")
+firestore_lab_attempts = _service("lab_attempts")
 
 
 def hydrate_tuition_enrollment(enrollment: dict) -> dict:
