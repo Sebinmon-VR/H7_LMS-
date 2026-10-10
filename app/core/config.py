@@ -410,7 +410,7 @@ class Settings(BaseSettings):
     SCHOOL_DISPLAY_NAME: str = "H7 EdTech"
     # Who a family should write to or ring. Mail is sent from a no-reply address, so the
     # contact email also becomes the Reply-To of every family-facing message.
-    SCHOOL_CONTACT_EMAIL: str = "academics@h7ed.com"
+    SCHOOL_CONTACT_EMAIL: str = "support@hamdaz.com"
     SCHOOL_CONTACT_PHONE: str = "+91 92077 73300"
     SCHOOL_ADDRESS: str = ""
     SCHOOL_WEBSITE_URL: str = "https://h7ed.com"
