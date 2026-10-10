@@ -40,3 +40,6 @@ students drag equipment, pour chemicals, heat, test gases and run guided experim
   counts toward the class leaderboard; repeats are recorded but pay nothing. Badges: First
   Experiment (1), Lab Scientist (5), Master Chemist (12).
 * Teachers see every student's attempts, best score and latest observations.
+* Online tuition students open the lab from their Games shelf (`/tuition/student/games/lab`):
+  free mode and library experiments with the same first-completion rewards, no class points
+  and no assignments, since assignments are set per school class.

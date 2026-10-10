@@ -30,6 +30,14 @@ def _student_only(user: UserOut) -> None:
         raise HTTPException(status_code=403, detail="The arena is for students. Use Arena management to set it up.")
 
 
+def _with_people(user: UserOut) -> None:
+    """
+    Classmates, rooms, quick match and invites are the school arena. A tuition-only student
+    gets the solo half (the bot, the lab, the locker) from the tuition games shelf.
+    """
+    profiles.require_school_player(user)
+
+
 # ===================================================================== student: home
 
 @router.get("/me")
@@ -102,6 +110,7 @@ def equip_item(body: ItemChoice, current_user: UserOut = Depends(require_student
 def list_classmates(current_user: UserOut = Depends(require_student)):
     """[Student] My classmates, online first, to challenge."""
     _student_only(current_user)
+    _with_people(current_user)
     return engine.classmates(current_user)
 
 
@@ -128,6 +137,7 @@ def my_recent_matches(current_user: UserOut = Depends(require_student)):
 def join_room(body: JoinByCode, current_user: UserOut = Depends(require_student)):
     """[Student] Join a room by its code."""
     _student_only(current_user)
+    _with_people(current_user)
     return engine.join_by_code(current_user, body.code)
 
 
@@ -143,6 +153,7 @@ def get_match(match_id: int, current_user: UserOut = Depends(require_student)):
 @router.post("/matches/{match_id}/start")
 def start_match(match_id: int, current_user: UserOut = Depends(require_student)):
     """[Student, host] Start a room."""
+    _with_people(current_user)
     return engine.start_match(current_user, match_id)
 
 
@@ -176,12 +187,14 @@ def rematch(match_id: int, current_user: UserOut = Depends(require_student)):
 @router.post("/invites/{invite_id}/accept")
 def accept_invite(invite_id: int, current_user: UserOut = Depends(require_student)):
     """[Student] Accept a classmate's challenge."""
+    _with_people(current_user)
     return engine.accept_invite(current_user, invite_id)
 
 
 @router.post("/invites/{invite_id}/decline", status_code=status.HTTP_204_NO_CONTENT)
 def decline_invite(invite_id: int, current_user: UserOut = Depends(require_student)):
     """[Student] Turn a challenge down."""
+    _with_people(current_user)
     engine.decline_invite(current_user, invite_id)
     return None
 
@@ -190,18 +203,21 @@ def decline_invite(invite_id: int, current_user: UserOut = Depends(require_stude
 def join_queue(body: QueueJoin, current_user: UserOut = Depends(require_student)):
     """[Student] Quick match: pair with anyone waiting on the same questions, or wait."""
     _student_only(current_user)
+    _with_people(current_user)
     return engine.join_queue(current_user, body)
 
 
 @router.get("/queue")
 def poll_queue(current_user: UserOut = Depends(require_student)):
     """[Student] Still waiting, or matched? Poll every couple of seconds."""
+    _with_people(current_user)
     return engine.poll_queue(current_user)
 
 
 @router.delete("/queue", status_code=status.HTTP_204_NO_CONTENT)
 def leave_queue(current_user: UserOut = Depends(require_student)):
     """[Student] Stop waiting."""
+    _with_people(current_user)
     engine.leave_queue(current_user)
     return None
 
@@ -231,6 +247,9 @@ def get_leaderboard(
     board and challenge boards; teachers see the classes they teach; admins see everything.
     """
     viewer_id = current_user.id if current_user.role == UserRole.STUDENT else None
+    if current_user.role == UserRole.STUDENT:
+        # The boards rank the school; online tuition plays without them.
+        profiles.require_school_player(current_user, profiles.TUITION_NO_BOARDS)
     if board == "class":
         if current_user.role == UserRole.STUDENT:
             class_id = profiles.require_student_class(current_user)
@@ -259,6 +278,7 @@ def get_profile_card(student_id: int, current_user: UserOut = Depends(require_an
     """
     target_class = profiles.student_class_id(student_id)
     if current_user.role == UserRole.STUDENT and student_id != current_user.id:
+        profiles.require_school_player(current_user, profiles.TUITION_NO_BOARDS)
         same_class = target_class is not None and target_class == profiles.student_class_id(current_user.id)
         on_global = leaderboard.rank_of("global", "all", student_id) is not None
         if not same_class and not on_global:

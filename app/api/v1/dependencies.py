@@ -1,10 +1,10 @@
 import logging
 from typing import Callable, List
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 
-from app.core import identity
+from app.core import demo, identity
 from app.core.enums import UserRole
 from app.core.firebase import firestore_users
 from app.schemas.user import UserOut
@@ -25,7 +25,7 @@ def resolve_token(token: str) -> tuple[dict, dict]:
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials or token expired",
+        detail="Your session has ended. Please sign in again.",
         headers={"WWW-Authenticate": "Bearer"},
     )
 
@@ -38,20 +38,25 @@ def resolve_token(token: str) -> tuple[dict, dict]:
     return claims, user_document
 
 
-def get_current_user(token: str = Depends(oauth2_scheme)) -> UserOut:
+def get_current_user(request: Request, token: str = Depends(oauth2_scheme)) -> UserOut:
     """
     FastAPI dependency resolving the authenticated user from a bearer token.
 
     The token is one this backend issued at sign-in (`POST /auth/login`). Roles are read from
     the profile on every request, never from the token, so a role change takes effect at once.
+
+    A demo account is held to its unlocked modules and its expiry date here, on every
+    request, so a locked screen stays locked whatever URL is typed (app/core/demo.py).
     """
     _, user_document = resolve_token(token)
 
     if not user_document.get("is_active", False):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Inactive user account"
+            # The frontend keys on this phrase; it shows its own sentence for it.
+            detail="Inactive user account. Your account has been deactivated; please contact the school office."
         )
+    demo.assert_allowed(user_document, request.url.path)
 
     user = UserOut(**user_document)
     # Every authenticated request is a sign of life for the office's "who is online";
@@ -72,7 +77,8 @@ def require_roles(allowed_roles: List[UserRole]) -> Callable:
         if current_user.role not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Action prohibited for role '{current_user.role.value}'. Allowed roles: {[r.value for r in allowed_roles]}"
+                detail="This isn't available for your account. If you think this is a mistake, "
+                       "contact the school office."
             )
         return current_user
 

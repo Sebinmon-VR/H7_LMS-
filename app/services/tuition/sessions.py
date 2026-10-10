@@ -344,12 +344,13 @@ def student_join(session: dict, actor) -> dict:
     joins ten minutes into a class that itself began twelve minutes late is ten minutes
     late, not twenty-two.
 
-    Joining before the class starts is allowed and is the normal case - the student is in
-    the room waiting. `timing.waiting_for_teacher` is what their screen should read from.
+    A student enters only a class that has begun - the teacher pressed start, or the
+    auto-start sweep opened it on time - see `assert_student_may_enter`.
     """
     if not is_admin(actor) and user_id_of(actor) != session.get("student_id"):
         raise HTTPException(status_code=403, detail="This class is not yours to join.")
     _assert_open(session)
+    assert_student_may_enter(session, actor)
 
     updates: dict = {}
     if not session.get("student_joined_at"):
@@ -358,6 +359,27 @@ def student_join(session: dict, actor) -> dict:
     merged = {**session, **updates}
     updates.update(compute_timing(merged))
     return _save(session, updates)
+
+
+def assert_student_may_enter(session: dict, actor) -> None:
+    """
+    The student's door opens when the class does. Before that a student used to be let in to
+    wait, which put them alone in an empty room hours early (the Join button showed on every
+    class not yet over). Admins and the teacher are never held back.
+    """
+    if is_admin(actor) or user_id_of(actor) != session.get("student_id"):
+        return
+    if session.get("status") == TuitionSessionStatus.IN_PROGRESS.value:
+        return
+    # Auto-start opens the class on the timetable; the sweep that stamps IN_PROGRESS may be a
+    # few minutes behind, and the student must not be refused a class that has begun.
+    began = class_started_at(session, tuition_settings())
+    if not (began and now_utc() >= began):
+        raise HTTPException(
+            status_code=409,
+            detail="Your tutor has not started this class yet. The Join button appears as "
+                   "soon as they do.",
+        )
 
 
 def _assert_open(session: dict) -> None:

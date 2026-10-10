@@ -87,6 +87,9 @@ def finalize(match: dict, rounds: list[dict]) -> dict:
     questions = match.get("questions") or []
     boards = ([f"class:{match['class_id']}"] if match["scope"] == "CLASS"
               else ["global", f"challenge:{match['challenge_id']}"])
+    # The global boards are the school's; a tuition student's practice earns XP and coins only.
+    if match.get("program") == "TUITION":
+        boards = []
     # Scores going into the last question, for the comeback badge.
     before_last = scores(match, rounds, max(0, len(rounds) - 1)) if len(rounds) > 1 else totals
 

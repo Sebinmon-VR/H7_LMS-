@@ -140,11 +140,15 @@ def join_class(session_id: str, current_user: UserOut = Depends(require_tuition_
     (The rule runs the other way for my teacher - if *they* are late, the class runs on so I
     still get a full lesson.)
 
+    **The class must have started** - my teacher pressed start, or it opened automatically on
+    time. Before that this answers 409 and my screen shows when it opens instead of a button.
+
     If the class has no link yet, one is generated now.
     """
     record = session_service.require_session(session_id)
     if record.get("student_id") != current_user.id:
         raise HTTPException(status_code=403, detail="This class is not yours to join.")
+    session_service.assert_student_may_enter(record, current_user)
 
     if not record.get("meeting_link"):
         record = session_service.ensure_meeting_link(record, current_user)

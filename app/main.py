@@ -258,7 +258,9 @@ async def sql_unavailable(request: Request, exc: DatabaseUnavailable):
     return JSONResponse(
         status_code=503,
         headers={"Retry-After": "30"},
-        content={"detail": f"The database is not responding. {exc}", "code": "database_unavailable"},
+        # The driver's own words stay in the log above; the person sees a plain sentence.
+        content={"detail": "The service is temporarily unavailable. Please try again in a minute.",
+                 "code": "database_unavailable"},
     )
 
 

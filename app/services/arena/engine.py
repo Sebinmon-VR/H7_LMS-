@@ -28,8 +28,8 @@ from app.core.firebase import (
 )
 from app.services.arena import catalog, content
 from app.services.arena.profiles import (
-    equipped_look, get_profile, player_summary, require_student_class, save_profile,
-    student_class_id,
+    TUITION_SOLO, equipped_look, get_profile, player_summary, require_student_class,
+    save_profile, student_class_id, tuition_only,
 )
 
 logger = logging.getLogger("arena")
@@ -414,6 +414,10 @@ def _start(match: dict) -> dict:
 
 
 def create_match(user, body) -> dict:
+    # Online tuition has no classes and no schoolmates: the bot on a global challenge only.
+    solo = tuition_only(user)
+    if solo and (body.mode != "BOT" or body.scope != "GLOBAL"):
+        raise HTTPException(status_code=403, detail=TUITION_SOLO)
     profile = _assert_free(user.id)
     source = _resolve_content(user, body.scope, body.subject_id, body.chapter_id, body.challenge_id)
     _assert_enough(source["pool"])
@@ -421,8 +425,9 @@ def create_match(user, body) -> dict:
 
     if body.mode == "BOT":
         bot_uid = f"{BOT_PREFIX}{body.bot_level.lower()}"
+        # A tuition battle is marked so its points stay off the school's global boards.
         match = _new_match("BOT", source, user.id, body.rounds, {**me, bot_uid: _bot_seat(body.bot_level)},
-                           {"bot_level": body.bot_level})
+                           {"bot_level": body.bot_level, **({"program": "TUITION"} if solo else {})})
         match = _start(match)
     elif body.mode == "ROOM":
         match = _new_match("ROOM", source, user.id, body.rounds, me, {"code": _room_code()})
@@ -442,7 +447,9 @@ def _check_opponents(user, source: dict, opponent_ids: list[int]) -> list[dict]:
         if opponent_id == user.id:
             raise HTTPException(status_code=400, detail="You cannot challenge yourself.")
         doc = firestore_users.get_document(str(opponent_id))
-        if not doc or doc.get("role") != UserRole.STUDENT.value or not doc.get("is_active", True):
+        # A tuition-only student is not in the school arena, so cannot be challenged into it.
+        if not doc or doc.get("role") != UserRole.STUDENT.value or not doc.get("is_active", True) \
+                or tuition_only(doc):
             raise HTTPException(status_code=404, detail="That student was not found.")
         if source["scope"] == "CLASS" and student_class_id(opponent_id) != source["class_id"]:
             raise HTTPException(status_code=403, detail="Class battles are between classmates. Use a global challenge or a room code instead.")

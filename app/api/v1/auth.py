@@ -17,7 +17,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from app.api.v1.dependencies import get_current_user, resolve_token
-from app.core import identity
+from app.core import demo, identity
 from app.core.config import settings
 from app.core.enums import UserRole
 from app.schemas.auth import (
@@ -60,7 +60,8 @@ def _sign_in(email: str, password: str) -> Token:
             detail="Incorrect email or password",
         )
     if not user_document.get("is_active", False):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user account")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user account. Your account has been deactivated; please contact the school office.")
+    demo.assert_not_expired(user_document)
     return _token_for(user_document)
 
 
@@ -89,7 +90,8 @@ def refresh(token: str = Depends(_bearer)):
     """
     claims, user_document = resolve_token(token)
     if not user_document.get("is_active", False):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user account")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user account. Your account has been deactivated; please contact the school office.")
+    demo.assert_not_expired(user_document)
     if not identity.may_refresh(claims):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

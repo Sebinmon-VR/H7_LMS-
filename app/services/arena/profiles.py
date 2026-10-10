@@ -44,6 +44,31 @@ def require_student_class(user) -> int:
     return class_id
 
 
+def tuition_only(user) -> bool:
+    """
+    A student of online tuition who is not also at the school. They have no class and no
+    schoolmates, so they play the bot and the lab on their own, never meet school students
+    in a battle, and stay off the school's boards. `user` is a UserOut or a user document.
+    """
+    from app.core.enums import Program
+    from app.services.tuition.common import has_program
+
+    return not has_program(user, Program.LMS.value)
+
+
+TUITION_SOLO = ("Battles against other students are part of the school arena. "
+                "Online tuition students can practise against the bot on a global challenge.")
+
+
+TUITION_NO_BOARDS = "Leaderboards rank the school's classes. Online tuition games are played without them."
+
+
+def require_school_player(user, detail: str = TUITION_SOLO) -> None:
+    """403 for a tuition-only student on anything that plays or ranks against other people."""
+    if tuition_only(user):
+        raise HTTPException(status_code=403, detail=detail)
+
+
 def _blank(student_id: int, class_id: int | None) -> dict:
     return {
         "student_id": student_id,

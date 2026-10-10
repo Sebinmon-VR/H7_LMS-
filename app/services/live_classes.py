@@ -408,6 +408,7 @@ def sweep(reference: datetime | None = None) -> dict:
         "auto_started": 0,
         "closed_stale": 0,
         "parent_reports_sent": 0,
+        "demo_accounts_erased": 0,
         "errors": [],
     }
 
@@ -467,6 +468,16 @@ def sweep(reference: datetime | None = None) -> dict:
         except Exception as exc:  # pragma: no cover
             log_backend_failure(logger, "Parent report sweep failed", exc)
             result["errors"].append(f"parent_reports: {exc}")
+
+    # Demo accounts past their expiry date are erased with what they left behind. Idempotent:
+    # an erased account is gone, so the next pass finds nothing.
+    try:
+        from app.services import demo_accounts
+
+        result["demo_accounts_erased"] = len(demo_accounts.purge_expired())
+    except Exception as exc:  # pragma: no cover
+        log_backend_failure(logger, "Demo account purge failed", exc)
+        result["errors"].append(f"demo_accounts: {exc}")
 
     return result
 

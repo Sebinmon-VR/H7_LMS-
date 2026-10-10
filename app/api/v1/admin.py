@@ -13,7 +13,7 @@ from app.core.enums import (
 )
 from app.core.storage import storage_service
 from app.core.jobs import job_registry, report_cache
-from app.core import identity
+from app.core import demo, identity
 from app.core.firebase import (
     firestore_users, firestore_classes, firestore_subjects,
     firestore_teacher_mappings, firestore_class_teacher_mappings,
@@ -28,6 +28,7 @@ from app.core.firebase import (
     require_document, delete_with_dependencies, prefetch_references, prefetch_academic
 )
 from app.services import accounts as account_service
+from app.services import demo_accounts as demo_account_service
 from app.services import admissions as admission_service
 from app.services import class_rooms as class_room_service
 from app.services import families as family_service
@@ -118,6 +119,31 @@ def create_user(user_in: UserCreate, admin: UserOut = Depends(require_admin)):
         # than waiting for the office to remember the sibling discount at invoice time.
         family_service.auto_place(account["id"], admin.id)
     return UserOut(**account)
+
+
+@router.get("/demo/modules")
+def demo_modules(_: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] The modules a demo account can have unlocked. Classes - the home page,
+    subjects or tutors, timetable and live classes - are always open and not listed.
+    """
+    return demo.catalogue()
+
+
+@router.get("/demo/accounts")
+def demo_accounts_list(_: UserOut = Depends(require_admin)):
+    """[Admin Only] Every demo account, soonest to expire first, with the days it has left."""
+    return demo_account_service.summary()
+
+
+@router.post("/demo/purge")
+def demo_accounts_purge(_: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Erase every demo account past its expiry now. The maintenance sweep does
+    this by itself every few minutes; the button is for not waiting.
+    """
+    erased = demo_account_service.purge_expired()
+    return {"erased": erased, "detail": f"{len(erased)} expired demo account(s) erased."}
 
 
 @router.get("/users/presence", response_model=List[UserPresenceOut])

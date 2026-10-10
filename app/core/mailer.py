@@ -201,79 +201,6 @@ def send_email(to: str, subject: str, body_text: str, body_html: str | None = No
         return False
 
 
-def send_class_reminder_email(
-    to: str,
-    full_name: str,
-    subject_name: str,
-    class_name: str,
-    starts_at_label: str,
-    minutes_before: int,
-    teacher_name: str | None = None,
-    room: str | None = None,
-    meeting_link: str | None = None,
-) -> bool:
-    """
-    Nudges a student or teacher that a timetabled period is about to start.
-
-    `starts_at_label` is pre-formatted by the caller in the school's timezone: this module
-    has no business deciding how a school writes a time, and the scheduler has already done
-    the zone arithmetic.
-    """
-    display_name = full_name or to
-    meeting_link = absolute_link(meeting_link)
-    lead = (
-        f"starts in {minutes_before} minutes"
-        if minutes_before > 0 else "is starting now"
-    )
-
-    details = [("Subject", subject_name), ("Class", class_name), ("Starts", starts_at_label)]
-    if teacher_name:
-        details.append(("Teacher", teacher_name))
-    if room:
-        details.append(("Room", room))
-
-    text_details = "\n".join(f"    {label}: {value}" for label, value in details)
-    join_line = f"\nJoin the session: {meeting_link}\n" if meeting_link else ""
-
-    body_text = (
-        f"Hello {display_name},\n\n"
-        f"Your {subject_name} class {lead}.\n\n"
-        f"{text_details}\n"
-        f"{join_line}\n"
-        f"You are receiving this because class reminders are on for your account.\n"
-    )
-
-    rows = "".join(
-        f'<tr><td style="color:#5f6368;padding:6px 12px;">{label}</td>'
-        f'<td style="padding:6px 12px;"><strong>{value}</strong></td></tr>'
-        for label, value in details
-    )
-    button = (
-        f'<p style="margin:24px 0;">'
-        f'<a href="{meeting_link}" style="background:#1a73e8;color:#ffffff;padding:10px 20px;'
-        f'border-radius:4px;text-decoration:none;display:inline-block;">Join the class</a></p>'
-        if meeting_link else ""
-    )
-    body_html = (
-        f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#202124;">'
-        f"<p>Hello {display_name},</p>"
-        f"<p>Your <strong>{subject_name}</strong> class {lead}.</p>"
-        f'<table cellpadding="0" style="border-collapse:collapse;background:#f8f9fa;'
-        f'border:1px solid #dadce0;border-radius:4px;">{rows}</table>'
-        f"{button}"
-        f'<p style="color:#5f6368;">You are receiving this because class reminders are on '
-        f"for your account.</p>"
-        f"</div>"
-    )
-
-    return send_email(
-        to=to,
-        subject=f"Reminder: {subject_name} {lead}",
-        body_text=body_text,
-        body_html=body_html,
-    )
-
-
 # ---------------------------------------------------------------------------------------
 # Family-facing letters
 #
@@ -361,8 +288,10 @@ def _letter(
     note: str | None = None,
     note_title: str = "A note from the admissions office",
     blocks: list[tuple[str, list[tuple[str, str]]]] | None = None,
+    sections: list[tuple[str, list[tuple[str, str]]]] | None = None,
     bullets: list[str] | None = None,
     closing: str | None = None,
+    signature: str = "Admissions Office",
     profile: dict | None = None,
 ) -> tuple[str, str]:
     """
@@ -385,8 +314,8 @@ def _letter(
     if rows:
         width = max(len(label) for label, _ in rows)
         text_parts += [f"  {label.ljust(width)} : {value}" for label, value in rows] + [""]
-    for title, block_rows in blocks or []:
-        text_parts.append(title)
+    for title, block_rows in [*(sections or []), *(blocks or [])]:
+        text_parts.append(title.upper() if sections and (title, block_rows) in sections else title)
         text_parts += [f"  {label}: {value}" for label, value in block_rows if value] + [""]
     if note:
         text_parts += [f"{note_title}:", note, ""]
@@ -394,7 +323,7 @@ def _letter(
         text_parts += [f"{label}: {url}"]
     if buttons:
         text_parts.append("")
-    text_parts += [closing or "Warm regards,", f"Admissions Office, {school}", ""]
+    text_parts += [closing or "Warm regards,", f"{signature}, {school}", ""]
     contact_bits = [profile.get("school_contact_phone"), profile.get("school_contact_email"),
                     profile.get("school_website_url")]
     contact_line = " | ".join(bit for bit in contact_bits if bit)
@@ -431,6 +360,20 @@ def _letter(
             f'<table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;'
             f'background:{_BRAND_SOFT};border-radius:12px;margin:4px 0 18px;">{cells}</table>'
         )
+    for title, section_rows in sections or []:
+        cells = "".join(
+            f'<tr><td style="padding:8px 14px;color:{_MUTED};font-size:13px;border-bottom:1px solid {_LINE};'
+            f'vertical-align:top;">{_e(label)}</td>'
+            f'<td style="padding:8px 14px;font-size:14px;font-weight:600;color:#2A2642;border-bottom:1px solid {_LINE};'
+            f'text-align:right;">{_e(value)}</td></tr>'
+            for label, value in section_rows if value
+        )
+        body.append(
+            f'<div style="font-size:13px;font-weight:700;color:{_BRAND};text-transform:uppercase;'
+            f'letter-spacing:.6px;margin:6px 0 6px;">{_e(title)}</div>'
+            f'<table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse;'
+            f'background:{_BRAND_SOFT};border-radius:12px;margin:0 0 16px;">{cells}</table>'
+        )
     for title, block_rows in blocks or []:
         cells = "".join(
             f'<tr><td style="padding:6px 14px;color:{_MUTED};font-size:13px;width:110px;">{_e(label)}</td>'
@@ -459,7 +402,7 @@ def _letter(
         )
     body.append(
         f'<p style="margin:18px 0 0;font-size:15px;line-height:1.6;color:#2A2642;">{_multiline(closing or "Warm regards,")}<br>'
-        f"<strong>Admissions Office</strong><br>{_e(school)}</p>"
+        f"<strong>{_e(signature)}</strong><br>{_e(school)}</p>"
     )
 
     footer_lines = []
@@ -914,6 +857,7 @@ def send_credentials_email(
         closing="For your security, please change the password after signing in for the first "
                 "time, and do not share it with anyone. If you were not expecting this account, "
                 "please contact the school office.\n\nWarm regards,",
+        signature="School Office",
     )
 
 
@@ -937,4 +881,121 @@ def send_password_reset_email(to: str, full_name: str, reset_url: str) -> bool:
             "not changed.",
         ],
         buttons=[("Choose a new password", reset_url)],
+        signature="School Office",
+    )
+
+
+# ---- Class reminders -----------------------------------------------------------------
+
+def send_class_reminder_email(
+    to: str,
+    full_name: str,
+    subject_name: str,
+    class_name: str,
+    starts_at_label: str,
+    minutes_before: int,
+    teacher_name: str | None = None,
+    room: str | None = None,
+    meeting_link: str | None = None,
+) -> bool:
+    """
+    Nudges a student or teacher that a timetabled period is about to start.
+
+    `starts_at_label` is pre-formatted by the caller in the school's timezone: this module
+    has no business deciding how a school writes a time, and the scheduler has already done
+    the zone arithmetic.
+    """
+    meeting_link = absolute_link(meeting_link)
+    lead = f"starts in {minutes_before} minutes" if minutes_before > 0 else "is starting now"
+    return _send_letter(
+        to, f"Reminder: your {subject_name} class {lead}",
+        greeting=f"Dear {full_name or to},",
+        paragraphs=[f"This is a reminder that your {subject_name} class {lead}."],
+        rows=[("Subject", subject_name), ("Class", class_label(class_name) or ""),
+              ("Starts at", starts_at_label), ("Teacher", teacher_name or ""), ("Room", room or "")],
+        buttons=[("Join the class", meeting_link)] if meeting_link else None,
+        closing="You are receiving this because class reminders are switched on for your "
+                "account. You can turn them off from your profile in the app.\n\nSee you in class,",
+        signature="School Office",
+    )
+
+
+# ---- Parent progress reports ---------------------------------------------------------
+
+_RESULT_LABEL = {
+    "IN_PROGRESS": "Not handed in yet",
+    "SUBMITTED": "Awaiting marks",
+    "EVALUATED": "Marked",
+    "MISSED": "Missed",
+}
+
+
+def _nice_date(value) -> str:
+    try:
+        from datetime import date as _date
+
+        return _date.fromisoformat(str(value)[:10]).strftime("%d %B %Y").lstrip("0")
+    except (TypeError, ValueError):
+        return str(value or "")
+
+
+def _percent(value) -> str:
+    return f"{value:g}%" if isinstance(value, (int, float)) else "-"
+
+
+def send_progress_report_email(to: str, report: dict, parent_name: str | None = None) -> bool:
+    """
+    The weekly or monthly digest for a parent: attendance, exams, homework and, when the
+    parent may see them, fees. Built from the same figures as the parent's app screens.
+    """
+    a, e, h = report["attendance"], report["exams"], report["homework"]
+    student = report["student_name"]
+    period = str(report.get("period") or "").lower()
+    span = f"{_nice_date(report['from_date'])} to {_nice_date(report['to_date'])}"
+
+    sections = [("Attendance", [
+        ("Present", f"{a['present']} of {a['total_sessions']} classes ({_percent(a['percent'])})"
+         if a["total_sessions"] else "No classes recorded"),
+        ("Absent", str(a["absent"]) if a["total_sessions"] else ""),
+        ("Late", str(a["late"]) if a["late"] else ""),
+        ("Excused", str(a["excused"]) if a["excused"] else ""),
+    ])]
+
+    exam_rows = []
+    for row in e["exams"]:
+        if row["marks"] is not None and row["max_marks"]:
+            result = f"{row['marks']:g} / {row['max_marks']:g}"
+        else:
+            result = row.get("grade") or _RESULT_LABEL.get(str(row.get("status") or ""), "Pending")
+        exam_rows.append((f"{row.get('subject_name') or 'Exam'}: {row.get('exam_title') or ''}", result))
+    if e["count"]:
+        exam_rows.insert(0, ("Average", _percent(e["average_percent"])))
+    sections.append(("Exams", exam_rows or [("This period", "No exams")]))
+
+    sections.append(("Homework", [
+        ("Handed in", f"{h['submitted']} of {h['set']} ({_percent(h['percent'])})" if h["set"] else "No homework set"),
+        ("Not handed in", str(h["missed"]) if h["missed"] else ""),
+        ("Handed in late", str(h["late"]) if h["late"] else ""),
+    ]))
+
+    fees = report.get("fees")
+    if fees:
+        sections.append(("Fees", [
+            ("Outstanding", money_label(fees.get("amount_outstanding"), fees.get("currency"))),
+            ("Next instalment due", _nice_date(fees["next_due"]) if fees.get("next_due") else ""),
+            ("Overdue", "Yes - an instalment is overdue" if fees.get("is_overdue") else ""),
+        ]))
+
+    profile = school_profile()
+    title = {"weekly": "weekly", "monthly": "monthly"}.get(period, period or "progress")
+    return _send_letter(
+        to, f"{student}'s {title} progress report ({span})", profile,
+        greeting=_greeting(parent_name),
+        paragraphs=[f"Here is {student}'s {title} progress report for {span}"
+                    + (f", {class_label(report.get('class_name'))}" if report.get("class_name") else "") + "."],
+        sections=sections,
+        buttons=[("Open the app for details", profile.get("web_app_url") or settings.LMS_LOGIN_URL)],
+        closing="If you have any questions about this report, please contact your child's class "
+                "teacher or the school office.\n\nWarm regards,",
+        signature="School Office",
     )

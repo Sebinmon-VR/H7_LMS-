@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import List
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.enums import Gender, Program, UserRole
 
@@ -93,6 +93,33 @@ class UserProfileFields(BaseModel):
     reminder_opt_in: bool | None = Field(
         None, description="Receive timetable reminder emails. Defaults to true on creation."
     )
+
+    # Demo account: a prospective family trying the LMS before admission. Classes are always
+    # open; every other module stays locked unless listed in `demo_modules`. The account
+    # works through `demo_expires_on` and is erased automatically afterwards. See
+    # app/core/demo.py. Switching `is_demo` off makes it an ordinary account.
+    is_demo: bool | None = None
+    demo_expires_on: date | None = Field(None, description="Last day the demo account works.")
+    demo_modules: List[str] | None = Field(
+        None, description="Modules unlocked beyond classes - keys from GET /admin/demo/modules."
+    )
+
+    @field_validator("demo_modules")
+    @classmethod
+    def _known_modules(cls, value):
+        if value is None:
+            return value
+        from app.core.demo import clean_modules
+
+        return clean_modules(value)
+
+    @model_validator(mode="after")
+    def _demo_needs_expiry(self):
+        if self.is_demo and self.demo_expires_on is None:
+            raise ValueError("A demo account needs an expiry date")
+        if self.is_demo and self.demo_expires_on is not None and self.demo_expires_on < date.today():
+            raise ValueError("The demo expiry date must not be in the past")
+        return self
 
     @field_validator(
         "phone", "alternate_phone", "guardian_phone",
@@ -268,6 +295,11 @@ class UserOut(BaseModel):
     # a product it never bought.
     programs: List[str] = Field(default_factory=lambda: [Program.LMS.value])
     updated_at: datetime | None = None
+
+    # Demo accounts; see app/core/demo.py.
+    is_demo: bool = False
+    demo_expires_on: date | None = None
+    demo_modules: List[str] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 

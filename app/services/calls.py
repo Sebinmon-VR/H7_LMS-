@@ -231,6 +231,7 @@ def _tuition_target(session_id, user) -> CallTarget:
         assert_tuition_access(user)
     session_service.assert_may_view(session, user)
     session_service._assert_open(session)
+    session_service.assert_student_may_enter(session, user)
     if not acs.is_call_link(session.get("meeting_link")):
         raise HTTPException(
             status_code=409,

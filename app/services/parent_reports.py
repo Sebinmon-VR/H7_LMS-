@@ -30,7 +30,7 @@ from app.core.firebase import (
     firestore_homework, firestore_homework_submissions, firestore_reminder_log,
     firestore_student_enrollments, firestore_subjects, firestore_users,
 )
-from app.core.mailer import is_configured as mail_is_configured, send_email
+from app.core.mailer import is_configured as mail_is_configured, send_progress_report_email
 from app.services import families as family_service
 
 logger = logging.getLogger("parent_reports")
@@ -440,17 +440,9 @@ def send_report(student_id, period: str = WEEKLY, start: date | None = None,
             may_see_fees = bool(link and link.get("may_view_fees"))
 
         report = build_report(student_id, period, start, end, include_fees=may_see_fees)
-        subject = (
-            f"{report['student_name']} - {period.title()} progress report "
-            f"({report['from_date']} to {report['to_date']})"
-        )
-
-        ok = send_email(
-            to=recipient["email"],
-            subject=subject,
-            body_text=render_text(report),
-            body_html=render_html(report),
-        )
+        # The shared family letter (app/core/mailer.py): the school's name, readable dates and
+        # results in words. `render_text`/`render_html` remain for the admin's preview.
+        ok = send_progress_report_email(recipient["email"], report, recipient.get("name"))
         sent += 1 if ok else 0
         results.append({
             "email": recipient["email"],

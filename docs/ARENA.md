@@ -3,7 +3,8 @@
 Students battle each other (or a bot) on questions from their own class syllabus, or on the
 school-wide global question bank. Battles earn XP and coins; coins unlock profile items;
 milestones award badges; XP fills a class leaderboard (class battles) and a global leaderboard
-(global challenges). Everything here is LMS-side (school), not tuition.
+(global challenges). Everything here is LMS-side (school); tuition students get the solo
+half, see section 7.
 
 ## 1. Content
 
@@ -175,7 +176,25 @@ Teacher: **Syllabus & questions** (their class-subject pairs) and **Arena leader
 (their classes). Admin: the same for every class, plus **Global questions**, **Global
 challenges** and the starter pack.
 
-## 7. Later
+## 7. Online tuition
+
+Tuition students get the solo half of the arena under **Games** in the tuition menu
+(`/tuition/student/games` on the frontend; the same `/arena` and `/lab` API):
+
+* **Quiz Battle against the bot** on a global challenge. A tuition student has no class, so
+  there is no syllabus to battle on and nobody in a class to play with.
+* **Virtual Lab**: free mode and the library experiments, with the usual one-time rewards.
+  There are no lab assignments for them (assignments are set per school class).
+* **Locker and badges**: the same profile, XP, coins and items.
+
+A *tuition-only* student (no `LMS` in `programs`) is refused with a 403 on everything that
+plays or ranks against other people: classmates, invites, rooms, quick match and the
+leaderboards. Their bot battles are created with `program: "TUITION"` and add no leaderboard
+points, because the global boards are the school's and school students may open the card of
+anyone on them. They cannot be challenged either. A student in both programmes is a school
+student and plays the full arena.
+
+## 8. Later
 * WebSockets (Azure Web PubSub) instead of polling once usage grows.
 * AI-drafted questions from chapter text, reviewed by the teacher.
 * More question types (type-the-answer, ordering, images).
