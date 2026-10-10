@@ -452,16 +452,25 @@ class AdmissionRequestStatus(str, enum.Enum):
     NEW = "NEW"                    # Submitted; nobody has looked at it.
     UNDER_REVIEW = "UNDER_REVIEW"  # Somebody has picked it up.
     WAITLISTED = "WAITLISTED"      # No seat right now; kept for when one frees.
+    # Selected. The pipeline from here runs through the family's portal link: they upload
+    # documents, the office verifies them, a fee is requested, paid and confirmed, and only
+    # then is the student created. Each step can be skipped by an admin who admits directly.
+    DOCUMENTS_REQUESTED = "DOCUMENTS_REQUESTED"  # Waiting for the family's uploads.
+    DOCUMENTS_SUBMITTED = "DOCUMENTS_SUBMITTED"  # Uploaded; the office has to check them.
+    DOCUMENTS_VERIFIED = "DOCUMENTS_VERIFIED"    # Checked and in order.
+    PAYMENT_REQUESTED = "PAYMENT_REQUESTED"      # Fee asked for; waiting for the money.
+    PAYMENT_SUBMITTED = "PAYMENT_SUBMITTED"      # Family sent proof; the office has to check it.
+    PAYMENT_VERIFIED = "PAYMENT_VERIFIED"        # Money confirmed - by the gateway or the office.
     ADMITTED = "ADMITTED"          # A student account exists. Terminal.
     REJECTED = "REJECTED"          # Declined. Reopenable.
 
 
-# Requests still awaiting a decision - what the admin's queue and the duplicate check look at.
-OPEN_ADMISSION_REQUEST_VALUES = frozenset({
-    AdmissionRequestStatus.NEW.value,
-    AdmissionRequestStatus.UNDER_REVIEW.value,
-    AdmissionRequestStatus.WAITLISTED.value,
-})
+# Requests still in play - everything but the two ends. What the admin's queue and the
+# duplicate check look at.
+OPEN_ADMISSION_REQUEST_VALUES = frozenset(
+    s.value for s in AdmissionRequestStatus
+    if s not in (AdmissionRequestStatus.ADMITTED, AdmissionRequestStatus.REJECTED)
+)
 
 
 class AcademicYearStatus(str, enum.Enum):

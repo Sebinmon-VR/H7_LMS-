@@ -357,7 +357,42 @@ def finance_settings(program: str = Program.LMS.value) -> dict:
 
 def program_settings(program: str) -> dict:
     """Effective settings for either program, by value ('LMS' or 'TUITION')."""
-    return lms_settings() if str(program).upper() == Program.LMS.value else tuition_settings()
+    if str(program).upper() == Program.LMS.value:
+        return {**lms_settings(), **school_profile()}
+    return tuition_settings()
+
+
+# How the school presents itself to families: the name at the top of every email, who to
+# contact, where the apps are. Kept in the LMS document because it is one institution's
+# identity, edited on the School Settings screen; both products' emails read it.
+_PROFILE_DEFAULTS = {
+    "school_name": lambda: env_settings.resolved_school_name,
+    "school_contact_email": lambda: env_settings.SCHOOL_CONTACT_EMAIL or env_settings.ADMISSION_REQUEST_NOTIFY_EMAIL,
+    "school_contact_phone": lambda: env_settings.SCHOOL_CONTACT_PHONE,
+    "school_address": lambda: env_settings.SCHOOL_ADDRESS,
+    "school_website_url": lambda: env_settings.SCHOOL_WEBSITE_URL,
+    "school_logo_url": lambda: env_settings.SCHOOL_LOGO_URL,
+    "web_app_url": lambda: env_settings.resolved_app_url,
+    "mobile_app_url": lambda: env_settings.MOBILE_APP_URL,
+    "admission_portal_url": lambda: env_settings.ADMISSION_PORTAL_URL,
+}
+_PROFILE_KEYS = frozenset(_PROFILE_DEFAULTS)
+
+
+def school_profile() -> dict:
+    """
+    The school's public identity, every key present. A stored blank falls back to the
+    environment, so clearing a field on the screen restores the default rather than
+    leaving the email with a hole in it.
+    """
+    stored = _stored(LMS_DOC)
+    profile = {}
+    for key, default in _PROFILE_DEFAULTS.items():
+        value = stored.get(key)
+        value = value.strip() if isinstance(value, str) else value
+        profile[key] = value or (default() or "").strip()
+    profile["school_name"] = profile["school_name"] or "the school"
+    return profile
 
 
 # Which keys each program will accept from an update. An unknown key is rejected rather than
@@ -397,7 +432,7 @@ _LMS_KEYS = _SHARED_KEYS | _FINANCE_KEYS | _LIBRARY_KEYS | {
     "employee_id_mode", "employee_id_prefix",
     "auto_start_class", "join_open_minutes_before", "default_class_minutes",
     "join_grace_minutes", "extra_class_needs_approval", "class_room_mode",
-}
+} | _PROFILE_KEYS
 WRITABLE_KEYS = {
     Program.LMS.value: _LMS_KEYS,
     Program.TUITION.value: _SHARED_KEYS | _FINANCE_KEYS | _LIBRARY_KEYS | {

@@ -217,7 +217,7 @@ logger.info(
 _PUBLIC_CORS_PATH = f"{settings.API_V1_STR}{ADMISSION_REQUESTS_PUBLIC_PREFIX}"
 _PUBLIC_CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Accept, Origin, X-Requested-With, X-Timezone",
     "Access-Control-Max-Age": "600",
     "Vary": "Origin",
@@ -306,8 +306,9 @@ def open_stored_file(blob_path: str, download: bool = False):
     if not blob_path or ".." in blob_path.split("/"):
         return JSONResponse(status_code=404, content={"detail": "File not found"})
     if azure_blob.is_private(blob_path):
-        # Class recordings: watched through the LMS, which signs a link for whoever may see it.
-        return JSONResponse(status_code=403, content={"detail": "Open this recording from the LMS."})
+        # Class recordings and admission documents: opened through the LMS, which signs a
+        # link for whoever may see them.
+        return JSONResponse(status_code=403, content={"detail": "Open this file from the LMS."})
     try:
         return RedirectResponse(azure_blob.read_url(blob_path, download=download), status_code=307)
     except azure_blob.BlobStorageError as exc:

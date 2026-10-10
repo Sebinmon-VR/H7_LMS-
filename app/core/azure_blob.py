@@ -23,7 +23,9 @@ FILES_PREFIX = "/files/"
 # Folders whose files are never handed out on the open /files/ path. A class recording is
 # watched only by the people allowed to see it: the endpoints that list it for them sign a
 # link as they answer (`sign_private`), and /files/ refuses these paths outright.
-PRIVATE_PREFIXES = ("recordings/",)
+# Admission documents - birth certificates, identity cards, payment screenshots - are read
+# only by the office, through links the admin endpoints sign as they answer.
+PRIVATE_PREFIXES = ("recordings/", "admissions/")
 # Recordings are long; a link signed when the list was loaded must outlast the watching.
 PRIVATE_LINK_MINUTES = 240
 

@@ -993,6 +993,32 @@ class ProgramSettingsUpdate(BaseModel):
     # LMS only. One standing live-class room per class that every subject teacher joins at
     # their period, instead of a fresh link per scheduled session.
     class_room_mode: bool | None = None
+    # LMS only. The School Settings screen sends these; without them here Pydantic dropped
+    # them before `save_settings` saw them, and the save looked successful while changing
+    # nothing.
+    admission_id_mode: str | None = Field(None, max_length=16)
+    admission_id_prefix: str | None = Field(None, max_length=16)
+    employee_id_mode: str | None = Field(None, max_length=16)
+    employee_id_prefix: str | None = Field(None, max_length=16)
+    join_open_minutes_before: int | None = Field(None, ge=0, le=240)
+    default_class_minutes: int | None = Field(None, ge=10, le=480)
+    join_grace_minutes: int | None = Field(None, ge=0, le=240)
+    extra_class_needs_approval: bool | None = None
+    student_library_uploads_enabled: bool | None = None
+    student_library_downloads_enabled: bool | None = None
+    library_syllabus_filter: bool | None = None
+
+    # LMS only. How the school presents itself in emails to families. A blank value
+    # restores the server default.
+    school_name: str | None = Field(None, max_length=150)
+    school_contact_email: str | None = Field(None, max_length=320)
+    school_contact_phone: str | None = Field(None, max_length=40)
+    school_address: str | None = Field(None, max_length=400)
+    school_website_url: str | None = Field(None, max_length=500)
+    school_logo_url: str | None = Field(None, max_length=1000)
+    web_app_url: str | None = Field(None, max_length=500)
+    mobile_app_url: str | None = Field(None, max_length=1000)
+    admission_portal_url: str | None = Field(None, max_length=500)
 
 
 class TimezoneUpdate(BaseModel):

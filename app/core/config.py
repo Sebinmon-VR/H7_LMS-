@@ -403,13 +403,47 @@ class Settings(BaseSettings):
     # An office inbox told of every new request, so nobody has to keep the admin page open.
     # Blank sends nothing; the request is still recorded and visible in the admin panel.
     ADMISSION_REQUEST_NOTIFY_EMAIL: str = ""
-    # How the school is named in emails to families. PROJECT_NAME is the API's own name and
-    # reads oddly at the top of a letter to a parent.
-    SCHOOL_DISPLAY_NAME: str = ""
+    # How the school is named in emails to families. Never PROJECT_NAME: that is the API's own
+    # name ("LMS Backend API") and it once reached a parent's inbox as the name of the school.
+    # School Settings overrides every value in this block (`settings_store.school_profile`);
+    # these are what a deployment that has not filled that screen in says.
+    SCHOOL_DISPLAY_NAME: str = "H7 EdTech"
+    # Who a family should write to or ring. Mail is sent from a no-reply address, so the
+    # contact email also becomes the Reply-To of every family-facing message.
+    SCHOOL_CONTACT_EMAIL: str = "academics@h7ed.com"
+    SCHOOL_CONTACT_PHONE: str = "+91 92077 73300"
+    SCHOOL_ADDRESS: str = ""
+    SCHOOL_WEBSITE_URL: str = "https://h7ed.com"
+    # Deep links use the Static Web App's own host: h7ed.com is a registrar frame around it
+    # (October 2026), which answers only its home page and 404s every other path.
+    SCHOOL_LOGO_URL: str = "https://blue-cliff-058b88c10.1.azurestaticapps.net/static/logo.png"
+    # Where a family downloads the mobile app; put in the welcome email after admission.
+    MOBILE_APP_URL: str = "https://blue-cliff-058b88c10.1.azurestaticapps.net/index.html#get-the-app"
+    # The page on the school website where a family uploads documents and payment proof. The
+    # link in each email is this address with `?t=<token>` appended.
+    ADMISSION_PORTAL_URL: str = "https://blue-cliff-058b88c10.1.azurestaticapps.net/admission-status.html"
+    # Family uploads: per file, and how many files one document may carry.
+    ADMISSION_DOCUMENT_MAX_MB: int = 10
+    ADMISSION_DOCUMENT_MAX_FILES: int = 5
+    # Portal uploads accepted per hour from one client address. 0 disables the limit.
+    ADMISSION_UPLOAD_RATE_LIMIT: int = 60
+
+    # Razorpay Payment Links, for the admission fee. Optional: with no keys the office pastes
+    # any payment link (or bank details) and the family submits proof of payment instead.
+    # With keys, the link is created automatically and its status is read back from Razorpay
+    # - on the family's return to the portal, from the admin's "check" button, and from the
+    # webhook at /api/v1/admissions/requests/payments/razorpay/webhook when one is set up.
+    RAZORPAY_KEY_ID: str = ""
+    RAZORPAY_KEY_SECRET: str = ""
+    RAZORPAY_WEBHOOK_SECRET: str = ""
+
+    @property
+    def razorpay_configured(self) -> bool:
+        return bool((self.RAZORPAY_KEY_ID or "").strip() and (self.RAZORPAY_KEY_SECRET or "").strip())
 
     @property
     def resolved_school_name(self) -> str:
-        return (self.SCHOOL_DISPLAY_NAME or self.PROJECT_NAME or "the school").strip()
+        return (self.SCHOOL_DISPLAY_NAME or "").strip() or "the school"
 
     # How often the school maintenance sweep runs: opening due classes, closing abandoned
     # ones, and sending any parent digest that has come due. Every action it takes is

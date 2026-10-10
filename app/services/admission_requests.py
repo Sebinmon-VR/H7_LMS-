@@ -20,6 +20,10 @@ Three things here are worth knowing before changing them:
 * **Emails never fail a request.** Acknowledgements, office alerts and decision letters are
   best-effort through the mailer, which returns False rather than raising; the flags on the
   response say whether they went.
+
+Between selection and admission - documents, their verification, the fee - lives in
+`admission_pipeline`, which the family reaches through the portal link minted here at
+submission.
 """
 
 import logging
@@ -54,7 +58,10 @@ ADMITTED = AdmissionRequestStatus.ADMITTED.value
 REJECTED = AdmissionRequestStatus.REJECTED.value
 
 # Decisions the family is written to about. UNDER_REVIEW is an internal state.
-NOTIFIABLE_DECISIONS = frozenset({WAITLISTED, REJECTED, ADMITTED})
+NOTIFIABLE_DECISIONS = frozenset({WAITLISTED, REJECTED})
+# Where the plain status endpoint may move a request. The pipeline states are reached
+# through their own actions, which carry the documents and the fee with them.
+MANUAL_STATUSES = frozenset({NEW, UNDER_REVIEW, WAITLISTED, REJECTED})
 
 RATE_WINDOW_SECONDS = 3600.0
 
@@ -326,12 +333,16 @@ def submit(payload, program: str = Program.LMS.value, client_key: str | None = N
         parents[0]["is_primary"] = True
     primary = next(p for p in parents if p["is_primary"])
 
+    from app.services import admission_pipeline
+
     now = _now()
     request_id = firestore_admission_requests.get_next_numeric_id()
     document = {
         "reference": _next_reference(rows),
         "program": program,
         "status": NEW,
+        # The family's private link to the application, sent in every email from here on.
+        "portal_token": admission_pipeline.new_token(),
 
         "student_full_name": payload.student_full_name,
         "date_of_birth": _iso(payload.date_of_birth),
@@ -380,7 +391,7 @@ def submit(payload, program: str = Program.LMS.value, client_key: str | None = N
                 request_id, document["reference"], document["student_full_name"])
 
     acknowledged = _notify_received(document)
-    _alert_office(document)
+    alert_office(document)
 
     return {
         **document,
@@ -397,6 +408,8 @@ def _notify_received(request: dict) -> bool:
     to = request.get("contact_email")
     if not to or not mailer.is_configured():
         return False
+    from app.services.admission_pipeline import portal_url
+
     try:
         return mailer.send_admission_request_received_email(
             to=to,
@@ -405,21 +418,26 @@ def _notify_received(request: dict) -> bool:
             reference=request.get("reference") or "",
             class_name=request.get("class_name"),
             year_name=request.get("academic_year_name"),
+            portal_url=portal_url(request),
         )
     except Exception as exc:  # pragma: no cover - never fail the request for its email
         logger.warning("Acknowledgement email for %s not sent: %s", request.get("reference"), exc)
         return False
 
 
-def _alert_office(request: dict) -> None:
+def alert_office(request: dict, event: str | None = None) -> None:
+    """Tells the office inbox something is waiting: a new application, uploads, a payment."""
     to = (settings.ADMISSION_REQUEST_NOTIFY_EMAIL or "").strip()
     if not to or not mailer.is_configured():
         return
     admin_url = None
-    if settings.LMS_LOGIN_URL:
-        admin_url = settings.LMS_LOGIN_URL.rstrip("/").rsplit("/login", 1)[0] + "/admin/admission-requests"
+    base = settings.resolved_app_url
+    if base:
+        admin_url = f"{base}/admin/admission-requests?q={request.get('reference') or ''}"
     try:
-        mailer.send_admission_request_alert_email(to, request, admin_url)
+        mailer.send_admission_request_alert_email(
+            to, request, admin_url, event=event or "A new admission application has arrived.",
+        )
     except Exception as exc:  # pragma: no cover
         logger.warning("Office alert for %s not sent: %s", request.get("reference"), exc)
 
@@ -428,6 +446,8 @@ def _notify_decision(request: dict, status: str, note: str | None) -> bool:
     to = request.get("contact_email")
     if not to or status not in NOTIFIABLE_DECISIONS or not mailer.is_configured():
         return False
+    from app.services.admission_pipeline import portal_url
+
     try:
         return mailer.send_admission_decision_email(
             to=to,
@@ -436,8 +456,9 @@ def _notify_decision(request: dict, status: str, note: str | None) -> bool:
             reference=request.get("reference") or "",
             status=status,
             note=note,
-            class_name=request.get("admitted_class_name") or request.get("class_name"),
-            year_name=request.get("admitted_year_name") or request.get("academic_year_name"),
+            class_name=request.get("class_name"),
+            year_name=request.get("academic_year_name"),
+            portal_url=portal_url(request),
         )
     except Exception as exc:  # pragma: no cover
         logger.warning("Decision email for %s not sent: %s", request.get("reference"), exc)
@@ -513,6 +534,11 @@ def set_status(request: dict, new_status: str, actor, note: str | None = None,
         )
     if new_status == ADMITTED:
         raise HTTPException(status_code=400, detail="Use the admit action to admit a request.")
+    if new_status not in MANUAL_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail="Use the documents and payment actions to move a request through selection.",
+        )
     if new_status == current:
         raise HTTPException(status_code=400, detail=f"The request is already {new_status}.")
 
@@ -527,10 +553,21 @@ def set_status(request: dict, new_status: str, actor, note: str | None = None,
     }
     if new_status in (WAITLISTED, REJECTED):
         updates["decision_note"] = note
+        payment = request.get("payment") or {}
+        if payment.get("gateway_link_id") and payment.get("status") != "VERIFIED":
+            # A waitlisted or declined family must not be able to pay through the old link.
+            from app.core import razorpay
+
+            razorpay.cancel_payment_link(payment["gateway_link_id"])
+            updates["payment"] = {**payment, "link_url": None, "gateway_status": "cancelled"}
     firestore_admission_requests.add_document(str(request["id"]), updates)
     merged = {**request, **updates}
 
-    if notify:
+    if notify and new_status in NOTIFIABLE_DECISIONS:
+        if not merged.get("portal_token"):
+            from app.services.admission_pipeline import ensure_token
+
+            merged = ensure_token(merged)
         merged["_notified"] = _notify_decision(merged, new_status, note)
     logger.info("Admission request %s moved %s -> %s by %s.",
                 request.get("reference"), current, new_status, actor.id)
@@ -559,8 +596,17 @@ def delete_request(request: dict) -> None:
     Allowed in any state. An admitted request's student is a separate record and stays; the
     link from student to request is lost, which is the trade the admin makes by deleting.
     """
+    from app.core.storage import storage_service
+
     firestore_admission_requests.delete_document(str(request["id"]))
-    logger.info("Deleted admission request %s (%s).", request["id"], request.get("reference"))
+    # The documents and payment proofs are identity papers; they go with the request.
+    files = [f for doc in request.get("documents") or [] for f in doc.get("files") or []]
+    files += [f for sub in (request.get("payment") or {}).get("submissions") or []
+              for f in sub.get("files") or []]
+    for entry in files:
+        storage_service.delete_file(entry.get("url"), entry.get("provider"))
+    logger.info("Deleted admission request %s (%s) and %d file(s).",
+                request["id"], request.get("reference"), len(files))
 
 
 # ---------------------------------------------------------------------------------------
@@ -757,18 +803,23 @@ def admit(request: dict, payload, actor) -> dict:
             logger.exception("Parent account failed for request %s", request.get("reference"))
             warnings.append(f"Parent login not created: {exc}")
 
+    # Passwords are issued without their own emails: they travel in the one welcome letter
+    # below, with the admission details and the app links, instead of three separate emails.
     credentials: list[dict] = []
     if payload.send_credentials:
-        deliver_to = primary.get("email") or student["email"]
         try:
-            credentials.append(account_service.issue_credentials(student, deliver_to=deliver_to))
+            credentials.append(account_service.issue_credentials(student, send_email=False))
         except HTTPException as exc:
             warnings.append(f"Student login details not issued: {exc.detail}")
         if parent is not None and parent_created:
             try:
-                credentials.append(account_service.issue_credentials(parent))
+                credentials.append(account_service.issue_credentials(parent, send_email=False))
             except HTTPException as exc:
                 warnings.append(f"Parent login details not issued: {exc.detail}")
+
+    receipt_id = None
+    if payload.record_fee_receipt:
+        receipt_id = _record_fee_receipt(request, student, year_id, payload, actor, warnings)
 
     now = _now()
     updates = {
@@ -789,10 +840,20 @@ def admit(request: dict, payload, actor) -> dict:
         "admission_number": student.get("admission_number"),
         "history": [*(request.get("history") or []), _history_entry(ADMITTED, actor, payload.note)],
     }
+    if receipt_id is not None and request.get("payment"):
+        updates["payment"] = {**request["payment"], "receipt_id": receipt_id}
     firestore_admission_requests.add_document(str(request["id"]), updates)
     merged = {**request, **updates}
 
-    notified = _notify_decision(merged, ADMITTED, payload.note) if payload.notify_applicant else False
+    notified = False
+    if payload.notify_applicant or credentials:
+        notified = _send_welcome(merged, student, parent, parent_created, credentials, payload)
+        for issued in credentials:
+            issued["email_sent"] = notified
+            issued["detail"] = (
+                f"Sent to {primary.get('email')} in the welcome email." if notified
+                else "The welcome email could not be sent. Share these details with the family directly."
+            )
 
     logger.info("Admission request %s admitted as student %s by %s.",
                 request.get("reference"), student["id"], actor.id)
@@ -802,11 +863,10 @@ def admit(request: dict, payload, actor) -> dict:
         parts.append(f"enrolled in {class_room.get('name')}")
     if parent is not None:
         parts.append("parent login created" if parent_created else "linked to the existing parent login")
-    if credentials:
-        sent = sum(1 for c in credentials if c.get("email_sent"))
-        parts.append(f"{sent} of {len(credentials)} login emails sent")
+    if receipt_id is not None:
+        parts.append("admission fee entered in Finance")
     if notified:
-        parts.append("family notified")
+        parts.append("welcome email sent" + (" with login details" if credentials else ""))
 
     return {
         "request": present(merged),
@@ -817,8 +877,120 @@ def admit(request: dict, payload, actor) -> dict:
         "credentials": credentials,
         "warnings": warnings,
         "applicant_notified": notified,
+        "receipt_id": receipt_id,
         "detail": "; ".join(parts) + ".",
     }
+
+
+def _send_welcome(request: dict, student: dict, parent: dict | None, parent_created: bool,
+                  credentials: list[dict], payload) -> bool:
+    """The welcome letter: admission details, app links and every password just issued."""
+    primary = _primary_parent(request)
+    to = primary.get("email") or request.get("contact_email")
+    if not to or not mailer.is_configured():
+        return False
+
+    details = [
+        ("Student", student.get("full_name") or request.get("student_full_name") or ""),
+        ("Admission number", student.get("admission_number") or ""),
+        ("Class", mailer.class_label(request.get("admitted_class_name")) or ""),
+        ("Academic year", request.get("admitted_year_name") or ""),
+        ("Roll number", student.get("roll_number") or payload.roll_number or ""),
+        ("Admission date", date.today().strftime("%d %B %Y").lstrip("0")),
+    ]
+    if parent is not None and not parent_created:
+        details.append(("Parent login", f"{parent.get('email')} (your existing account)"))
+
+    titles = {int(student["id"]): f"Student login - {student.get('full_name')}"}
+    if parent is not None:
+        titles[int(parent["id"])] = f"Parent login - {parent.get('full_name')}"
+    logins = [
+        {"title": titles.get(int(c["user_id"]), c.get("full_name") or "Login"),
+         "email": c.get("email"), "password": c.get("password")}
+        for c in credentials
+    ]
+    try:
+        return mailer.send_admission_welcome_email(
+            to=to,
+            contact_name=primary.get("full_name") or request.get("contact_name") or "Parent",
+            student_name=student.get("full_name") or request.get("student_full_name") or "",
+            reference=request.get("reference") or "",
+            details=details,
+            logins=logins,
+            note=payload.note,
+        )
+    except Exception as exc:  # pragma: no cover - never fail an admit for its email
+        logger.warning("Welcome email for %s not sent: %s", request.get("reference"), exc)
+        return False
+
+
+ADMISSION_PORTAL_SOURCE = "ADMISSION_PORTAL"
+
+
+def _record_fee_receipt(request: dict, student: dict, year_id, payload, actor,
+                        warnings: list[str]) -> int | None:
+    """
+    The confirmed admission fee, entered in Finance so the collections report carries it.
+    Only for a fee confirmed through the portal; anything that does not fit is a warning,
+    never a failed admit - the student exists by now.
+    """
+    payment = request.get("payment") or {}
+    if payment.get("status") != "VERIFIED":
+        return None
+
+    from app.core.enums import PaymentMethod
+    from app.schemas.finance import FeeReceiptCreate
+    from app.services import finance as finance_service
+    from app.services import receipts as receipt_service
+    from app.services.admission_pipeline import school_currency
+
+    program = (request.get("program") or Program.LMS.value).upper()
+    currency = (payment.get("currency") or "").upper()
+    if currency and currency != school_currency(program):
+        warnings.append(
+            f"The fee was paid in {currency}, not the school's {school_currency(program)}, so it "
+            f"was not entered in Finance. Record it there by hand."
+        )
+        return None
+
+    head_id = payload.fee_head_id
+    if head_id is None:
+        heads = [h for h in finance_service.list_heads(program) if h.get("is_admission_charge")]
+        if not heads:
+            warnings.append("No admission fee head exists in Finance, so the fee was not recorded "
+                            "there. Create one and record the receipt by hand.")
+            return None
+        head_id = int(heads[0]["id"])
+
+    submissions = [s for s in payment.get("submissions") or [] if s.get("status") == "ACCEPTED"]
+    accepted = submissions[-1] if submissions else {}
+    via_gateway = payment.get("verified_via") == "GATEWAY"
+    method = PaymentMethod.ONLINE if via_gateway else {
+        "UPI": PaymentMethod.UPI, "BANK_TRANSFER": PaymentMethod.BANK_TRANSFER,
+        "CARD": PaymentMethod.CARD, "CASH": PaymentMethod.CASH, "CHEQUE": PaymentMethod.CHEQUE,
+    }.get(str(accepted.get("method") or "").upper(), PaymentMethod.OTHER)
+    paid_at = accepted.get("paid_on") or (payment.get("verified_at") or _now())[:10]
+    try:
+        receipt = receipt_service.record_receipt(
+            FeeReceiptCreate(
+                student_id=int(student["id"]),
+                fee_head_id=int(head_id),
+                amount=float(payment.get("amount_paid") or payment.get("amount")),
+                paid_at=date.fromisoformat(str(paid_at)[:10]),
+                method=method,
+                reference=(payment.get("gateway_payment_id") or accepted.get("transaction_id") or "")[:120] or None,
+                note=f"Admission fee paid through the online admission ({request.get('reference')}).",
+                academic_year_id=year_id,
+            ),
+            actor.id, program, source=ADMISSION_PORTAL_SOURCE,
+        )
+        return int(receipt["id"])
+    except HTTPException as exc:
+        warnings.append(f"The admission fee was not entered in Finance: {exc.detail}")
+    except Exception as exc:
+        logger.exception("Receipt for %s failed", request.get("reference"))
+        warnings.append(f"The admission fee was not entered in Finance: {exc}")
+    return None
 
 
 # ---------------------------------------------------------------------------------------
@@ -889,6 +1061,15 @@ def present(request: dict) -> dict:
         "enrollment_id": request.get("enrollment_id"),
         "admission_number": request.get("admission_number"),
 
+        **pipeline_fields(request),
+        "applicant_notified": request.get("_notified"),
+
         "internal_notes": request.get("internal_notes") or [],
         "history": request.get("history") or [],
     }
+
+
+def pipeline_fields(request: dict) -> dict:
+    from app.services.admission_pipeline import admin_fields
+
+    return admin_fields(request)

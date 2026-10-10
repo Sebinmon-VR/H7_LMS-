@@ -3,6 +3,7 @@ Request and response shapes for academic years and admission categories.
 """
 
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -459,6 +460,83 @@ class AdmissionRequestHistoryOut(BaseModel):
     note: str | None = None
 
 
+# ---- The selection pipeline: documents and the fee ------------------------------------
+
+DocumentStatus = Literal["PENDING", "UPLOADED", "SUBMITTED", "ACCEPTED", "REJECTED"]
+PaymentStatus = Literal["REQUESTED", "SUBMITTED", "VERIFIED", "REJECTED"]
+
+
+class AdmissionFileOut(BaseModel):
+    """One uploaded file. `url` is a short-lived signed link, filled for the office only."""
+    id: str
+    name: str
+    content_type: str | None = None
+    size: int | None = None
+    uploaded_at: datetime | None = None
+    url: str | None = None
+
+
+class AdmissionDocumentOut(BaseModel):
+    """
+    One document the office asked for, and where it has got to.
+
+    PENDING nothing uploaded; UPLOADED files are there but the family has not pressed
+    Submit; SUBMITTED waiting for the office; ACCEPTED checked; REJECTED to be uploaded
+    again, `review_note` saying why.
+    """
+    key: str
+    label: str
+    description: str | None = None
+    required: bool = True
+    status: DocumentStatus = "PENDING"
+    files: list[AdmissionFileOut] = Field(default_factory=list)
+    review_note: str | None = None
+    reviewed_at: datetime | None = None
+    reviewed_by_name: str | None = None
+
+
+class AdmissionPaymentSubmissionOut(BaseModel):
+    """Proof of payment sent by the family: a transaction id, a screenshot, or both."""
+    id: str
+    transaction_id: str | None = None
+    paid_on: date | None = None
+    amount: float | None = None
+    method: str | None = None
+    note: str | None = None
+    files: list[AdmissionFileOut] = Field(default_factory=list)
+    submitted_at: datetime | None = None
+    status: Literal["PENDING", "ACCEPTED", "REJECTED"] = "PENDING"
+    review_note: str | None = None
+
+
+class AdmissionPaymentOut(BaseModel):
+    """
+    The fee asked of the family. `provider` RAZORPAY means the link was made through the
+    gateway and its status can be read back; MANUAL means the office supplied a link or
+    instructions and confirms the money by hand.
+    """
+    amount: float
+    currency: str
+    description: str
+    due_date: date | None = None
+    link_url: str | None = None
+    instructions: str | None = None
+    provider: Literal["RAZORPAY", "MANUAL"] = "MANUAL"
+    gateway_link_id: str | None = None
+    gateway_status: str | None = None
+    status: PaymentStatus = "REQUESTED"
+    requested_at: datetime | None = None
+    requested_by_name: str | None = None
+    verified_at: datetime | None = None
+    verified_by_name: str | None = None
+    verified_via: Literal["OFFICE", "GATEWAY"] | None = None
+    gateway_payment_id: str | None = None
+    amount_paid: float | None = None
+    review_note: str | None = None
+    receipt_id: int | None = None
+    submissions: list[AdmissionPaymentSubmissionOut] = Field(default_factory=list)
+
+
 class AdmissionRequestOut(BaseModel):
     id: int
     reference: str
@@ -515,6 +593,20 @@ class AdmissionRequestOut(BaseModel):
     admitted_year_name: str | None = None
     enrollment_id: int | None = None
     admission_number: str | None = None
+
+    # The selection pipeline. `portal_url` is the family's private page - copy it into a
+    # WhatsApp message when an email has gone astray.
+    portal_url: str | None = None
+    documents: list[AdmissionDocumentOut] = Field(default_factory=list)
+    documents_note: str | None = None
+    documents_deadline: date | None = None
+    documents_requested_at: datetime | None = None
+    documents_submitted_at: datetime | None = None
+    documents_verified_at: datetime | None = None
+    payment: AdmissionPaymentOut | None = None
+    # Set on the response to an action that may email the family: whether the email went.
+    # Null on plain reads.
+    applicant_notified: bool | None = None
 
     internal_notes: list[AdmissionRequestNoteOut] = Field(default_factory=list)
     history: list[AdmissionRequestHistoryOut] = Field(default_factory=list)
@@ -589,8 +681,18 @@ class AdmissionRequestAdmit(BaseModel):
         None, max_length=320, description="Defaults to the primary contact's email."
     )
     send_credentials: bool = False
-    notify_applicant: bool = True
+    notify_applicant: bool = Field(
+        True, description="Send the welcome email: admission details, app links and, when "
+                          "`send_credentials` is on, the login details - one email, not three.",
+    )
     note: str | None = Field(None, max_length=2000, description="Shown to the family if notified.")
+    record_fee_receipt: bool = Field(
+        True, description="When the fee was confirmed through the portal, enter it in Finance "
+                          "as a receipt against the admission fee head.",
+    )
+    fee_head_id: int | None = Field(
+        None, description="The fee head for that receipt. Defaults to the admission-charge head.",
+    )
 
     @field_validator("admission_number", "roll_number", "note", mode="before")
     @classmethod
@@ -615,4 +717,211 @@ class AdmissionRequestAdmitResult(BaseModel):
     credentials: list[CredentialsIssued] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     applicant_notified: bool = False
+    receipt_id: int | None = None
     detail: str
+
+# ---- What the office sends ------------------------------------------------------------
+
+class AdmissionDocumentSpec(BaseModel):
+    """One document to ask for. `key` is derived from the label when omitted."""
+    key: str | None = Field(None, max_length=60)
+    label: str = Field(..., min_length=2, max_length=120)
+    description: str | None = Field(None, max_length=300)
+    required: bool = True
+
+    @field_validator("key", "label", "description", mode="before")
+    @classmethod
+    def _strip(cls, value):
+        return _blank_to_none(value)
+
+
+class AdmissionDocumentsRequest(BaseModel):
+    """
+    Select the applicant and ask for documents. Asking again keeps what was already
+    uploaded for a document of the same key and adds the new ones.
+    """
+    documents: list[AdmissionDocumentSpec] = Field(..., min_length=1, max_length=20)
+    note: str | None = Field(None, max_length=2000, description="Included in the email verbatim.")
+    deadline: date | None = None
+    notify_applicant: bool = True
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _strip(cls, value):
+        return _blank_to_none(value)
+
+
+class AdmissionDocumentDecision(BaseModel):
+    key: str
+    status: Literal["ACCEPTED", "REJECTED"]
+    note: str | None = Field(None, max_length=500, description="Why, for a rejected document.")
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _strip(cls, value):
+        return _blank_to_none(value)
+
+
+class AdmissionDocumentsReview(BaseModel):
+    """
+    The office's verdict on the uploads. Any REJECTED sends the family back to upload those
+    again; all required documents ACCEPTED verifies them.
+    """
+    decisions: list[AdmissionDocumentDecision] = Field(..., min_length=1)
+    note: str | None = Field(None, max_length=2000)
+    notify_applicant: bool = True
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _strip(cls, value):
+        return _blank_to_none(value)
+
+
+class AdmissionPaymentRequest(BaseModel):
+    """
+    Ask for the fee. With Razorpay configured and `use_gateway` on, the link is made
+    through Razorpay; otherwise `payment_link` (any provider) and/or `instructions` (bank
+    or UPI details) tell the family how to pay. Asking again replaces the previous request.
+    """
+    amount: float = Field(..., gt=0)
+    currency: str | None = Field(None, max_length=8, description="Defaults to the school currency.")
+    description: str = Field("Admission fee", min_length=2, max_length=200)
+    due_date: date | None = None
+    payment_link: str | None = Field(None, max_length=1000)
+    instructions: str | None = Field(None, max_length=2000)
+    use_gateway: bool = True
+    note: str | None = Field(None, max_length=2000)
+    notify_applicant: bool = True
+
+    @field_validator("currency", "payment_link", "instructions", "note", mode="before")
+    @classmethod
+    def _strip(cls, value):
+        return _blank_to_none(value)
+
+    @field_validator("payment_link")
+    @classmethod
+    def _http(cls, value):
+        if value and not value.lower().startswith(("https://", "http://")):
+            raise ValueError("The payment link must start with https://")
+        return value
+
+
+class AdmissionPaymentReview(BaseModel):
+    """Confirm the family's proof of payment, or send it back with a note."""
+    approve: bool
+    note: str | None = Field(None, max_length=2000)
+    notify_applicant: bool = True
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _strip(cls, value):
+        return _blank_to_none(value)
+
+
+class AdmissionResendResult(BaseModel):
+    sent: bool
+    detail: str
+
+
+class AdmissionPipelineConfig(BaseModel):
+    """What the office's dialogs need to know about this deployment."""
+    gateway_available: bool
+    gateway_provider: str | None = None
+    currency: str
+    portal_base_url: str | None = None
+    email_configured: bool
+
+
+# ---- What the family's portal page sees ----------------------------------------------
+
+class PortalFileOut(BaseModel):
+    id: str
+    name: str
+    size: int | None = None
+    uploaded_at: datetime | None = None
+
+
+class PortalDocumentOut(BaseModel):
+    key: str
+    label: str
+    description: str | None = None
+    required: bool = True
+    status: DocumentStatus = "PENDING"
+    review_note: str | None = None
+    files: list[PortalFileOut] = Field(default_factory=list)
+
+
+class PortalPaymentSubmissionOut(BaseModel):
+    transaction_id: str | None = None
+    paid_on: date | None = None
+    amount: float | None = None
+    submitted_at: datetime | None = None
+    status: Literal["PENDING", "ACCEPTED", "REJECTED"] = "PENDING"
+    has_attachment: bool = False
+
+
+class PortalPaymentOut(BaseModel):
+    amount: float
+    currency: str
+    description: str
+    due_date: date | None = None
+    link_url: str | None = None
+    instructions: str | None = None
+    provider: Literal["RAZORPAY", "MANUAL"] = "MANUAL"
+    status: PaymentStatus = "REQUESTED"
+    review_note: str | None = None
+    last_submission: PortalPaymentSubmissionOut | None = None
+
+
+class PortalStep(BaseModel):
+    key: str
+    label: str
+    state: Literal["done", "current", "upcoming", "stopped"]
+
+
+class PortalSchoolOut(BaseModel):
+    name: str
+    contact_email: str | None = None
+    contact_phone: str | None = None
+    website_url: str | None = None
+    web_app_url: str | None = None
+    mobile_app_url: str | None = None
+
+
+class PortalAdmittedOut(BaseModel):
+    class_name: str | None = None
+    academic_year_name: str | None = None
+    admission_number: str | None = None
+    login_email: str | None = None
+
+
+class AdmissionPortalOut(BaseModel):
+    """
+    Everything the family's page shows, and nothing else: no notes, no other family, no
+    links to the files themselves. Reached only with the secret in the family's emails.
+    """
+    reference: str
+    student_full_name: str
+    class_name: str | None = None
+    academic_year_name: str | None = None
+    status: AdmissionRequestStatus
+    stage_title: str
+    stage_message: str
+    steps: list[PortalStep] = Field(default_factory=list)
+    submitted_at: datetime | None = None
+
+    documents: list[PortalDocumentOut] = Field(default_factory=list)
+    documents_note: str | None = None
+    documents_deadline: date | None = None
+    can_upload_documents: bool = False
+    can_submit_documents: bool = False
+
+    payment: PortalPaymentOut | None = None
+    can_submit_payment: bool = False
+
+    admitted: PortalAdmittedOut | None = None
+    school: PortalSchoolOut
+    max_file_mb: int
+    max_files_per_document: int
+    accepted_types: list[str] = Field(default_factory=list)
+
