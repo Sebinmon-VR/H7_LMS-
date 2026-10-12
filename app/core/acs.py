@@ -334,6 +334,12 @@ def stop_recording(recording_id: str) -> bool:
 def download_recording(content_location: str):
     """The bytes of one finished recording chunk, streamed."""
     try:
-        return _client("calls").download_recording(content_location)
+        result = _client("calls").download_recording(content_location)
+        # azure-communication-callautomation 1.6 hands back the HTTP response itself
+        # rather than the byte iterator it is documented to return (SDK issue #42835).
+        if hasattr(result, "iter_bytes"):
+            result.raise_for_status()
+            return result.iter_bytes()
+        return result
     except Exception as exc:
         raise AcsError(f"Could not download the recording: {exc}") from exc
