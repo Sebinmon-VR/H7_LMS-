@@ -111,6 +111,14 @@ def _event(kind: str, title: str, start: datetime | None, **extra) -> dict:
     }
 
 
+def _id_of(record: dict, field: str) -> int:
+    """A record's numeric reference, or -1 when it has none (a tuition exam has no class)."""
+    try:
+        return int(record.get(field))
+    except (TypeError, ValueError):
+        return -1
+
+
 def _name_of(service, doc_id) -> str | None:
     if doc_id is None:
         return None
@@ -338,22 +346,22 @@ def for_user(user, from_date: date, to_date: date,
         if class_ids:
             timetable = [
                 t for t in firestore_timetable.list_all()
-                if int(t.get("class_id", -1)) in class_ids
+                if _id_of(t, "class_id") in class_ids
             ]
             events += _timetable_events(timetable, from_date, to_date, role)
             events += _meeting_events(
                 [m for m in firestore_meetings.list_all()
-                 if int(m.get("class_id", -1)) in class_ids],
+                 if _id_of(m, "class_id") in class_ids],
                 from_date, to_date,
             )
             events += _exam_events(
                 [e for e in firestore_exams.list_all()
-                 if int(e.get("class_id", -1)) in class_ids],
+                 if _id_of(e, "class_id") in class_ids],
                 from_date, to_date,
             )
             events += _homework_events(
                 [h for h in firestore_homework.list_all()
-                 if int(h.get("class_id", -1)) in class_ids],
+                 if _id_of(h, "class_id") in class_ids],
                 from_date, to_date,
             )
 
@@ -380,23 +388,23 @@ def for_user(user, from_date: date, to_date: date,
             led = permissions.led_class_ids(user)
             timetable = [
                 t for t in firestore_timetable.list_all()
-                if int(t.get("teacher_id", -1)) == user_id
-                or int(t.get("class_id", -1)) in led
+                if _id_of(t, "teacher_id") == user_id
+                or _id_of(t, "class_id") in led
             ]
             meetings = [
                 m for m in firestore_meetings.list_all()
-                if int(m.get("teacher_id", -1)) == user_id
-                or int(m.get("class_id", -1)) in led
+                if _id_of(m, "teacher_id") == user_id
+                or _id_of(m, "class_id") in led
             ]
             exams = [
                 e for e in firestore_exams.list_all()
-                if int(e.get("teacher_id", -1)) == user_id
-                or int(e.get("class_id", -1)) in led
+                if _id_of(e, "teacher_id") == user_id
+                or _id_of(e, "class_id") in led
             ]
             homework = [
                 h for h in firestore_homework.list_all()
-                if int(h.get("teacher_id", -1)) == user_id
-                or int(h.get("class_id", -1)) in led
+                if _id_of(h, "teacher_id") == user_id
+                or _id_of(h, "class_id") in led
             ]
 
         events += _timetable_events(timetable, from_date, to_date, role)
