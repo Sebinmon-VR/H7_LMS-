@@ -250,3 +250,12 @@ class StorageService:
 
 
 storage_service = StorageService()
+
+# Where uploaded profile photos live (POST /admin/users/{id}/photo).
+PROFILE_PHOTO_PREFIXES = ("/files/photos/", "/uploads/photos/")
+
+
+def forget_profile_photo(url: str | None) -> None:
+    """Deletes an uploaded profile photo. A web address pasted in before uploads is not ours to delete."""
+    if url and url.startswith(PROFILE_PHOTO_PREFIXES):
+        storage_service.delete_file(url)

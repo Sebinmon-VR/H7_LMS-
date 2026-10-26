@@ -16,6 +16,7 @@ from datetime import date
 
 from app.core import demo, identity
 from app.core import firebase as fb
+from app.core.storage import forget_profile_photo
 
 logger = logging.getLogger("demo_accounts")
 
@@ -74,6 +75,7 @@ def erase(user: dict) -> dict:
     if identity.has_password(user_id):
         identity.delete_credentials(user_id)
     fb.firestore_users.delete_document(str(user_id))
+    forget_profile_photo(user.get("photo_url"))
     logger.info("Erased expired demo account %s (%s): %s", user_id, user.get("email"), removed or "nothing else")
     return {"user_id": user_id, "email": user.get("email"), "removed": removed}
 

@@ -26,6 +26,10 @@ azure-communication-email>=1.0.0
 # Linux images ship no IANA database, so SCHOOL_TIMEZONE would silently fall back to UTC and
 # every reminder would fire at the wrong hour without this.
 tzdata>=2024.1
+# Profile photos the browser cannot open itself - iPhone HEIC above all - are turned into a
+# JPG by the server before cropping (POST /admin/users/photo/preview).
+Pillow>=11.3.0
+pillow-heif>=1.0.0
 
 # Not installed on the server. The one-off tools that read what is left on Google -
 # scripts/import_firebase_passwords.py and scripts/migrate_firestore_to_sql.py - need:

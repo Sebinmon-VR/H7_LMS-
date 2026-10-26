@@ -1,6 +1,8 @@
+import logging
 from datetime import date, datetime
+from pathlib import Path
 from typing import Callable, List, Optional
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status, Query
 
 from app.api.v1.dependencies import require_admin
 from app.core import acs
@@ -11,7 +13,7 @@ from app.core.enums import (
     UserRole, AttendanceStatus, DayOfWeek, Program,
     TEACHING_ROLE_VALUES, TEACHING_OR_ADMIN_VALUES, normalize_programs,
 )
-from app.core.storage import storage_service
+from app.core.storage import forget_profile_photo, storage_service
 from app.core.jobs import job_registry, report_cache
 from app.core import demo, identity
 from app.core.firebase import (
@@ -69,6 +71,8 @@ from app.services import presence
 # The profile fields a sibling match is made from. An edit touching any of them re-runs
 # the household placement for a student not yet in one.
 GUARDIAN_FIELDS = ("guardian_name", "guardian_phone", "guardian_email")
+
+logger = logging.getLogger("admin")
 
 router = APIRouter(prefix="/admin", tags=["Admin Module"])
 
@@ -275,6 +279,125 @@ def update_user(
     return UserOut(**firestore_users.get_document(str(user_id)))
 
 
+# A profile photo: small, square and already cropped by the browser, so anything near the
+# limit is a full-size camera picture the page failed to shrink.
+PHOTO_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+PHOTO_MAX_BYTES = 5 * 1024 * 1024
+
+
+PHOTO_SOURCE_MAX_BYTES = 30 * 1024 * 1024
+PHOTO_PREVIEW_SIDE = 2048
+
+
+def _as_jpeg(data: bytes) -> bytes:
+    """
+    Any picture Pillow can read - iPhone HEIC, TIFF, BMP, AVIF, GIF - as a JPG a browser can
+    show. Turned upright first: phones store a sideways picture plus a note to rotate it.
+    """
+    import io
+
+    import pillow_heif
+    from PIL import Image, ImageOps
+
+    pillow_heif.register_heif_opener()
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            picture = ImageOps.exif_transpose(source)
+            if picture.mode in ("RGBA", "LA", "P"):
+                # A transparent background would turn black as a JPG.
+                picture = picture.convert("RGBA")
+                flat = Image.new("RGB", picture.size, "white")
+                flat.paste(picture, mask=picture.getchannel("A"))
+                picture = flat
+            else:
+                picture = picture.convert("RGB")
+            picture.thumbnail((PHOTO_PREVIEW_SIDE, PHOTO_PREVIEW_SIDE))
+            out = io.BytesIO()
+            picture.save(out, "JPEG", quality=90)
+            return out.getvalue()
+    except Exception as exc:
+        logger.info("Photo preview could not read the picture: %s", exc)
+        raise HTTPException(
+            status_code=400,
+            detail="This picture could not be opened. Please choose a different one.",
+        ) from exc
+
+
+@router.post("/users/photo/preview")
+async def preview_user_photo(
+    file: UploadFile = File(..., description="A picture in any common format."),
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] A picture the browser cannot open, returned as a JPG it can.
+
+    Nothing is stored: the page crops what comes back and uploads the result to
+    `POST /users/{user_id}/photo` like any other photo.
+    """
+    data = await file.read(PHOTO_SOURCE_MAX_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="That picture is empty. Please choose another.")
+    if len(data) > PHOTO_SOURCE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="That picture is larger than 30 MB. Please choose a smaller one.")
+    return Response(content=_as_jpeg(data), media_type="image/jpeg")
+
+
+@router.post("/users/{user_id}/photo", response_model=UserOut)
+async def upload_user_photo(
+    user_id: int,
+    file: UploadFile = File(..., description="A JPG, PNG or WEBP picture."),
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Sets a person's profile photo, replacing (and deleting) the previous one.
+
+    Photos live on the open /files/ path like other school files: an image tag carries no
+    sign-in, and the random name in the address is what keeps it from being guessed.
+    """
+    user = require_document(firestore_users, user_id, "User")
+
+    extension = Path(file.filename or "").suffix.lower()
+    content_type = PHOTO_TYPES.get(extension)
+    if content_type is None:
+        raise HTTPException(status_code=400, detail="Please choose a JPG, PNG or WEBP picture.")
+    data = await file.read(PHOTO_MAX_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="That picture is empty. Please choose another.")
+    if len(data) > PHOTO_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="That picture is larger than 5 MB. Please choose a smaller one.")
+
+    stored = storage_service.save_bytes(
+        data, f"photo{extension}", folder=f"photos/{user_id}", content_type=content_type,
+    )
+    if stored["requested_provider"] != stored["provider"]:
+        # Local disk on the server does not survive a redeploy; a photo that vanishes next
+        # week is worse than one that asks to be tried again.
+        storage_service.delete_file(stored["url"], stored["provider"])
+        raise HTTPException(
+            status_code=503,
+            detail="We could not save the picture just now. Please try again in a few minutes.",
+        )
+
+    firestore_users.add_document(str(user_id), {
+        "photo_url": stored["url"],
+        "updated_at": datetime.utcnow().isoformat(),
+    })
+    forget_profile_photo(user.get("photo_url"))
+    return UserOut(**firestore_users.get_document(str(user_id)))
+
+
+@router.delete("/users/{user_id}/photo", response_model=UserOut)
+def remove_user_photo(user_id: int, _: UserOut = Depends(require_admin)):
+    """[Admin Only] Takes a person's profile photo off, so their initials show again."""
+    user = require_document(firestore_users, user_id, "User")
+    firestore_users.add_document(str(user_id), {
+        "photo_url": None,
+        "updated_at": datetime.utcnow().isoformat(),
+    })
+    forget_profile_photo(user.get("photo_url"))
+    return UserOut(**firestore_users.get_document(str(user_id)))
+
+
 # Records that point at a user. Deleting the user permanently has to deal with each of
 # these, or the system is left hydrating references to a profile that no longer exists.
 def _user_dependencies(user_id: int) -> list[tuple[str, object, str]]:
@@ -406,6 +529,7 @@ def delete_user(
     login_deleted = identity.delete_credentials(user_id) if had_password else True
 
     firestore_users.delete_document(str(user_id))
+    forget_profile_photo(user.get("photo_url"))
 
     detail = f"User {user.get('email') or user_id} permanently deleted."
     if blocking:
