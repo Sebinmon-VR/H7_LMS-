@@ -15,9 +15,11 @@ from app.core.firebase import (
     hydrate_attendance, hydrate_topic, hydrate_live_meeting,
     hydrate_study_material, hydrate_exam_grade, hydrate_teacher_mapping,
     hydrate_class_teacher_mapping,
-    firestore_classes, firestore_subjects,
+    firestore_classes, firestore_subjects, firestore_timetable,
     require_document, assert_owner, prefetch_references, prefetch_academic
 )
+from app.services import attendance_register as register_service
+from app.services import substitutions as substitution_service
 from app.services import timetable as timetable_service
 from app.services.content import (
     active_students_in_class as _active_students_in_class,
@@ -26,7 +28,8 @@ from app.services.content import (
 from app.services.permissions import visible_records
 from app.services.recordings import harvest_meeting
 from app.schemas.academic import ClassTeacherMappingOut, TeacherMappingOut
-from app.schemas.timetable import ScheduledPeriod, TimetableEntryOut
+from app.schemas.timetable import CoverCreate, ScheduledPeriod, TeacherSummaryOut, TimetableEntryOut
+from app.core.enums import TEACHING_ROLE_VALUES
 from app.schemas.user import UserOut
 from app.schemas.attendance import BatchAttendanceCreate, AttendanceUpdate, AttendanceOut
 from app.schemas.topic import PendingTopicOut, TopicCreate, TopicUpdate, TopicOut
@@ -115,8 +118,77 @@ def get_teacher_day_schedule(
     `is_current` marks the period happening right now; `starts_in_minutes` counts down.
     """
     target = on_date or timetable_service.now_local().date()
-    entries = timetable_service.list_entries(teacher_id=current_user.id)
-    return [ScheduledPeriod(**p) for p in timetable_service.resolve_on_date(entries, target)]
+    # Every period, with covers applied, kept where this teacher is the one taking it. A
+    # teacher's own entries are not enough: a period they cover belongs to somebody else's entry.
+    entries = timetable_service.list_entries()
+    return [
+        ScheduledPeriod(**p)
+        for p in timetable_service.resolve_on_date(entries, target)
+        if (p["entry"].get("teacher_id") or None) == current_user.id
+    ]
+
+
+def _own_period_entry(entry_id: int, current_user: UserOut) -> dict:
+    """The timetable entry, if it is this teacher's own. A teacher may only arrange cover for their own periods."""
+    entry = require_document(firestore_timetable, entry_id, "Timetable period")
+    if entry.get("teacher_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only arrange cover for your own periods.")
+    return entry
+
+
+@router.get("/cover", response_model=List[ScheduledPeriod])
+def my_periods_for_cover(
+    on_date: date = Query(...),
+    current_user: UserOut = Depends(require_teacher),
+):
+    """
+    [Teacher Only] Your own timetabled periods on one date, including any you have already
+    handed to a substitute. Covers the periods you may arrange cover for.
+    """
+    entries = timetable_service.list_entries()
+    rows = []
+    for period in timetable_service.resolve_on_date(entries, on_date):
+        original = (period["entry"].get("substitution") or {}).get("original_teacher_id")             or period["entry"].get("teacher_id")
+        if original == current_user.id:
+            rows.append(ScheduledPeriod(**period))
+    return rows
+
+
+@router.get("/staff", response_model=List[TeacherSummaryOut])
+def teaching_staff(_: UserOut = Depends(require_teacher)):
+    """[Teacher Only] Every teacher in the school, to choose a substitute from. Names only."""
+    return [
+        TeacherSummaryOut(id=u["id"], full_name=u.get("full_name") or "")
+        for u in firestore_users.list_all()
+        if str(u.get("role")) in TEACHING_ROLE_VALUES
+    ]
+
+
+@router.post("/cover", response_model=ScheduledPeriod, status_code=status.HTTP_201_CREATED)
+def set_my_cover(payload: CoverCreate, current_user: UserOut = Depends(require_teacher)):
+    """
+    [Teacher Only] Give one of your own periods to a substitute, for one date.
+
+    Used when you are away: only that date changes. The recurring timetable, and every other
+    date, stay as they were.
+    """
+    _own_period_entry(payload.timetable_entry_id, current_user)
+    substitution_service.create(
+        payload.timetable_entry_id,
+        payload.on_date,
+        payload.substitute_teacher_id,
+        actor=current_user,
+        note=payload.note,
+    )
+    entry = firestore_timetable.get_document(str(payload.timetable_entry_id))
+    return ScheduledPeriod(**timetable_service.resolve_on_date([entry], payload.on_date)[0])
+
+
+@router.delete("/cover/{entry_id}/{on_date}", status_code=status.HTTP_204_NO_CONTENT)
+def clear_my_cover(entry_id: int, on_date: date, current_user: UserOut = Depends(require_teacher)):
+    """[Teacher Only] Take back a substitute you set for one of your own periods on one date."""
+    _own_period_entry(entry_id, current_user)
+    substitution_service.remove(entry_id, on_date)
 
 
 @router.get("/timetable/upcoming", response_model=List[ScheduledPeriod])
@@ -145,41 +217,11 @@ def mark_attendance(
     [Teacher Only - Independent] Mark attendance for students in a class and subject for a date.
     Saves the records to the database.
     """
-    created_records = []
-    for item in batch_in.attendance_list:
-        existing = next(
-            (
-                record for record in firestore_attendance.query_documents("student_id", "==", item.student_id)
-                if record.get("class_id") == batch_in.class_id
-                and record.get("subject_id") == batch_in.subject_id
-                and record.get("date") == batch_in.date.isoformat()
-            ),
-            None
-        )
-
-        created_at = existing.get("created_at") if existing else datetime.utcnow().isoformat()
-        record_data = {
-            "student_id": item.student_id,
-            "class_id": batch_in.class_id,
-            "subject_id": batch_in.subject_id,
-            "teacher_id": current_user.id,
-            "date": batch_in.date.isoformat(),
-            "status": item.status.value,
-            "remarks": item.remarks,
-            "created_at": created_at
-        }
-
-        if existing:
-            firestore_attendance.add_document(str(existing["id"]), record_data)
-            record_data["id"] = existing["id"]
-        else:
-            new_id = firestore_attendance.get_next_numeric_id()
-            firestore_attendance.add_document(str(new_id), record_data)
-            record_data["id"] = new_id
-
-        created_records.append(AttendanceOut(**hydrate_attendance(record_data)))
-
-    return created_records
+    # The same register the live class saves for a period; see attendance_register.
+    saved = register_service.save_register(
+        batch_in.class_id, batch_in.subject_id, batch_in.date, batch_in.attendance_list, current_user.id,
+    )
+    return [AttendanceOut(**hydrate_attendance(record)) for record in saved]
 
 
 @router.get("/attendance", response_model=List[AttendanceOut])

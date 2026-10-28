@@ -405,6 +405,11 @@ def create_exam(payload, actor) -> dict:
         "question_paper_warning": None,
         "max_upload_files": payload.max_upload_files,
 
+        "auto_publish": bool(payload.auto_publish),
+        "auto_publish_at": store_dt(payload.auto_publish_at) if payload.auto_publish_at else None,
+        "auto_publish_error": None,
+        "live_invigilation": bool(payload.live_invigilation),
+
         "results_published": False,
         "results_published_at": None,
         "created_at": now_utc().isoformat(),
@@ -455,9 +460,12 @@ def apply_exam_update(exam: dict, payload) -> dict:
         if key in updates and hasattr(updates[key], "value"):
             updates[key] = updates[key].value
 
-    for key in ("starts_at", "ends_at"):
+    for key in ("starts_at", "ends_at", "auto_publish_at"):
         if key in updates:
             updates[key] = store_dt(updates[key])
+    if "auto_publish" in updates or "auto_publish_at" in updates:
+        # A changed schedule gets a fresh attempt; the old reason no longer applies.
+        updates["auto_publish_error"] = None
 
     if "teacher_id" in updates:
         resolve_teacher(updates["teacher_id"])
@@ -501,6 +509,54 @@ def apply_exam_update(exam: dict, payload) -> dict:
     updates["updated_at"] = now_utc().isoformat()
     firestore_exams.add_document(str(exam["id"]), updates)
     return firestore_exams.get_document(str(exam["id"]))
+
+
+AUTO_PUBLISH_NOT_READY = (
+    "It was due to publish automatically, but it has no questions or question paper yet. "
+    "Add them and it will publish on its own, or press Publish."
+)
+
+
+def publish_due(at: datetime | None = None) -> dict:
+    """
+    Releases every auto-publishing draft whose publish time has come.
+
+    Run by the maintenance sweep and again whenever a student opens their exam list, so an
+    exam is never late just because the sweep has not come round yet. Idempotent: a released
+    exam is no longer a draft, so the next pass skips it. A draft with nothing to answer is
+    held back, with the reason saved for the teacher, and tried again on every pass.
+    """
+    # The sweep passes a naive UTC clock. `to_utc` would read a naive value as school time,
+    # so a naive clock is taken as UTC here explicitly.
+    if at is None:
+        moment = now_utc()
+    elif at.tzinfo is None:
+        moment = at.replace(tzinfo=timezone.utc)
+    else:
+        moment = at.astimezone(timezone.utc)
+    published, held = [], []
+    for exam in firestore_exams.query_documents("status", "==", ExamStatus.DRAFT.value):
+        if not exam.get("auto_publish"):
+            continue
+        due = to_utc(exam.get("auto_publish_at") or exam.get("starts_at"))
+        if due is None or due > moment:
+            continue
+        try:
+            assert_publishable(exam)
+        except HTTPException:
+            if exam.get("auto_publish_error") != AUTO_PUBLISH_NOT_READY:
+                firestore_exams.add_document(str(exam["id"]), {"auto_publish_error": AUTO_PUBLISH_NOT_READY})
+            held.append(exam["id"])
+            continue
+        firestore_exams.add_document(str(exam["id"]), {
+            "status": ExamStatus.PUBLISHED.value,
+            "auto_publish_error": None,
+            "updated_at": moment.isoformat(),
+        })
+        published.append(exam["id"])
+    if published:
+        logger.info("Auto-published exams %s.", published)
+    return {"published": published, "held": held}
 
 
 def assert_publishable(exam: dict) -> None:
@@ -1026,6 +1082,121 @@ async def store_answer_sheet(
     return firestore_exam_submissions.get_document(str(submission["id"]))
 
 
+def save_marking_sheet(exam: dict, submission: dict, payload) -> dict:
+    """
+    Stores the teacher's marking of the answer sheets: where they drew the lines that split
+    each file into answers, and the score given to each part.
+
+    Kept apart from the valuation so a teacher can mark half a script, leave, and come back;
+    the total it adds up to is what is then recorded as the script's marks. Each part's score
+    must not exceed what it was said to be worth, and the whole must fit the exam.
+    """
+    if submission.get("status") == SubmissionStatus.IN_PROGRESS.value:
+        raise HTTPException(status_code=409, detail="That script has not been handed in yet.")
+
+    attachments = submission.get("attachments") or []
+    sheet: dict[str, Any] = {}
+    total = 0.0
+    for key, marked in (payload.files or {}).items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"'{key}' is not a file on this script.")
+        if index < 0 or index >= len(attachments):
+            raise HTTPException(status_code=404, detail=f"There is no uploaded file {index + 1}.")
+        dividers = sorted(float(d) for d in marked.dividers)
+        if any(d <= 0 or d >= 1 for d in dividers):
+            raise HTTPException(status_code=400, detail="A dividing line must sit inside the page.")
+        if len(marked.segments) != len(dividers) + 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Each part between the lines needs exactly one score entry.",
+            )
+        segments = []
+        for part in marked.segments:
+            if part.marks is not None and part.max_marks is not None and part.marks > part.max_marks:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{part.label or 'A part'} is given {part.marks}, more than its {part.max_marks}.",
+                )
+            total += float(part.marks or 0.0)
+            segments.append(part.model_dump())
+        sheet[str(index)] = {"file_url": attachments[index].get("file_url"), "dividers": dividers, "segments": segments}
+
+    total = round(total, 2)
+    max_marks = float(exam.get("max_marks") or 0.0)
+    if max_marks and total > max_marks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The parts add up to {total}, more than the exam is out of ({max_marks}).",
+        )
+
+    moment = now_utc().isoformat()
+    updates = {"marking_sheet": sheet, "marking_total": total, "updated_at": moment}
+    firestore_exam_submissions.add_document(str(submission["id"]), updates)
+    return firestore_exam_submissions.get_document(str(submission["id"]))
+
+
+def mark_away(submission: dict | None, away: bool) -> dict | None:
+    """
+    Notes a student stepping out of an exam they have started, or coming back to it.
+
+    The clock never stops for it - this is only so the invigilator can see who left and when.
+    Only a script still being written is touched, and repeats are no-ops: leaving twice
+    without coming back is one absence.
+    """
+    if not submission or submission.get("status") != SubmissionStatus.IN_PROGRESS.value:
+        return submission
+    moment = now_utc().isoformat()
+    log = [dict(entry) for entry in (submission.get("away_log") or [])]
+    if away:
+        if submission.get("away_since"):
+            return submission
+        log.append({"left_at": moment, "returned_at": None})
+        updates = {"away_since": moment, "away_log": log}
+    else:
+        if not submission.get("away_since"):
+            return submission
+        if log and not log[-1].get("returned_at"):
+            log[-1]["returned_at"] = moment
+        updates = {"away_since": None, "away_log": log}
+    firestore_exam_submissions.add_document(str(submission["id"]), updates)
+    return {**submission, **updates}
+
+
+def remove_answer_file(exam: dict, submission: dict, index: int) -> dict:
+    """
+    Takes back one uploaded file before the script is handed in.
+
+    Under the same clock as uploading: once the student's time to hand in has passed, what
+    they filed stays filed. A file attached to one question is taken off that answer too, and
+    the stored copy is deleted - a removed file should not linger in storage.
+    """
+    assert_open_for_writing(exam, submission)
+    attachments = list(submission.get("attachments") or [])
+    if index < 0 or index >= len(attachments):
+        raise HTTPException(status_code=404, detail="There is no such uploaded file.")
+    removed = attachments.pop(index)
+
+    updates: dict[str, Any] = {"attachments": attachments, "updated_at": now_utc().isoformat()}
+    question_id = removed.get("question_id")
+    if question_id is not None:
+        answers = [dict(a) for a in (submission.get("answers") or [])]
+        for answer in answers:
+            if answer.get("question_id") == question_id:
+                answer["attachments"] = [
+                    url for url in (answer.get("attachments") or []) if url != removed.get("file_url")
+                ]
+        updates["answers"] = answers
+
+    firestore_exam_submissions.add_document(str(submission["id"]), updates)
+    try:
+        storage_service.delete_file(removed.get("file_url"), removed.get("provider"))
+    except Exception as exc:  # the record is already right; a stray file is not worth failing over
+        logger.warning("Removed answer file could not be deleted from storage: %s", exc)
+    return firestore_exam_submissions.get_document(str(submission["id"]))
+
+
 def reopen(exam: dict, submission: dict) -> dict:
     """
     Puts a handed-in script back in the student's hands.
@@ -1082,7 +1253,8 @@ def evaluate(exam: dict, submission: dict, payload, evaluator) -> dict:
     Under MARKS a per-question sheet is totalled for you; a flat `marks_obtained` is taken as
     given, which is the natural shape for a paper marked with a red pen. Under GRADE the
     letter is what counts and must come from the exam's own scale, so a card cannot end up
-    carrying a grade the school does not use.
+    carrying a grade the school does not use - but marks may be given instead, and the grade
+    is then the band they reach, so the report card carries the marks as well as the letter.
     """
     if submission.get("status") == SubmissionStatus.IN_PROGRESS.value:
         raise HTTPException(
@@ -1139,10 +1311,16 @@ def evaluate(exam: dict, submission: dict, payload, evaluator) -> dict:
     grade = payload.grade
 
     if scheme == GradingScheme.GRADE.value:
+        if not grade and marks is not None:
+            # Marks were given (on the marking sheet, say): the grade is the band they reach.
+            grade = summary["grade"]
         if not grade:
             raise HTTPException(
                 status_code=400,
-                detail="This exam is valued by grade, so `grade` is required.",
+                detail=(
+                    "This exam is graded: choose a grade, or enter marks that reach one of its "
+                    "grade bands."
+                ),
             )
         allowed = {b.get("grade") for b in (exam.get("grade_bands") or [])}
         if grade not in allowed:
@@ -1343,6 +1521,11 @@ def hydrate_exam(exam: dict) -> dict:
         "question_paper_warning": exam.get("question_paper_warning"),
         "max_upload_files": exam.get("max_upload_files") or 5,
 
+        "auto_publish": bool(exam.get("auto_publish")),
+        "auto_publish_at": exam.get("auto_publish_at"),
+        "auto_publish_error": exam.get("auto_publish_error"),
+        "live_invigilation": bool(exam.get("live_invigilation")),
+
         "results_published": bool(exam.get("results_published")),
         "results_published_at": exam.get("results_published_at"),
         "created_at": exam.get("created_at"),
@@ -1437,6 +1620,7 @@ def hydrate_exam_for_student(
 
         "question_paper_url": exam.get("question_paper_url"),
         "max_upload_files": exam.get("max_upload_files") or 5,
+        "live_invigilation": bool(exam.get("live_invigilation")),
         "questions": questions,
         "question_count": len(exam.get("questions") or []),
 
@@ -1473,6 +1657,10 @@ def hydrate_submission(submission: dict, exam: dict | None = None) -> dict:
         "expires_at": submission.get("expires_at"),
         "is_late": bool(submission.get("is_late")),
         "late_by_minutes": submission.get("late_by_minutes") or 0.0,
+        "away_since": submission.get("away_since"),
+        "away_log": submission.get("away_log") or [],
+        "marking_sheet": submission.get("marking_sheet") or {},
+        "marking_total": submission.get("marking_total"),
 
         "answers": submission.get("answers") or [],
         "attachments": submission.get("attachments") or [],

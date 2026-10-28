@@ -129,6 +129,19 @@ def delete(blob_name: str) -> bool:
         return False
 
 
+def download(blob_name: str) -> tuple[bytes, str | None]:
+    """A blob's bytes and its stored content type, for serving a file through the API."""
+    try:
+        client = _container().get_blob_client(blob_name)
+        data = client.download_blob().readall()
+        content_type = client.get_blob_properties().content_settings.content_type
+    except BlobStorageError:
+        raise
+    except Exception as exc:
+        raise BlobStorageError(f"Could not read blob '{blob_name}': {exc}") from exc
+    return data, content_type
+
+
 def size_of(blob_name: str) -> int | None:
     try:
         return int(_container().get_blob_client(blob_name).get_blob_properties().size)

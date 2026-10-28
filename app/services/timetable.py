@@ -23,8 +23,8 @@ from fastapi import HTTPException
 from app.core.config import settings
 from app.core.enums import TEACHING_OR_ADMIN_VALUES, DayOfWeek
 from app.core.firebase import (
-    firestore_classes, firestore_student_enrollments, firestore_subjects,
-    firestore_teacher_mappings, firestore_timetable, firestore_users,
+    firestore_classes, firestore_period_substitutions, firestore_student_enrollments,
+    firestore_subjects, firestore_teacher_mappings, firestore_timetable, firestore_users,
     hydrate_timetable_entry, prefetch_references,
 )
 
@@ -373,6 +373,29 @@ def entries_for_student(student_id: int, day_of_week: DayOfWeek | None = None) -
     return sort_entries(entries)
 
 
+def apply_cover(hydrated: dict, cover: dict) -> dict:
+    """
+    The period as its covering teacher sees it: the substitute in the teacher's place, with the
+    original teacher kept alongside so a student's screen can say who is standing in.
+    """
+    substitute_id = cover.get("substitute_teacher_id")
+    original = hydrated.get("teacher")
+    covering_teacher = hydrate_timetable_entry({**hydrated, "teacher_id": substitute_id})["teacher"]
+    return {
+        **hydrated,
+        "teacher_id": substitute_id,
+        "teacher": covering_teacher,
+        "substitution": {
+            "on_date": cover.get("on_date"),
+            "substitute_teacher_id": substitute_id,
+            "substitute_teacher": covering_teacher,
+            "original_teacher_id": hydrated.get("teacher_id"),
+            "original_teacher": original,
+            "note": cover.get("note"),
+        },
+    }
+
+
 def resolve_on_date(entries: list[dict], on_date: date, reference: datetime | None = None) -> list[dict]:
     """
     Turns recurring entries into concrete periods for one calendar date.
@@ -385,6 +408,11 @@ def resolve_on_date(entries: list[dict], on_date: date, reference: datetime | No
     reference = reference or datetime.now(tz)
     if reference.tzinfo is None:
         reference = reference.replace(tzinfo=tz)
+
+    covers = {
+        str(c.get("timetable_entry_id")): c
+        for c in firestore_period_substitutions.query_documents("on_date", "==", on_date.isoformat())
+    }
 
     resolved = []
     for entry in entries:
@@ -400,8 +428,15 @@ def resolve_on_date(entries: list[dict], on_date: date, reference: datetime | No
         starts_at = datetime.combine(on_date, start, tzinfo=tz)
         ends_at = datetime.combine(on_date, end, tzinfo=tz)
 
+        hydrated = hydrate_timetable_entry(entry)
+        cover = covers.get(str(entry.get("id")))
+        if cover:
+            # The covering teacher takes the period for this date only. The recurring entry
+            # keeps its own teacher, so the next week's period is unchanged.
+            hydrated = apply_cover(hydrated, cover)
+
         resolved.append({
-            "entry": hydrate_timetable_entry(entry),
+            "entry": hydrated,
             "on_date": on_date,
             "starts_at": starts_at,
             "ends_at": ends_at,

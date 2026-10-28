@@ -22,8 +22,14 @@ from app.api.v1.dependencies import (
     require_admin, require_any_authenticated, require_student, require_teacher,
 )
 from app.core.enums import LeaveStatus, LeaveType, UserRole
-from app.core.firebase import firestore_homework_submissions, firestore_users, require_document
+from app.core.firebase import (
+    firestore_homework_submissions, firestore_leave_requests, firestore_timetable,
+    firestore_users, require_document,
+)
+
 from app.schemas.user import UserOut
+from app.schemas.timetable import CoverCreate, ScheduledPeriod
+from app.schemas.workflow import AffectedPeriod
 from app.schemas.workflow import (
     HomeworkCreate, HomeworkGrade, HomeworkOut, HomeworkSubmissionOut, HomeworkSubmit,
     HomeworkUpdate, LeaveApply, LeaveBalanceOut, LeaveDecision, LeaveRequestOut,
@@ -32,6 +38,8 @@ from app.services import cadence as cadence_service
 from app.services import homework as homework_service
 from app.services import leave as leave_service
 from app.services import parent_reports
+from app.services import substitutions as substitution_service
+from app.services import timetable as timetable_service
 from app.services import permissions
 
 homework_router = APIRouter(prefix="/homework", tags=["Homework"])
@@ -255,6 +263,19 @@ def my_leave(
     return [LeaveRequestOut(**leave_service.present(r)) for r in requests]
 
 
+@leave_router.get("/affected", response_model=List[AffectedPeriod])
+def affected_periods_for_dates(
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    staff: UserOut = Depends(require_teacher),
+):
+    """
+    The periods you have across these dates, for the leave form to offer as classes that
+    need a substitute. Nothing is saved by calling this.
+    """
+    return [AffectedPeriod(**p) for p in leave_service.affected_periods(staff.id, start_date, end_date)]
+
+
 @leave_router.get("/me/balance", response_model=LeaveBalanceOut)
 def my_leave_balance(
     academic_year_id: Optional[int] = Query(None),
@@ -314,6 +335,11 @@ def decide_leave(
     decided = leave_service.decide(
         request, payload.approve, admin, payload.note, payload.substitute_teacher_id
     )
+    if payload.approve and decided.get("cover_plan"):
+        # The applicant's chosen substitutes take the leave's own days; nothing else changes.
+        gaps = substitution_service.cover_from_plan(decided, admin)
+        firestore_leave_requests.add_document(str(request_id), {"cover_gaps": gaps})
+        decided = {**decided, "cover_gaps": gaps}
     return LeaveRequestOut(**leave_service.present(decided))
 
 
@@ -327,7 +353,54 @@ def withdraw_leave(request_id: int, staff: UserOut = Depends(require_teacher)):
     leave is recorded as CANCELLED rather than WITHDRAWN.
     """
     request = leave_service.require_request(request_id)
-    return LeaveRequestOut(**leave_service.present(leave_service.withdraw(request, staff)))
+    was_approved = request.get("status") == LeaveStatus.APPROVED.value
+    withdrawn = leave_service.withdraw(request, staff)
+    if was_approved:
+        # The covers were for days the teacher is no longer away; give the periods back.
+        substitution_service.drop_for_leave(request_id)
+    return LeaveRequestOut(**leave_service.present(withdrawn))
+
+
+cover_router = APIRouter(prefix="/admin/cover", tags=["Cover (Admin)"])
+
+
+@cover_router.get("", response_model=List[ScheduledPeriod])
+def day_cover(on_date: date = Query(...), _: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Every period on one date, with any cover already in place.
+
+    A period's `entry.teacher` is who takes it that day; `entry.substitution` says who it was
+    moved from. The office works from this to see what still needs a teacher.
+    """
+    entries = timetable_service.list_entries()
+    return [ScheduledPeriod(**p) for p in timetable_service.resolve_on_date(entries, on_date)]
+
+
+@cover_router.post("", response_model=ScheduledPeriod, status_code=status.HTTP_201_CREATED)
+def assign_cover(payload: CoverCreate, admin: UserOut = Depends(require_admin)):
+    """
+    [Admin Only] Give one period on one date to a substitute.
+
+    The recurring timetable is not touched. Refused when the period does not run that day,
+    when the substitute is the timetabled teacher or not a teacher, or when the substitute is
+    already teaching at that time.
+    """
+    substitution_service.create(
+        payload.timetable_entry_id,
+        payload.on_date,
+        payload.substitute_teacher_id,
+        actor=admin,
+        note=payload.note,
+    )
+    entry = require_document(firestore_timetable, payload.timetable_entry_id, "Timetable period")
+    period = timetable_service.resolve_on_date([entry], payload.on_date)[0]
+    return ScheduledPeriod(**period)
+
+
+@cover_router.delete("/{entry_id}/{on_date}", status_code=status.HTTP_204_NO_CONTENT)
+def clear_cover(entry_id: int, on_date: date, _: UserOut = Depends(require_admin)):
+    """[Admin Only] Put the timetabled teacher back on one period for one date."""
+    substitution_service.remove(entry_id, on_date)
 
 
 @leave_router.get("/balance/{teacher_id}", response_model=LeaveBalanceOut)

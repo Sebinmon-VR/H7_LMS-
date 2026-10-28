@@ -215,6 +215,47 @@ class StorageService:
 
         return self._delete_local_file(file_url)
 
+    def read_file(self, file_url: str) -> tuple[bytes, str, str]:
+        """
+        The bytes behind a stored file's address, with a content type and a file name.
+
+        For serving a file through the API - an in-page viewer has to fetch the bytes with the
+        user's sign-in, which a plain link to storage cannot carry. Raises FileNotFoundError
+        when the file is not there (or is a Google-era file whose bytes are gone).
+        """
+        import mimetypes
+
+        if not file_url:
+            raise FileNotFoundError("No file.")
+        provider = self._infer_provider(file_url)
+        name = unquote(urlparse(file_url).path).rsplit("/", 1)[-1] or "file"
+        guessed = mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+        if provider == PROVIDER_BLOB:
+            blob_name = azure_blob.blob_name_from(file_url)
+            try:
+                data, content_type = azure_blob.download(blob_name)
+            except azure_blob.BlobStorageError as exc:
+                raise FileNotFoundError(str(exc)) from exc
+            if not content_type or content_type == "application/octet-stream":
+                content_type = guessed
+            return data, content_type, name
+
+        if provider != PROVIDER_LOCAL:
+            raise FileNotFoundError("This file is no longer stored.")
+
+        path_part = unquote(urlparse(file_url).path)
+        if not path_part.startswith("/uploads/"):
+            raise FileNotFoundError("Not a stored file.")
+        target = (self.upload_dir / path_part[len("/uploads/"):]).resolve()
+        try:
+            target.relative_to(self.upload_dir.resolve())
+        except ValueError:
+            raise FileNotFoundError("Outside the uploads directory.")
+        if not target.is_file():
+            raise FileNotFoundError("Missing.")
+        return target.read_bytes(), guessed, name
+
     @staticmethod
     def _infer_provider(file_url: str) -> str:
         if azure_blob.blob_name_from(file_url):

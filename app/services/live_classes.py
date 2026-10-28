@@ -409,6 +409,7 @@ def sweep(reference: datetime | None = None) -> dict:
         "closed_stale": 0,
         "parent_reports_sent": 0,
         "demo_accounts_erased": 0,
+        "exams_published": 0,
         "errors": [],
     }
 
@@ -478,6 +479,15 @@ def sweep(reference: datetime | None = None) -> dict:
     except Exception as exc:  # pragma: no cover
         log_backend_failure(logger, "Demo account purge failed", exc)
         result["errors"].append(f"demo_accounts: {exc}")
+
+    # Exams set to publish themselves are released once their publish time comes.
+    try:
+        from app.services import exams as exam_service
+
+        result["exams_published"] = len(exam_service.publish_due(now)["published"])
+    except Exception as exc:  # pragma: no cover
+        log_backend_failure(logger, "Exam auto-publish failed", exc)
+        result["errors"].append(f"exam_auto_publish: {exc}")
 
     return result
 

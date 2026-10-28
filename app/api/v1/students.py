@@ -109,22 +109,40 @@ def get_student_attendance(
     return [AttendanceOut(**hydrate_attendance(record)) for record in records]
 
 
+def _enrolled_class_ids(student_id: int) -> set:
+    """Every class the student is enrolled in, not only the first."""
+    return {
+        e.get("class_id")
+        for e in firestore_student_enrollments.query_documents("student_id", "==", student_id)
+        if e.get("class_id") is not None
+    }
+
+
+def _scoped_class_ids(student_id: int, class_id: Optional[int]) -> set:
+    """
+    The classes a student list covers: all their enrolled classes, or just `class_id` when
+    it is one of them. A class the student is not enrolled in gives nothing, never another
+    class's records.
+    """
+    enrolled = _enrolled_class_ids(student_id)
+    if class_id is None:
+        return enrolled
+    return {class_id} & enrolled
+
+
 @router.get("/topics", response_model=List[TopicOut])
 def get_student_topics_covered(
+    class_id: Optional[int] = Query(None, description="Only this class; must be one the student is in."),
     subject_id: Optional[int] = Query(None),
     current_user: UserOut = Depends(require_student)
 ):
     """
-    [Student Only] View syllabus topics/portions covered by teachers for student's class.
+    [Student Only] View syllabus topics/portions covered by teachers for the student's classes.
     """
-    enrollment = next(
-        (e for e in firestore_student_enrollments.query_documents("student_id", "==", current_user.id)),
-        None
-    )
-    if not enrollment:
-        return []
-
-    topics = firestore_topics.query_documents("class_id", "==", enrollment.get("class_id"))
+    topics = [
+        t for class_key in _scoped_class_ids(current_user.id, class_id)
+        for t in firestore_topics.query_documents("class_id", "==", class_key)
+    ]
     if subject_id is not None:
         topics = [t for t in topics if t.get("subject_id") == subject_id]
     topics.sort(key=lambda t: t.get("date_covered"), reverse=True)
@@ -170,20 +188,16 @@ def _student_view(meeting: dict) -> dict:
 
 @router.get("/materials", response_model=List[StudyMaterialOut])
 def get_student_study_materials(
+    class_id: Optional[int] = Query(None, description="Only this class; must be one the student is in."),
     subject_id: Optional[int] = Query(None),
     current_user: UserOut = Depends(require_student)
 ):
     """
     [Student Only] Access & download uploaded study notes, textbooks, and resources.
 
-    Covers every class the student is enrolled in, not only the first: a student holding two
-    enrollments otherwise sees the older class's library and nothing shared with the other.
+    Covers every class the student is enrolled in unless `class_id` narrows it to one of them.
     """
-    class_ids = {
-        e.get("class_id")
-        for e in firestore_student_enrollments.query_documents("student_id", "==", current_user.id)
-        if e.get("class_id") is not None
-    }
+    class_ids = _scoped_class_ids(current_user.id, class_id)
     if not class_ids:
         return []
 

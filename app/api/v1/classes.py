@@ -31,6 +31,8 @@ from app.schemas.workflow import (
     JoinClassOut, JoinRoomOut,
 )
 from app.schemas.workflow import RoomPresenceOut
+from app.schemas.attendance import PeriodRegisterOut, PeriodRegisterSave
+from app.services import attendance_register as register_service
 from app.services import calendar as calendar_service
 from app.services import class_rooms
 from app.services import extra_classes as extra_service
@@ -249,6 +251,38 @@ def class_room_presence(class_id: int, user: UserOut = Depends(require_any_authe
     if user.role == UserRole.STUDENT:
         raise HTTPException(status_code=403, detail="Only teachers and the office can see who is in the room.")
     return RoomPresenceOut(**class_rooms.presence_for_class(class_room))
+
+
+@router.get("/rooms/{class_id}/register", response_model=PeriodRegisterOut)
+def period_register(class_id: int, user: UserOut = Depends(require_any_authenticated)):
+    """
+    [Teacher] Your period's register for this class, filled in from who joined the class room.
+
+    Each student is suggested PRESENT if they were in the room for the start of your period,
+    LATE if they first came in more than `late_after_minutes` after it began, and ABSENT if
+    they were not in during it. Once saved, the saved marks are returned alongside the
+    suggestion. Nothing is recorded until you save it.
+    """
+    class_room = class_rooms.require_class(class_id)
+    class_rooms.assert_may_see(class_room, user)
+    if user.role == UserRole.STUDENT:
+        raise HTTPException(status_code=403, detail="Only teachers take the register.")
+    return PeriodRegisterOut(**register_service.period_register(class_room, user))
+
+
+@router.post("/rooms/{class_id}/register", response_model=PeriodRegisterOut)
+def save_period_register(class_id: int, payload: PeriodRegisterSave, user: UserOut = Depends(require_any_authenticated)):
+    """
+    [Teacher] Save your period's register as checked. It is the same register the Attendance
+    page takes for this class, subject and date, and replaces any marks already there.
+    """
+    class_room = class_rooms.require_class(class_id)
+    class_rooms.assert_may_see(class_room, user)
+    if user.role == UserRole.STUDENT:
+        raise HTTPException(status_code=403, detail="Only teachers take the register.")
+    return PeriodRegisterOut(**register_service.save_period_register(
+        class_room, user, payload.subject_id, payload.date, payload.attendance_list,
+    ))
 
 
 # ---------------------------------------------------------------------------------------

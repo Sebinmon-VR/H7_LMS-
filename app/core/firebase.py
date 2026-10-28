@@ -1216,8 +1216,14 @@ firestore_payment_intents = _service("payment_intents")
 firestore_extra_classes = _service("extra_class_requests")
 # Staff leave applications and their decisions.
 firestore_leave_requests = _service("leave_requests")
+# A substitute taking one timetable period on one date. Keyed "<entry id>:<date>", so a period
+# can have at most one cover on a given day. Reading it here keeps the timetable resolver free
+# of any import back into the services that write it.
+firestore_period_substitutions = _service("period_substitutions")
 # Support tickets, with their message threads held inline.
 firestore_support_tickets = _service("support_tickets")
+# Content for the in-app User Guide that admins edit, such as its video links.
+firestore_guide_content = _service("guide_content")
 # Per-product support contact details, edited by an admin. One document per program, tiny,
 # read on every support screen.
 firestore_support_contacts = _service("support_contacts", cacheable=True)

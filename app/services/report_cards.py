@@ -121,12 +121,14 @@ def _counts_toward_total(line: dict, exam: dict, count_missing_as_zero: bool) ->
     """
     Whether a row contributes to the arithmetic.
 
-    A GRADE-scheme exam never does: letters cannot be added up, and converting one back to a
-    number would invent a mark nobody awarded. Those exams still appear on the card - a
-    grade is a result worth reporting - they just do not move the totals.
+    A GRADE-scheme exam counts only when the teacher recorded marks for it (marking the
+    answer sheet does, and the grade then follows from the marks). A grade picked on its own
+    never does: letters cannot be added up, and converting one back to a number would invent
+    a mark nobody awarded. Such an exam still appears on the card - a grade is a result worth
+    reporting - it just does not move the totals, and a missed one is never counted as zero.
     """
     if exam.get("grading_scheme") == GradingScheme.GRADE.value:
-        return False
+        return not line["missed"] and line["marks_obtained"] is not None and float(exam.get("max_marks") or 0.0) > 0
     if line["missed"] and not count_missing_as_zero:
         return False
     return line["marks_obtained"] is not None and float(exam.get("max_marks") or 0.0) > 0

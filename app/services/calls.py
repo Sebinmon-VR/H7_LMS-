@@ -18,6 +18,7 @@ Three kinds of thing can be joined, matching the links stored on them:
   class     a school class's standing room      (class_rooms.room_link)
   meeting   a scheduled session with its own room (live_meetings.meeting_link)
   tuition   a one-to-one tuition class          (tuition_sessions.meeting_link)
+  exam      a live-invigilated exam             (exams with `live_invigilation`)
 """
 
 import logging
@@ -260,6 +261,79 @@ def _tuition_target(session_id, user) -> CallTarget:
     )
 
 
+# How early the exam room opens before the exam does, so students can settle and switch their
+# cameras on, and how early the teacher may come in to open it.
+EXAM_ROOM_LEAD_MINUTES = 15
+EXAM_HOST_LEAD_MINUTES = 30
+
+
+def _exam_target(exam_id, user) -> CallTarget:
+    """
+    A live-invigilated exam's room.
+
+    Students sit the paper inside the call with their camera on; the exam's teacher (or the
+    class teacher, or an admin) watches. Students may come in from shortly before the exam
+    opens until their own time to hand in has passed; the teacher a little earlier. Never
+    recorded from here: a recording would be filed in the class library, which is no place
+    for an exam.
+    """
+    from app.core.firebase import assert_owner, firestore_exams, firestore_subjects
+    from app.services import exams as exam_service
+
+    exam = exam_service.require_exam(int(exam_id))
+    if not exam.get("live_invigilation"):
+        raise HTTPException(status_code=404, detail="This exam is not sat in a live room.")
+
+    now = datetime.now(timezone.utc)
+    starts = exam_service.to_utc(exam.get("starts_at"))
+    is_host = user.role in HOST_ROLES
+    if is_host:
+        assert_owner(exam, user, "exams")
+        # Open until the last student's own deadline, so extra time is never cut short.
+        closes = max(
+            [exam_service.deadlines_for(exam, None)["closes_at"]]
+            + [
+                exam_service.deadlines_for(exam, int(sid))["closes_at"]
+                for sid in (exam.get("time_concessions") or {})
+            ]
+        )
+        if starts and now < starts - timedelta(minutes=EXAM_HOST_LEAD_MINUTES):
+            raise HTTPException(
+                status_code=409,
+                detail=f"The exam room opens {EXAM_HOST_LEAD_MINUTES} minutes before the exam.",
+            )
+    else:
+        exam_service.assert_student_may_sit(exam, user.id)
+        closes = exam_service.deadlines_for(exam, user.id)["closes_at"]
+        if starts and now < starts - timedelta(minutes=EXAM_ROOM_LEAD_MINUTES):
+            raise HTTPException(
+                status_code=409,
+                detail=f"The exam room opens {EXAM_ROOM_LEAD_MINUTES} minutes before the exam.",
+            )
+    if closes and now > closes:
+        raise HTTPException(status_code=409, detail="This exam has closed.")
+
+    try:
+        room_id = _room_for(firestore_exams, exam, closes)
+    except acs.AcsError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    subject = (firestore_subjects.get_document(str(exam.get("subject_id"))) or {}).get("name")
+    return CallTarget(
+        kind=acs.KIND_EXAM,
+        entity_id=str(exam["id"]),
+        title=exam.get("title") or "Exam",
+        subtitle=subject,
+        room_id=room_id,
+        is_host=is_host,
+        records=False,
+        class_id=exam.get("class_id"),
+        subject_id=exam.get("subject_id"),
+        ends_at=closes,
+        extra={"exam": exam},
+    )
+
+
 def resolve(kind: str, entity_id: str, user) -> CallTarget:
     if kind == acs.KIND_CLASS:
         return _class_target(int(entity_id), user)
@@ -267,6 +341,8 @@ def resolve(kind: str, entity_id: str, user) -> CallTarget:
         return _meeting_target(int(entity_id), user)
     if kind == acs.KIND_TUITION:
         return _tuition_target(entity_id, user)
+    if kind == acs.KIND_EXAM:
+        return _exam_target(entity_id, user)
     raise HTTPException(status_code=404, detail="Unknown kind of class.")
 
 
@@ -319,6 +395,10 @@ def connected(kind: str, entity_id: str, user, server_call_id: str | None) -> di
             target.class_id, class_rooms.EVENT_JOINED_SESSION, user,
             meeting_id=target.meeting_id, detail=target.title,
         )
+    elif target.kind == acs.KIND_EXAM and not target.is_host:
+        from app.services import exams as exam_service
+
+        exam_service.mark_away(exam_service.get_submission(int(target.entity_id), user.id), False)
     elif target.kind == acs.KIND_TUITION:
         from app.services.tuition import sessions as session_service
 
@@ -365,6 +445,10 @@ def left(kind: str, entity_id: str, user) -> dict:
                     meeting["class_id"], class_rooms.EVENT_LEFT_ROOM, user,
                     meeting_id=meeting["id"], detail=meeting.get("title"),
                 )
+    if kind == acs.KIND_EXAM and user.role == UserRole.STUDENT:
+        from app.services import exams as exam_service
+
+        exam_service.mark_away(exam_service.get_submission(int(entity_id), user.id), True)
     stopped = recordings.stop_for(f"{kind}:{entity_id}", user=user)
     return {"ok": True, "recordings_stopped": stopped}
 
@@ -374,6 +458,8 @@ def set_recording(kind: str, entity_id: str, user, action: str, server_call_id: 
     target = resolve(kind, entity_id, user)
     if not target.is_host:
         raise HTTPException(status_code=403, detail="Only the teacher can record the class.")
+    if target.kind == acs.KIND_EXAM:
+        raise HTTPException(status_code=409, detail="Exams are not recorded.")
     entity_key = f"{target.kind}:{target.entity_id}"
     if action == "stop":
         stopped = recordings.stop_for(entity_key, reason="Stopped by the teacher.")

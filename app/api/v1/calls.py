@@ -25,7 +25,7 @@ router = APIRouter(prefix="/calls", tags=["Live Classes"])
 RECORDING_FILE_EVENT = "Microsoft.Communication.RecordingFileStatusUpdated"
 VALIDATION_EVENT = "Microsoft.EventGrid.SubscriptionValidationEvent"
 
-CallKind = Literal["class", "meeting", "tuition"]
+CallKind = Literal["class", "meeting", "tuition", "exam"]
 
 
 class CallSessionOut(BaseModel):

@@ -87,6 +87,16 @@ class TimetableEntryUpdate(BaseModel):
     is_active: bool | None = None
 
 
+class PeriodSubstitutionOut(BaseModel):
+    """A cover for one period on one date. Present only on that date's resolved period."""
+    on_date: date
+    substitute_teacher_id: int
+    substitute_teacher: UserOut | None = None
+    original_teacher_id: int | None = None
+    original_teacher: UserOut | None = None
+    note: str | None = None
+
+
 class TimetableEntryOut(BaseModel):
     id: int
     class_id: int
@@ -95,6 +105,7 @@ class TimetableEntryOut(BaseModel):
     subject: SubjectOut | None = None
     teacher_id: int | None = None
     teacher: UserOut | None = None
+    substitution: PeriodSubstitutionOut | None = None
     day_of_week: DayOfWeek
     start_time: time
     end_time: time
@@ -107,6 +118,20 @@ class TimetableEntryOut(BaseModel):
     updated_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class TeacherSummaryOut(BaseModel):
+    """A teacher's name and id, for choosing a substitute. Nothing about their contact details."""
+    id: int
+    full_name: str
+
+
+class CoverCreate(BaseModel):
+    """Give one timetable period on one date to a substitute."""
+    timetable_entry_id: int
+    on_date: date
+    substitute_teacher_id: int
+    note: str | None = Field(None, max_length=500)
 
 
 class TimetableBulkResult(BaseModel):

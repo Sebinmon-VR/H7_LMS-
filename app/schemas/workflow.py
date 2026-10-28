@@ -314,6 +314,14 @@ class ClassRoomAttendanceOut(BaseModel):
 # Staff leave
 # ---------------------------------------------------------------------------------------
 
+class CoverPlanItem(BaseModel):
+    """One class a leave takes away, and who the applicant wants to cover it."""
+    timetable_entry_id: int
+    substitute_teacher_id: int | None = Field(
+        None, description="Empty means the class needs cover but nobody is chosen yet."
+    )
+
+
 class LeaveApply(BaseModel):
     leave_type: LeaveType
     start_date: date
@@ -322,6 +330,11 @@ class LeaveApply(BaseModel):
     reason: str | None = Field(None, max_length=2000)
     contact_during_leave: str | None = Field(None, max_length=120)
     attachments: list[dict[str, Any]] = Field(default_factory=list)
+    cover_plan: list[CoverPlanItem] = Field(
+        default_factory=list,
+        description="The classes that need a substitute during this leave, each with the "
+        "teacher the applicant chose. Applied to the leave's days once it is approved.",
+    )
 
     @model_validator(mode="after")
     def _dates_make_sense(self):
@@ -346,6 +359,7 @@ class LeaveDecision(BaseModel):
 
 class AffectedPeriod(BaseModel):
     date: date
+    timetable_entry_id: int | None = None
     class_id: int | None = None
     class_name: str | None = None
     subject_name: str | None = None
@@ -356,6 +370,12 @@ class AffectedPeriod(BaseModel):
 class LeaveRequestOut(BaseModel):
     id: int
     teacher_id: int
+    cover_entry_ids: list[int] = Field(default_factory=list)
+    cover_plan: list[dict] = Field(default_factory=list)
+    cover_gaps: list[dict] = Field(
+        default_factory=list,
+        description="Periods of the plan that could not be covered on approval, with the reason.",
+    )
     teacher_name: str | None = None
     employee_id: str | None = None
     leave_type: LeaveType

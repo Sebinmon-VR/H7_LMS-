@@ -161,6 +161,33 @@ def apply_for_leave(payload, actor) -> dict:
 
     request_id = firestore_leave_requests.get_next_numeric_id()
     day_part = getattr(payload.day_part, "value", payload.day_part)
+    periods = affected_periods(actor.id, payload.start_date, payload.end_date)
+
+    # Only periods this teacher actually has in the leave can be put in the cover plan, and a
+    # chosen substitute must be another teacher.
+    own_entries = {p["timetable_entry_id"] for p in periods}
+    plan = []
+    for item in payload.cover_plan:
+        if item.timetable_entry_id not in own_entries:
+            raise HTTPException(
+                status_code=400,
+                detail="Some of the classes chosen are not periods you have in these dates.",
+            )
+        if item.substitute_teacher_id is not None:
+            if int(item.substitute_teacher_id) == int(actor.id):
+                raise HTTPException(status_code=400, detail="You cannot cover your own classes.")
+            substitute = require_document(firestore_users, item.substitute_teacher_id, "Substitute teacher")
+            if str(substitute.get("role")) not in TEACHING_ROLE_VALUES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{substitute.get('full_name')} is not a teacher and cannot cover a class.",
+                )
+        plan.append({
+            "timetable_entry_id": int(item.timetable_entry_id),
+            "substitute_teacher_id": (
+                int(item.substitute_teacher_id) if item.substitute_teacher_id is not None else None
+            ),
+        })
 
     document = {
         "teacher_id": int(actor.id),
@@ -173,9 +200,8 @@ def apply_for_leave(payload, actor) -> dict:
         "reason": payload.reason,
         "contact_during_leave": payload.contact_during_leave,
         "status": LeaveStatus.PENDING.value,
-        "affected_periods": affected_periods(
-            actor.id, payload.start_date, payload.end_date
-        ),
+        "affected_periods": periods,
+        "cover_plan": plan,
         "attachments": payload.attachments or [],
         "created_at": _now(),
     }
@@ -370,6 +396,16 @@ def on_leave_on(day: date) -> list[dict]:
     return away
 
 
+def _present_plan(plan: list[dict]) -> list[dict]:
+    """The cover plan with each chosen substitute's name, for the request card."""
+    shown = []
+    for item in plan:
+        sub_id = item.get("substitute_teacher_id")
+        sub = firestore_users.get_document(str(sub_id)) if sub_id is not None else None
+        shown.append({**item, "substitute_teacher_name": (sub or {}).get("full_name")})
+    return shown
+
+
 def present(request: dict) -> dict:
     teacher = firestore_users.get_document(str(request.get("teacher_id"))) or {}
     decider = (
@@ -399,6 +435,11 @@ def present(request: dict) -> dict:
         "decided_at": request.get("decided_at"),
         "decision_note": request.get("decision_note"),
         "substitute_teacher_id": request.get("substitute_teacher_id"),
+        "cover_entry_ids": sorted({
+            int(p["timetable_entry_id"]) for p in (request.get("cover_plan") or [])
+        }),
+        "cover_plan": _present_plan(request.get("cover_plan") or []),
+        "cover_gaps": request.get("cover_gaps") or [],
         "substitute_teacher_name": (substitute or {}).get("full_name"),
         "affected_periods": request.get("affected_periods") or [],
         "attachments": request.get("attachments") or [],

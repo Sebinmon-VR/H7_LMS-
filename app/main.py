@@ -27,8 +27,10 @@ from app.api.v1.families import (
     admin_router as families_admin_router,
     parent_router as parent_router,
 )
+from app.api.v1.guide import guide_admin_router, guide_router
 from app.api.v1.academics import (
     academics_router,
+    cover_router,
     homework_router,
     leave_router,
     reports_router as parent_reports_router,
@@ -362,6 +364,9 @@ app.include_router(calendar_router, prefix=settings.API_V1_STR)
 app.include_router(homework_router, prefix=settings.API_V1_STR)
 app.include_router(leave_router, prefix=settings.API_V1_STR)
 app.include_router(academics_router, prefix=settings.API_V1_STR)
+app.include_router(cover_router, prefix=settings.API_V1_STR)
+app.include_router(guide_router, prefix=settings.API_V1_STR)
+app.include_router(guide_admin_router, prefix=settings.API_V1_STR)
 app.include_router(parent_reports_router, prefix=settings.API_V1_STR)
 app.include_router(support_router, prefix=settings.API_V1_STR)
 app.include_router(support_admin_router, prefix=settings.API_V1_STR)

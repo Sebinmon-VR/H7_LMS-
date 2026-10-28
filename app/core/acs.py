@@ -31,7 +31,8 @@ logger = logging.getLogger("acs")
 KIND_CLASS = "class"
 KIND_MEETING = "meeting"
 KIND_TUITION = "tuition"
-KINDS = (KIND_CLASS, KIND_MEETING, KIND_TUITION)
+KIND_EXAM = "exam"
+KINDS = (KIND_CLASS, KIND_MEETING, KIND_TUITION, KIND_EXAM)
 
 ROLE_PRESENTER = "Presenter"
 ROLE_ATTENDEE = "Attendee"

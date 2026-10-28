@@ -20,7 +20,7 @@ anything. `assert_owner` is that rule; nothing here re-implements it.
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 
 from app.api.v1.dependencies import require_student, require_teacher
 from app.core.concurrency import run_parallel
@@ -31,6 +31,7 @@ from app.core.firebase import (
     require_document,
 )
 from app.schemas.exam import (
+    MarkingSheetIn,
     AnswerKeyUpdate, AnswerSaveIn, EvaluationIn, ExamCreate, ExamOut, ExamStats, ExamUpdate,
     QuestionFormUpdate, ResultsPublished, StudentExamOut, StudentSubmissionOut, SubmissionOut,
     SubmitIn, TimeConcessionGrant,
@@ -43,12 +44,43 @@ from app.services import exams as exam_service
 from app.services import report_cards as report_card_service
 from app.services import timetable as timetable_service
 from app.services.permissions import is_class_teacher_of, visible_records
+from app.core.storage import storage_service
 
 logger = logging.getLogger("exams_api")
 
 router = APIRouter(prefix="/exams", tags=["Exams Module"])
 report_router = APIRouter(prefix="/report-cards", tags=["Report Cards"])
 student_router = APIRouter(prefix="/students", tags=["Exams Module - Students"])
+
+
+def _inline_file(file_url: str | None) -> Response:
+    """
+    A stored file served through the API so it opens inside the page, never as a download
+    or a new window. Not cached: an exam paper must not linger in a shared browser.
+    """
+    if not file_url:
+        raise HTTPException(status_code=404, detail="There is no file here.")
+    try:
+        data, content_type, name = storage_service.read_file(file_url)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="This file could not be found.")
+    safe_name = name.replace('"', "")
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{safe_name}"',
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+def _attachment_url(submission: dict | None, index: int) -> str | None:
+    attachments = (submission or {}).get("attachments") or []
+    if index < 0 or index >= len(attachments):
+        raise HTTPException(status_code=404, detail="There is no such uploaded file.")
+    return attachments[index].get("file_url")
 
 
 def _managed_exam(exam_id: int, current_user: UserOut) -> dict:
@@ -243,6 +275,22 @@ async def upload_question_paper(
     return ExamOut(**exam_service.hydrate_exam(updated))
 
 
+@router.get("/{exam_id}/paper/file")
+def view_question_paper(exam_id: int, current_user: UserOut = Depends(require_teacher)):
+    """[Teacher / Admin] The uploaded question paper, to view inside the page."""
+    exam = _managed_exam(exam_id, current_user)
+    return _inline_file(exam.get("question_paper_url"))
+
+
+@router.get("/{exam_id}/submissions/{student_id}/attachments/{index}/file")
+def view_submission_file(
+    exam_id: int, student_id: int, index: int, current_user: UserOut = Depends(require_teacher)
+):
+    """[Teacher / Admin] One file a student uploaded, to read while marking."""
+    _managed_exam(exam_id, current_user)
+    return _inline_file(_attachment_url(exam_service.get_submission(exam_id, student_id), index))
+
+
 @router.post("/{exam_id}/publish", response_model=ExamOut)
 def publish_exam(exam_id: int, current_user: UserOut = Depends(require_teacher)):
     """
@@ -256,6 +304,7 @@ def publish_exam(exam_id: int, current_user: UserOut = Depends(require_teacher))
 
     firestore_exams.add_document(str(exam_id), {
         "status": ExamStatus.PUBLISHED.value,
+        "auto_publish_error": None,
         "updated_at": exam_service.now_utc().isoformat(),
     })
     return ExamOut(**exam_service.hydrate_exam(firestore_exams.get_document(str(exam_id))))
@@ -331,6 +380,26 @@ def get_submission(
             detail=f"Student {student_id} has not started this exam.",
         )
     return SubmissionOut(**exam_service.hydrate_submission(submission, exam))
+
+
+@router.put("/{exam_id}/submissions/{student_id}/marking", response_model=SubmissionOut)
+def save_marking(
+    exam_id: int,
+    student_id: int,
+    payload: MarkingSheetIn,
+    current_user: UserOut = Depends(require_teacher),
+):
+    """
+    [Teacher / Admin] Save the marking drawn on a student's answer sheets - the lines that
+    split each file into answers and the score for each part. Records nothing as the result
+    yet; value the script with the total it adds up to (`/evaluate`).
+    """
+    exam = _managed_exam(exam_id, current_user)
+    submission = exam_service.get_submission(exam_id, student_id)
+    if not submission:
+        raise HTTPException(status_code=404, detail="This student has not sat the exam.")
+    saved = exam_service.save_marking_sheet(exam, submission, payload)
+    return SubmissionOut(**exam_service.hydrate_submission(saved, exam))
 
 
 @router.post("/{exam_id}/submissions/{student_id}/evaluate", response_model=SubmissionOut)
@@ -547,6 +616,13 @@ def list_my_exams(
     handed in, and their personal `closes_at` with any granted extra time already applied -
     so a list screen needs no further call per exam. Answer keys are never included.
     """
+    # Release anything due to auto-publish first, so a student opening the list at the start
+    # time sees the exam without waiting for the next maintenance pass.
+    try:
+        exam_service.publish_due()
+    except Exception as exc:  # pragma: no cover - listing must not fail because of it
+        logger.warning("Auto-publish pass failed while listing exams: %s", exc)
+
     class_ids = timetable_service.class_ids_for_student(current_user.id)
     if not class_ids:
         return []
@@ -609,6 +685,55 @@ def get_my_exam(exam_id: int, current_user: UserOut = Depends(require_student)):
         submission=submission,
         include_questions=(state.value != "NOT_OPEN"),
     ))
+
+
+@student_router.post("/exams/{exam_id}/away")
+def step_out_of_exam(exam_id: int, current_user: UserOut = Depends(require_student)):
+    """
+    [Student] I am leaving the exam for now. The clock keeps running; this only tells the
+    invigilator.
+    """
+    _student_exam(exam_id, current_user)
+    exam_service.mark_away(exam_service.get_submission(exam_id, current_user.id), True)
+    return {"ok": True}
+
+
+@student_router.post("/exams/{exam_id}/back")
+def back_in_exam(exam_id: int, current_user: UserOut = Depends(require_student)):
+    """[Student] I am back in the exam."""
+    _student_exam(exam_id, current_user)
+    exam_service.mark_away(exam_service.get_submission(exam_id, current_user.id), False)
+    return {"ok": True}
+
+
+@student_router.delete("/exams/{exam_id}/attachments/{index}", response_model=StudentSubmissionOut)
+def remove_my_answer_file(exam_id: int, index: int, current_user: UserOut = Depends(require_student)):
+    """[Student] Take back one uploaded file, before handing in."""
+    exam = _student_exam(exam_id, current_user)
+    submission = exam_service.get_submission(exam_id, current_user.id)
+    if submission is None:
+        raise HTTPException(status_code=404, detail="You have not uploaded anything for this exam.")
+    updated = exam_service.remove_answer_file(exam, submission, index)
+    return StudentSubmissionOut(**exam_service.hydrate_submission_for_student(updated, exam))
+
+
+@student_router.get("/exams/{exam_id}/paper/file")
+def view_my_question_paper(exam_id: int, current_user: UserOut = Depends(require_student)):
+    """
+    [Student] The question paper, to read inside the exam page. Released only once the exam
+    has opened, like the question form.
+    """
+    exam = _student_exam(exam_id, current_user)
+    if exam_service.window_state(exam, current_user.id).value == "NOT_OPEN":
+        raise HTTPException(status_code=403, detail="The paper is shown once the exam opens.")
+    return _inline_file(exam.get("question_paper_url"))
+
+
+@student_router.get("/exams/{exam_id}/attachments/{index}/file")
+def view_my_answer_file(exam_id: int, index: int, current_user: UserOut = Depends(require_student)):
+    """[Student] One of the files you uploaded for this exam, to check it inside the page."""
+    _student_exam(exam_id, current_user)
+    return _inline_file(_attachment_url(exam_service.get_submission(exam_id, current_user.id), index))
 
 
 @student_router.post("/exams/{exam_id}/start", response_model=StudentSubmissionOut)

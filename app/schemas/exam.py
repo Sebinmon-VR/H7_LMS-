@@ -174,6 +174,20 @@ class _ExamRules(BaseModel):
     auto_grade_objective: bool = True
     max_upload_files: int = Field(5, ge=1, le=25)
 
+    auto_publish: bool = Field(
+        False,
+        description="Release the draft by itself at `auto_publish_at` (or `starts_at` when that is "
+        "empty), so nobody has to remember to press Publish.",
+    )
+    auto_publish_at: datetime | None = Field(
+        None, description="When an auto-publishing draft is released. Defaults to `starts_at`."
+    )
+    live_invigilation: bool = Field(
+        False,
+        description="Sit the exam in a live call: students answer with their camera on while the "
+        "teacher watches. The paper and the uploads are inside the call.",
+    )
+
 
 class ExamCreate(_ExamRules):
     """
@@ -202,6 +216,8 @@ class ExamCreate(_ExamRules):
     def _check_rules(self) -> "ExamCreate":
         _validate_window(self.starts_at, self.ends_at, self.duration_minutes)
         _validate_scheme(self.grading_scheme, self.grade_bands, self.max_marks, self.pass_marks)
+        if self.auto_publish and self.auto_publish_at and self.auto_publish_at >= self.ends_at:
+            raise ValueError("The exam must publish before it closes.")
 
         if self.mode is ExamMode.ONLINE and self.status is ExamStatus.PUBLISHED and not self.questions:
             raise ValueError(
@@ -238,6 +254,10 @@ class ExamUpdate(BaseModel):
     shuffle_questions: bool | None = None
     auto_grade_objective: bool | None = None
     max_upload_files: int | None = Field(None, ge=1, le=25)
+
+    auto_publish: bool | None = None
+    auto_publish_at: datetime | None = None
+    live_invigilation: bool | None = None
 
 
 class QuestionFormUpdate(BaseModel):
@@ -332,6 +352,12 @@ class ExamOut(BaseModel):
     question_paper_url: str | None = None
     question_paper_provider: str | None = None
     question_paper_warning: str | None = None
+
+    auto_publish: bool = False
+    auto_publish_at: datetime | None = None
+    # Why an auto-publishing draft was not released when it came due, in plain words.
+    auto_publish_error: str | None = None
+    live_invigilation: bool = False
     max_upload_files: int = 5
 
     results_published: bool = False
@@ -386,6 +412,8 @@ class StudentExamOut(BaseModel):
 
     question_paper_url: str | None = None
     max_upload_files: int = 5
+    # Sat in a live call: the exam page lives inside /call/exam/<id>.
+    live_invigilation: bool = False
     questions: list[StudentQuestionOut] = Field(default_factory=list)
     question_count: int = 0
 
@@ -467,6 +495,12 @@ class SubmissionOut(BaseModel):
     expires_at: datetime | None = None
     is_late: bool = False
     late_by_minutes: float = 0.0
+    # Set while the student has stepped out of the exam; the log keeps every absence.
+    away_since: datetime | None = None
+    away_log: list[dict] = Field(default_factory=list)
+    # The teacher's marking on the answer sheets, and what it adds up to.
+    marking_sheet: dict = Field(default_factory=dict)
+    marking_total: float | None = None
 
     answers: list[AnswerOut] = Field(default_factory=list)
     attachments: list[AttachmentOut] = Field(default_factory=list)
@@ -514,6 +548,29 @@ class StudentSubmissionOut(BaseModel):
     question_scores: list[QuestionScoreOut] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class MarkingPart(BaseModel):
+    """One answer on an answer sheet, between two of the teacher's lines."""
+    label: str = Field("", max_length=40)
+    marks: float | None = Field(None, ge=0)
+    max_marks: float | None = Field(None, ge=0)
+    comment: str | None = Field(None, max_length=500)
+
+
+class MarkedFile(BaseModel):
+    """
+    One uploaded file, split into answers. `dividers` are where the lines sit, as a fraction of
+    the way down the file (0 is the top, 1 the bottom), so they land in the same place however
+    wide the screen is. There is always one more part than there are lines.
+    """
+    dividers: list[float] = Field(default_factory=list)
+    segments: list[MarkingPart] = Field(default_factory=list)
+
+
+class MarkingSheetIn(BaseModel):
+    """The whole marking of a script, keyed by the uploaded file's position ("0", "1", ...)."""
+    files: dict[str, MarkedFile] = Field(default_factory=dict)
 
 
 class QuestionScoreIn(BaseModel):
