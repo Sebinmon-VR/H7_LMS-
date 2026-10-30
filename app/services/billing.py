@@ -23,11 +23,13 @@ rather than a migration.
 """
 
 import logging
+import threading
 import uuid
 from datetime import date, datetime, timedelta
 
 from fastapi import HTTPException
 
+from app.core import razorpay
 from app.core.enums import (
     OFFLINE_GATEWAY_METHODS, InstalmentStatus, InvoiceStatus, PaymentIntentStatus,
     PaymentMethod, Program, TERMINAL_INTENT_STATES,
@@ -129,6 +131,34 @@ def _next_invoice_number(config: dict) -> str:
     return f"{stem}{highest + 1:04d}"
 
 
+RECEIPT_PREFIX = "RCT"
+
+# Held from choosing a receipt number until the payment carrying it is written, so two
+# clerks at two counters cannot both take the next number. Per process: the backend runs as
+# one instance, and the numbers are derived from the stored payments, so a restart loses
+# nothing.
+_receipt_lock = threading.Lock()
+
+
+def _next_receipt_number(year_name: str | None) -> str:
+    """
+    The next counter receipt number for a session year, `RCT-2026-27-0001`.
+
+    Numbered per school year because that is how a receipt book runs, and derived from the
+    payments already stored - like the invoice number - rather than from a counter document.
+    """
+    stem = f"{RECEIPT_PREFIX}-{year_name or datetime.utcnow().year}-"
+    highest = 0
+    for invoice in firestore_fee_invoices.list_all():
+        for payment in invoice.get("payments") or []:
+            number = str(payment.get("receipt_number") or "")
+            if number.startswith(stem):
+                tail = number[len(stem):]
+                if tail.isdigit():
+                    highest = max(highest, int(tail))
+    return f"{stem}{highest + 1:04d}"
+
+
 # ---------------------------------------------------------------------------------------
 # Generating
 # ---------------------------------------------------------------------------------------
@@ -203,6 +233,9 @@ def generate_invoice(student_id, academic_year_id=None, actor_id: int | None = N
         "charge_total": breakdown["charge_total"],
         "convenience_total": breakdown["convenience_total"],
         "late_fee_total": (existing or {}).get("late_fee_total", 0.0),
+        # Concessions and extra items are given at issue; a rebuilt draft starts clean.
+        "extra_total": 0.0,
+        "concession_reason": None,
         "total_amount": breakdown["total_amount"],
         "due_date": (year_start + timedelta(days=int(config["invoice_due_days"]))).isoformat(),
 
@@ -227,10 +260,187 @@ def generate_invoice(student_id, academic_year_id=None, actor_id: int | None = N
     return document
 
 
+def _field(obj, name):
+    """Reads a request item whether it arrived as a schema object or a plain dict."""
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _apply_concessions(invoice: dict, concessions, reason: str | None,
+                       actor_id: int | None) -> dict:
+    """
+    Takes a concession off named fee lines, as the office decides it at the moment of issue.
+
+    Each line's amount shrinks, its components shrink in proportion (so a receipt still says
+    what was paid for), and the matching line items carry the cut as a discount. One
+    "Concession" entry joins the discounts list so the bill shows it as a concession rather
+    than as a mysteriously smaller fee.
+    """
+    instalments = [dict(i) for i in invoice.get("instalments") or []]
+    by_label = {i.get("label"): i for i in instalments}
+    line_items = [dict(l) for l in invoice.get("line_items") or []]
+    item_by_name: dict = {}
+    for item in line_items:
+        item_by_name.setdefault(item.get("name"), item)
+
+    currency = invoice.get("currency") or ""
+    granted = 0.0
+    for concession in concessions or []:
+        label = _field(concession, "label")
+        amount = money(_field(concession, "amount"))
+        if amount <= 0:
+            continue
+        line = by_label.get(label)
+        if line is None:
+            raise HTTPException(status_code=400, detail=f"There is no fee called '{label}' on this bill.")
+        before = money(line.get("amount"))
+        if amount > before + 0.009:
+            raise HTTPException(
+                status_code=400,
+                detail=f"The concession on {label} is more than the fee itself ({currency} {before}).",
+            )
+
+        components = [dict(c) for c in line.get("components") or []]
+        parts = [c for c in components if money(c.get("amount")) > 0]
+        remaining = amount
+        for index, part in enumerate(parts):
+            share = remaining if index == len(parts) - 1 else money(amount * money(part["amount"]) / before)
+            remaining = money(remaining - share)
+            part["amount"] = money(money(part["amount"]) - share)
+            item = item_by_name.get(part.get("name"))
+            if item is not None:
+                item["discount_amount"] = money(money(item.get("discount_amount")) + share)
+                item["net_amount"] = money(money(item.get("net_amount", item.get("amount"))) - share)
+        line["components"] = components
+        line["amount"] = money(before - amount)
+        line["concession_amount"] = money(money(line.get("concession_amount")) + amount)
+        granted = money(granted + amount)
+
+    if granted <= 0:
+        return invoice
+    discounts = list(invoice.get("discounts") or []) + [{
+        "rule_id": None,
+        "name": f"Concession ({reason.strip()})" if reason and reason.strip() else "Concession",
+        "basis": "MANUAL",
+        "value_type": "FIXED",
+        "value": granted,
+        "amount": granted,
+        "stacked": True,
+    }]
+    return {
+        **invoice,
+        "instalments": instalments,
+        "line_items": line_items,
+        "discounts": discounts,
+        "discount_total": money(money(invoice.get("discount_total")) + granted),
+        "total_amount": money(money(invoice.get("total_amount")) - granted),
+        "concession_reason": (reason or "").strip() or None,
+        "concession_by": actor_id,
+    }
+
+
+def _drop_lines(invoice: dict, labels) -> dict:
+    """
+    Leaves fee lines off the bill: the office ticks which fees it is issuing, and the rest
+    are not asked for at all - not even as a zero line.
+
+    The line items shrink by what the dropped lines carried, so the bill's breakdown still
+    adds up to its total. A line with money already paid against it cannot be dropped.
+    """
+    drop = {str(l) for l in labels or [] if l}
+    if not drop:
+        return invoice
+    instalments = [dict(i) for i in invoice.get("instalments") or []]
+    known = {i.get("label") for i in instalments}
+    for label in drop - known:
+        raise HTTPException(status_code=400, detail=f"There is no fee called '{label}' on this bill.")
+
+    line_items = [dict(l) for l in invoice.get("line_items") or []]
+    item_by_name: dict = {}
+    for item in line_items:
+        item_by_name.setdefault(item.get("name"), item)
+
+    kept, removed = [], 0.0
+    for line in instalments:
+        if line.get("label") not in drop:
+            kept.append(line)
+            continue
+        if money(line.get("amount_paid")) > 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Money has already been paid towards {line.get('label')}, so it stays on the bill.",
+            )
+        for part in line.get("components") or []:
+            item = item_by_name.get(part.get("name"))
+            if item is not None:
+                share = money(part.get("amount"))
+                item["amount"] = money(money(item.get("amount")) - share)
+                item["net_amount"] = money(money(item.get("net_amount", item.get("amount"))) - share)
+        removed = money(removed + money(line.get("amount")))
+
+    return {
+        **invoice,
+        "instalments": kept,
+        "line_items": [l for l in line_items if money(l.get("net_amount", l.get("amount"))) > 0],
+        "subtotal": money(money(invoice.get("subtotal")) - removed),
+        "total_amount": money(money(invoice.get("total_amount")) - removed),
+        "left_off": sorted(drop),
+    }
+
+
+def _add_extra_lines(invoice: dict, items, actor_id: int | None) -> dict:
+    """
+    Adds fees that are not in the fee structure - books, uniform, a trip - as lines of their own.
+
+    Each becomes a separate line on the schedule, so it can be ticked and paid on its own and
+    reads by its own name on the receipt.
+    """
+    instalments = [dict(i) for i in invoice.get("instalments") or []]
+    taken = {i.get("label") for i in instalments}
+    added = 0.0
+    for item in items or []:
+        name = str(_field(item, "name") or "").strip()
+        amount = money(_field(item, "amount"))
+        due = _field(item, "due_date")
+        if not name or amount <= 0:
+            raise HTTPException(status_code=400, detail="Each extra item needs a name and an amount.")
+        label, n = name, 2
+        while label in taken:
+            label, n = f"{name} ({n})", n + 1
+        taken.add(label)
+        instalments.append({
+            "label": label,
+            "term": "EXTRA",
+            "is_extra": True,
+            "due_date": (finance._as_date(due) or date.today()).isoformat(),
+            "amount": amount,
+            "amount_paid": 0.0,
+            "status": InstalmentStatus.PENDING.value,
+            "components": [{"name": name, "amount": amount}],
+            "added_by": actor_id,
+            "added_at": _now(),
+        })
+        added = money(added + amount)
+    if added <= 0:
+        return invoice
+    return {
+        **invoice,
+        "instalments": instalments,
+        "extra_total": money(money(invoice.get("extra_total")) + added),
+        "total_amount": money(money(invoice.get("total_amount")) + added),
+    }
+
+
 def issue_invoice(invoice: dict, actor_id: int | None = None,
-                  program: str = Program.LMS.value) -> dict:
+                  program: str = Program.LMS.value, concessions=None,
+                  concession_reason: str | None = None, extra_items=None,
+                  exclude=None) -> dict:
     """
     Freezes an invoice and gives it a number.
+
+    The office can give a concession on any fee line and add extra items (books, uniform) in
+    the same step, so what is issued is exactly what the family is asked to pay.
 
     A zero-total invoice is refused: it means no fee structure matched, and sending a parent
     a bill for nothing is a support call rather than a courtesy.
@@ -240,12 +450,16 @@ def issue_invoice(invoice: dict, actor_id: int | None = None,
             status_code=409,
             detail=f"This invoice is already {invoice.get('status')}.",
         )
+    invoice = _drop_lines(invoice, exclude)
+    invoice = _apply_concessions(invoice, concessions, concession_reason, actor_id)
+    invoice = _add_extra_lines(invoice, extra_items, actor_id)
     if money(invoice.get("total_amount")) <= 0:
         raise HTTPException(
             status_code=400,
             detail="This invoice totals zero - no fee structure applies to the student. "
                    "Set up a structure for their class or category first.",
         )
+    _apply_payments_to_instalments(invoice)
 
     config = finance_settings(program)
     updates = {
@@ -254,7 +468,17 @@ def issue_invoice(invoice: dict, actor_id: int | None = None,
         "issued_at": _now(),
         "updated_at": _now(),
         "issued_by": actor_id,
+        "instalments": invoice.get("instalments") or [],
+        "line_items": invoice.get("line_items") or [],
+        "subtotal": money(invoice.get("subtotal")),
+        "left_off": invoice.get("left_off") or [],
+        "discounts": invoice.get("discounts") or [],
+        "discount_total": money(invoice.get("discount_total")),
+        "extra_total": money(invoice.get("extra_total")),
+        "total_amount": money(invoice.get("total_amount")),
+        "concession_reason": invoice.get("concession_reason"),
     }
+    updates["status"] = _settle_status({**invoice, **updates})
     firestore_fee_invoices.add_document(str(invoice["id"]), updates)
     logger.info("Issued invoice %s for student %s.",
                 updates["invoice_number"], invoice.get("student_id"))
@@ -323,22 +547,27 @@ def _apply_payments_to_instalments(invoice: dict) -> None:
         if line.get("status") != InstalmentStatus.WAIVED.value:
             line["amount_paid"] = 0.0
 
-    targeted, general = [], []
+    # A payment's money, as (label or None, amount) pieces: the fees the office ticked, the
+    # one instalment it named, or None for "oldest first".
+    pieces = []
     for payment in invoice.get("payments") or []:
-        (targeted if payment.get("instalment_label") else general).append(payment)
-
-    for payment in targeted:
-        for line in instalments:
-            if line.get("label") == payment["instalment_label"]:
-                line["amount_paid"] = money(line.get("amount_paid", 0) + money(payment["amount"]))
-                break
+        if payment.get("allocations"):
+            pieces.extend((a.get("label"), money(a.get("amount"))) for a in payment["allocations"])
         else:
-            # The label no longer matches any line - the plan was changed after the payment
-            # was taken. Treated as a general payment rather than dropped, because the money
-            # is real whatever the schedule now says.
-            general.append(payment)
+            pieces.append((payment.get("instalment_label"), money(payment.get("amount"))))
 
-    pool = money(sum(money(p["amount"]) for p in general))
+    by_label = {line.get("label"): line for line in instalments}
+    pool = 0.0
+    for label, amount in pieces:
+        line = by_label.get(label) if label else None
+        if line is not None:
+            line["amount_paid"] = money(line.get("amount_paid", 0) + amount)
+        else:
+            # No label, or one that no longer matches a line because the plan changed after
+            # the payment was taken. Spread oldest-first rather than dropped: the money is
+            # real whatever the schedule now says.
+            pool = money(pool + amount)
+
     for line in instalments:
         if pool <= 0:
             break
@@ -356,7 +585,8 @@ def _apply_payments_to_instalments(invoice: dict) -> None:
             continue
         paid = money(line.get("amount_paid", 0))
         total = money(line.get("amount", 0))
-        if paid >= total and total > 0:
+        if paid >= total:
+            # Includes a line a concession took to zero: nothing is asked of the family.
             line["status"] = InstalmentStatus.PAID.value
         elif paid > 0:
             line["status"] = InstalmentStatus.PARTIALLY_PAID.value
@@ -377,6 +607,290 @@ def _settle_status(invoice: dict) -> str:
     if paid > 0:
         return InvoiceStatus.PARTIALLY_PAID.value
     return invoice.get("status") or InvoiceStatus.DRAFT.value
+
+
+# Razorpay's published standard fees (razorpay.com/pricing, 2026-10): 2% on payments made
+# inside India, up to 3% on international cards, with 18% GST on the fee. Passed on to the
+# payer for online payments. A currency's own convenience charge, set under
+# Fees -> Currencies, takes precedence when the school has negotiated another rate.
+RAZORPAY_FEE_PERCENT = {"INR": 2.0}
+RAZORPAY_INTERNATIONAL_FEE_PERCENT = 3.0
+RAZORPAY_FEE_GST_PERCENT = 18.0
+
+
+def _gateway_fee_percent(code: str, entry: dict) -> tuple[float, str]:
+    own = float(entry.get("convenience_percent") or 0)
+    if own > 0:
+        return own, "Online payment fee"
+    base = RAZORPAY_FEE_PERCENT.get(code, RAZORPAY_INTERNATIONAL_FEE_PERCENT)
+    return round(base * (1 + RAZORPAY_FEE_GST_PERCENT / 100.0), 4), \
+        f"Razorpay fee ({base:g}% + GST)"
+
+
+def payment_quote(amount: float, currency: str | None = None, program: str = Program.LMS.value,
+                  bill_currency: str | None = None, online: bool = False) -> dict:
+    """
+    What a payer hands over to settle `amount` of a bill, in the currency they chose.
+
+    The bill stays in its own currency (rupees) and is credited `amount`; this only works out
+    what is collected: the amount at the rate set under Fees -> Currencies (1 for the bill's
+    own currency), plus that currency's tax and convenience charge when the school set them
+    (INR 18% tax, AED 5% VAT). Both are added on top and kept apart from the fees, so the
+    bill is credited the fee alone.
+
+    `online` adds the payment gateway's fee too (Razorpay: 2% in India, 3% international,
+    plus GST on the fee), charged on the fees and tax together. Cash, cheque and bank
+    transfers carry no gateway fee.
+    """
+    config = currency_settings(program)
+    base = config["base_currency"]
+    bill = (bill_currency or base).upper()
+    code = (currency or bill).upper()
+    amount = money(amount)
+    currencies = config["currencies"]
+
+    def entry_for(c):
+        entry = currencies.get(c)
+        if not entry or not entry.get("enabled") or (
+                not entry.get("is_base") and float(entry.get("rate_from_base") or 0) <= 0):
+            raise HTTPException(
+                status_code=400, detail=f"Payments in {c} are not available right now.",
+            )
+        return entry
+
+    plain = {
+        "base_currency": bill, "base_amount": amount, "currency": bill,
+        "symbol": (currencies.get(bill) or {}).get("symbol"), "exchange_rate": 1.0,
+        "fee_amount": amount, "tax_label": None, "tax_percent": 0.0, "tax_amount": 0.0,
+        "convenience_amount": 0.0, "gateway_fee_label": None, "gateway_fee_percent": 0.0,
+        "gateway_fee": 0.0, "total": amount, "rate_status": "base", "rate_fetched_at": None,
+    }
+    entry = entry_for(code)
+    bill_entry = entry_for(bill)
+    rate = 1.0 if code == bill else (
+        float(entry.get("rate_from_base") or 1.0) / float(bill_entry.get("rate_from_base") or 1.0)
+    )
+    fee = money(amount * rate)
+    tax_percent = float(entry.get("tax_percent") or 0) if entry.get("tax_enabled") else 0.0
+    tax = money(fee * tax_percent / 100.0) if tax_percent and not entry.get("tax_inclusive") else 0.0
+    convenience = 0.0
+    gateway_percent, gateway_label, gateway_fee = 0.0, None, 0.0
+    if online:
+        gateway_percent, gateway_label = _gateway_fee_percent(code, entry)
+        gateway_fee = money((fee + tax) * gateway_percent / 100.0
+                            + float(entry.get("convenience_amount") or 0))
+    return {
+        **plain,
+        "currency": code,
+        "symbol": entry.get("symbol"),
+        "exchange_rate": round(rate, 8),
+        "fee_amount": fee,
+        "tax_label": entry.get("tax_label") or "Tax",
+        "tax_percent": tax_percent,
+        "tax_amount": tax,
+        "convenience_amount": convenience,
+        "gateway_fee_label": gateway_label,
+        "gateway_fee_percent": gateway_percent,
+        "gateway_fee": gateway_fee,
+        "total": money(fee + tax + convenience + gateway_fee),
+        "rate_status": "base" if code == bill else entry.get("rate_status"),
+        "rate_fetched_at": entry.get("rate_fetched_at"),
+    }
+
+
+def _foreign_fields(quote: dict | None) -> dict:
+    """What was handed over beside the rupee fees: another currency, tax on top, or both."""
+    if not quote or (
+        quote.get("currency") == quote.get("base_currency")
+        and not quote.get("tax_amount") and not quote.get("convenience_amount")
+        and not quote.get("gateway_fee")
+    ):
+        return {}
+    return {
+        "paid_currency": quote["currency"],
+        "paid_amount": quote["total"],
+        "paid_fee_amount": quote["fee_amount"],
+        "paid_tax_label": quote.get("tax_label"),
+        "paid_tax_percent": quote.get("tax_percent"),
+        "paid_tax_amount": quote.get("tax_amount"),
+        "paid_convenience_amount": quote.get("convenience_amount"),
+        "paid_gateway_fee": quote.get("gateway_fee"),
+        "paid_gateway_fee_label": quote.get("gateway_fee_label"),
+        "exchange_rate": quote["exchange_rate"],
+    }
+
+
+def clean_allocations(invoice: dict, allocations, amount: float) -> list[dict] | None:
+    """
+    Checks the fees the office ticked against what each one still owes.
+
+    `allocations` is [{label, amount}]: which fee lines this payment is for, and how much of
+    it goes to each, so a parent can pay Books and Term 2 while Term 1 waits. Each must be a
+    line on the bill, positive, no more than that line still owes, and together they must
+    come to the payment. None when nothing was ticked - the money then settles oldest-first.
+    """
+    if not allocations:
+        return None
+    lines = {i.get("label"): i for i in invoice.get("instalments") or []}
+    merged: dict[str, float] = {}
+    for part in allocations:
+        label = _field(part, "label")
+        value = money(_field(part, "amount"))
+        if value <= 0:
+            continue
+        line = lines.get(label)
+        if line is None or line.get("status") == InstalmentStatus.WAIVED.value:
+            raise HTTPException(
+                status_code=400, detail=f"There is no fee called '{label}' left to pay on this bill.",
+            )
+        merged[label] = money(merged.get(label, 0.0) + value)
+
+    currency = invoice.get("currency") or ""
+    for label, value in merged.items():
+        line = lines[label]
+        owing = money(money(line.get("amount")) - money(line.get("amount_paid")))
+        if value > owing + 0.009:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label} has only {currency} {owing} left to pay, not {currency} {value}.",
+            )
+    total = money(sum(merged.values()))
+    if abs(total - money(amount)) > 0.009:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The fees ticked come to {currency} {total}, but the amount is "
+                   f"{currency} {money(amount)}.",
+        )
+    return [{"label": label, "amount": value} for label, value in merged.items()] or None
+
+
+def issue_left_off(invoice: dict, labels, actor_id: int | None = None, concessions=None,
+                   concession_reason: str | None = None, program: str = Program.LMS.value) -> dict:
+    """
+    Bills fees that were left off when the bill was issued - Term 1 and Term 2 held back
+    while only the admission fee was billed, say.
+
+    The lines are priced from the fee rules as they stand now, exactly as issuing would have
+    priced them, and join the issued bill (with any concession given now). They then show on
+    the family's Fees page like every other line.
+    """
+    if invoice.get("status") not in FROZEN_STATUSES:
+        raise HTTPException(status_code=400, detail="Issue the bill first.")
+    wanted = [str(l) for l in labels or [] if l]
+    left_off = list(invoice.get("left_off") or [])
+    if not wanted:
+        raise HTTPException(status_code=400, detail="Tick the fees to add to the bill.")
+    for label in wanted:
+        if label not in left_off:
+            raise HTTPException(status_code=400, detail=f"{label} is not waiting to be billed on this bill.")
+
+    student = require_document(firestore_users, invoice["student_id"], "Student")
+    breakdown = finance.compute_breakdown(student, invoice["academic_year_id"], program,
+                                          currency=invoice.get("currency"))
+    priced = {i.get("label"): i for i in breakdown.get("instalments") or []}
+
+    instalments = [dict(i) for i in invoice.get("instalments") or []]
+    line_items = [dict(l) for l in invoice.get("line_items") or []]
+    item_by_name = {l.get("name"): l for l in line_items}
+    source_items = {l.get("name"): l for l in breakdown.get("line_items") or []}
+    added = 0.0
+    for label in wanted:
+        line = priced.get(label)
+        if not line or money(line.get("amount")) <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label} no longer has a fee set in the fee structure, so it cannot be billed.",
+            )
+        line = {**line, "amount_paid": 0.0, "status": InstalmentStatus.PENDING.value,
+                "added_by": actor_id, "added_at": _now()}
+        instalments.append(line)
+        for part in line.get("components") or []:
+            share = money(part.get("amount"))
+            item = item_by_name.get(part.get("name"))
+            if item is None:
+                base = source_items.get(part.get("name")) or {"name": part.get("name")}
+                item = {**base, "amount": 0.0, "net_amount": 0.0, "discount_amount": 0.0}
+                line_items.append(item)
+                item_by_name[item.get("name")] = item
+            item["amount"] = money(money(item.get("amount")) + share)
+            item["net_amount"] = money(money(item.get("net_amount", item.get("amount"))) + share)
+        added = money(added + money(line.get("amount")))
+
+    # Keep the schedule in due-date order, extra items last.
+    instalments.sort(key=lambda i: (bool(i.get("is_extra")), str(i.get("due_date") or "")))
+    updated = {
+        **invoice,
+        "instalments": instalments,
+        "line_items": line_items,
+        "subtotal": money(money(invoice.get("subtotal")) + added),
+        "total_amount": money(money(invoice.get("total_amount")) + added),
+        "left_off": [l for l in left_off if l not in wanted],
+    }
+    updated = _apply_concessions(updated, concessions, concession_reason, actor_id)
+    _apply_payments_to_instalments(updated)
+    updated["status"] = _settle_status(updated)
+    updated["updated_at"] = _now()
+    firestore_fee_invoices.add_document(str(invoice["id"]), {
+        key: updated.get(key) for key in (
+            "instalments", "line_items", "subtotal", "total_amount", "left_off", "discounts",
+            "discount_total", "status", "updated_at",
+        )
+    })
+    logger.info("Billed %s more on invoice %s: %s.", added, invoice["id"], ", ".join(wanted))
+    return updated
+
+
+def add_extra_items(invoice: dict, items, actor_id: int | None = None) -> dict:
+    """Adds extra items (books, uniform) to a bill that has already been issued."""
+    if invoice.get("status") not in FROZEN_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail="Issue the bill first. Extra items on a bill that is not issued yet are "
+                   "added when you issue it.",
+        )
+    updated = _add_extra_lines(invoice, items, actor_id)
+    _apply_payments_to_instalments(updated)
+    updated["status"] = _settle_status(updated)
+    updated["updated_at"] = _now()
+    firestore_fee_invoices.add_document(str(invoice["id"]), {
+        "instalments": updated["instalments"],
+        "extra_total": money(updated.get("extra_total")),
+        "total_amount": money(updated.get("total_amount")),
+        "status": updated["status"],
+        "updated_at": updated["updated_at"],
+    })
+    return updated
+
+
+def remove_extra_item(invoice: dict, label: str) -> dict:
+    """Takes an extra item off again, while nothing has been paid towards it."""
+    instalments = [dict(i) for i in invoice.get("instalments") or []]
+    line = next((i for i in instalments if i.get("label") == label), None)
+    if line is None or not line.get("is_extra"):
+        raise HTTPException(
+            status_code=404, detail=f"There is no extra item called '{label}' on this bill.",
+        )
+    if money(line.get("amount_paid")) > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Money has already been paid towards {label}, so it cannot be removed.",
+        )
+    amount = money(line.get("amount"))
+    updated = dict(invoice)
+    updated["instalments"] = [i for i in instalments if i is not line]
+    updated["extra_total"] = money(money(invoice.get("extra_total")) - amount)
+    updated["total_amount"] = money(money(invoice.get("total_amount")) - amount)
+    _apply_payments_to_instalments(updated)
+    updated["status"] = _settle_status(updated)
+    updated["updated_at"] = _now()
+    firestore_fee_invoices.add_document(str(invoice["id"]), {
+        "instalments": updated["instalments"],
+        "extra_total": updated["extra_total"],
+        "total_amount": updated["total_amount"],
+        "status": updated["status"],
+        "updated_at": updated["updated_at"],
+    })
+    return updated
 
 
 def record_payment(invoice: dict, payload, actor_id: int | None = None) -> dict:
@@ -416,34 +930,128 @@ def record_payment(invoice: dict, payload, actor_id: int | None = None) -> dict:
                        f"Expected one of: {', '.join(str(l) for l in labels)}.",
             )
 
+    allocations = clean_allocations(invoice, getattr(payload, "allocations", None), amount)
+    # Paid in another currency: the gateway passes the quote it charged; the counter names
+    # the currency and it is priced here, at today's rate.
+    quote = getattr(payload, "quote", None)
+    if quote is None and getattr(payload, "currency", None):
+        quote = payment_quote(amount, payload.currency, invoice.get("program") or Program.LMS.value,
+                              invoice.get("currency"))
+
+    method = getattr(payload.method, "value", payload.method)
     payment = {
         "amount": amount,
         "paid_at": (payload.paid_at.isoformat() if payload.paid_at else _now()),
-        "method": getattr(payload.method, "value", payload.method),
+        "method": method,
         "reference": payload.reference,
-        "instalment_label": payload.instalment_label,
+        "instalment_label": None if allocations else payload.instalment_label,
+        "allocations": allocations,
         "note": payload.note,
         "recorded_by": actor_id,
         "recorded_at": _now(),
+        **_foreign_fields(quote),
     }
 
-    updated = dict(invoice)
-    updated["payments"] = list(invoice.get("payments") or []) + [payment]
-    updated["amount_paid"] = _recompute_paid(updated)
-    _apply_payments_to_instalments(updated)
-    updated["status"] = _settle_status(updated)
-    updated["updated_at"] = _now()
+    # An adjustment settles a debt without being money, so it gets no receipt number:
+    # a gap-free receipt series is what an auditor checks against the cash book.
+    is_money = method != PaymentMethod.ADJUSTMENT.value
+    year = admission_service.firestore_academic_years.get_document(
+        str(invoice.get("academic_year_id"))
+    ) or {}
 
-    firestore_fee_invoices.add_document(str(invoice["id"]), {
-        "payments": updated["payments"],
-        "amount_paid": updated["amount_paid"],
-        "instalments": updated["instalments"],
-        "status": updated["status"],
-        "updated_at": updated["updated_at"],
-    })
+    with _receipt_lock:
+        if is_money:
+            payment["receipt_number"] = _next_receipt_number(year.get("name"))
+
+        updated = dict(invoice)
+        updated["payments"] = list(invoice.get("payments") or []) + [payment]
+        updated["amount_paid"] = _recompute_paid(updated)
+        _apply_payments_to_instalments(updated)
+        updated["status"] = _settle_status(updated)
+        updated["updated_at"] = _now()
+
+        firestore_fee_invoices.add_document(str(invoice["id"]), {
+            "payments": updated["payments"],
+            "amount_paid": updated["amount_paid"],
+            "instalments": updated["instalments"],
+            "status": updated["status"],
+            "updated_at": updated["updated_at"],
+        })
     logger.info("Recorded %s %s against invoice %s (now %s).",
                 updated["currency"], amount, invoice["id"], updated["status"])
+    if is_money:
+        _email_receipt_later(updated, len(updated["payments"]) - 1)
     return updated
+
+
+def receipt_recipients(student: dict) -> list[dict]:
+    """
+    Who a fee receipt is emailed to: the student, the parent email on their profile, and
+    every active parent account linked to them that may see fees. One email per address.
+    """
+    from app.services import families as family_service
+
+    found: dict[str, dict] = {}
+
+    def add(email, name, view_path):
+        key = str(email or "").strip().lower()
+        if key and "@" in key and key not in found:
+            found[key] = {"email": str(email).strip(), "name": name, "view_path": view_path}
+
+    add(student.get("email"), student.get("full_name"), "/student/fees")
+    add(student.get("guardian_email"), student.get("guardian_name"), None)
+    for link in family_service.links_for_student(student["id"]):
+        if not link.get("may_view_fees"):
+            continue
+        parent = firestore_users.get_document(str(link["parent_id"])) or {}
+        if parent.get("is_active", True):
+            add(parent.get("email"), parent.get("full_name"), "/parent")
+    return list(found.values())
+
+
+def email_receipt(invoice: dict, index: int) -> list[str]:
+    """Emails the receipt for `invoice.payments[index]`; returns the addresses it went to."""
+    from app.core import mailer
+    from app.services import finance_reports
+
+    if not mailer.is_configured():
+        logger.info("Mail is not set up; receipt for invoice %s not emailed.", invoice.get("id"))
+        return []
+    student = firestore_users.get_document(str(invoice.get("student_id"))) or {}
+    if not student:
+        return []
+    student = {**student, "id": invoice.get("student_id")}
+    receipt = finance_reports.payment_receipt(invoice, index)
+    method = {
+        PaymentMethod.ONLINE.value: "Online",
+        PaymentMethod.BANK_TRANSFER.value: "Bank transfer",
+    }.get(str(receipt.get("method") or ""), str(receipt.get("method") or "").replace("_", " ").title())
+    sent = []
+    for person in receipt_recipients(student):
+        url = mailer.absolute_link(person["view_path"] or "/")
+        if mailer.send_fee_receipt_email(person["email"], person["name"], receipt, url, method):
+            sent.append(person["email"])
+    logger.info("Receipt %s emailed to %d address(es).", receipt.get("receipt_number"), len(sent))
+
+    # And the office: one alert per address in School Settings -> Payment alert emails.
+    from app.services.tuition.settings_store import school_profile
+
+    counter = mailer.absolute_link(f"/admin/fee-collection?student={invoice.get('student_id')}")
+    office = {e.strip().lower() for e in (school_profile().get("fee_alert_emails") or "").replace(";", ",").split(",")}
+    for address in sorted(e for e in office if "@" in e):
+        mailer.send_fee_payment_alert_email(address, receipt, counter, method)
+    return sent
+
+
+def _email_receipt_later(invoice: dict, index: int) -> None:
+    """Emails the receipt off the request, so a slow or broken mail service never holds up a payment."""
+    def run():
+        try:
+            email_receipt(invoice, index)
+        except Exception:  # noqa: BLE001 - a receipt email must never break the payment
+            logger.exception("Emailing the receipt for invoice %s failed.", invoice.get("id"))
+
+    threading.Thread(target=run, name="receipt-email", daemon=True).start()
 
 
 def waive_instalment(invoice: dict, label: str, reason: str,
@@ -549,11 +1157,10 @@ def collect_payment(student_id, payload, actor_id: int | None = None,
     """
     The counter: a student pays, and the office records it in one step.
 
-    Finds the year's invoice, building and issuing it first when the student has not been
-    billed yet - a parent at the window with cash should not be turned away because nobody
-    pressed "generate" - then records the payment on it. A draft is issued rather than
-    regenerated, so figures a clerk already quoted from it do not move under the payment.
-    Refused, with the reason, when no fee structure applies (nothing to bill) or the amount
+    Finds the year's invoice and records the payment on it. The bill has to have been issued
+    first: issuing is the office's deliberate act, and it is what puts the bill on the
+    student's and parent's Fees page, so the counter never raises one as a side effect of
+    taking money. Refused, with the reason, when there is no issued bill or the amount
     exceeds what is outstanding.
     """
     require_document(firestore_users, student_id, "Student")
@@ -568,10 +1175,14 @@ def collect_payment(student_id, payload, actor_id: int | None = None,
         academic_year_id = year["id"]
 
     invoice = firestore_fee_invoices.get_document(invoice_id_for(student_id, academic_year_id))
-    if invoice is None or invoice.get("status") == InvoiceStatus.CANCELLED.value:
-        invoice = generate_invoice(student_id, academic_year_id, actor_id, program)
-    if invoice.get("status") == InvoiceStatus.DRAFT.value:
-        invoice = issue_invoice(invoice, actor_id, program)
+    if invoice is None or invoice.get("status") in (
+        InvoiceStatus.DRAFT.value, InvoiceStatus.CANCELLED.value,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="This student's fee bill for the year has not been issued yet. "
+                   "Issue the bill first, then collect the payment.",
+        )
 
     return record_payment(invoice, payload, actor_id)
 
@@ -626,6 +1237,8 @@ def present_invoice(invoice: dict, program: str = Program.LMS.value,
         "line_items": invoice.get("line_items") or [],
         "discounts": invoice.get("discounts") or [],
         "instalments": instalments,
+        # Fee lines held back when the bill was issued; they can be billed later.
+        "left_off": invoice.get("left_off") or [],
         "payments": invoice.get("payments") or [],
 
         "subtotal": money(invoice.get("subtotal")),
@@ -644,8 +1257,8 @@ def present_invoice(invoice: dict, program: str = Program.LMS.value,
         "issued_at": invoice.get("issued_at"),
         "due_date": invoice.get("due_date"),
         "notes": invoice.get("notes"),
-        "gateway_enabled": config["gateway_enabled"],
-        "gateway_provider": config["gateway_provider"],
+        "gateway_enabled": gateway_enabled(program),
+        "gateway_provider": gateway_provider(program),
         "created_at": invoice.get("created_at"),
         "updated_at": invoice.get("updated_at"),
     }
@@ -654,6 +1267,14 @@ def present_invoice(invoice: dict, program: str = Program.LMS.value,
 def invoices_for_student(student_id) -> list[dict]:
     invoices = firestore_fee_invoices.query_documents("student_id", "==", int(student_id))
     return sorted(invoices, key=lambda i: str(i.get("academic_year_id") or ""), reverse=True)
+
+
+def issued_invoices_for_student(student_id) -> list[dict]:
+    """What a student or parent sees: bills the office has issued, never its drafts."""
+    return [
+        i for i in invoices_for_student(student_id)
+        if i.get("status") not in (None, InvoiceStatus.DRAFT.value, InvoiceStatus.CANCELLED.value)
+    ]
 
 
 # ---------------------------------------------------------------------------------------
@@ -690,12 +1311,26 @@ def intent_reference(intent_id) -> str:
     return f"PAY-{intent_id}"
 
 
+def gateway_enabled(program: str = Program.LMS.value) -> bool:
+    """Online payment is on when the school switched it on, or when Razorpay keys are set."""
+    return bool(finance_settings(program)["gateway_enabled"]) or razorpay.is_configured()
+
+
+def gateway_provider(program: str = Program.LMS.value) -> str | None:
+    return "razorpay" if razorpay.is_configured() else finance_settings(program)["gateway_provider"]
+
+
 def create_intent(invoice: dict, amount: float, actor_id: int | None = None,
                   instalment_label: str | None = None,
                   program: str = Program.LMS.value,
-                  requested_method: str | None = None) -> dict:
+                  requested_method: str | None = None,
+                  allocations=None, currency: str | None = None) -> dict:
     """
     Records an intention to pay, and hands back what the checkout page needs next.
+
+    `amount` is what the bill is credited, in the bill's currency. `currency` is what the
+    payer pays in; the quote for it (rate, tax) is frozen on the intent, so the money
+    charged and the money credited are fixed together and cannot drift apart.
 
     For an online method no provider is wired, so `checkout_url` comes back null and the
     intent sits in CREATED. That is deliberate rather than a stub: the payment page already
@@ -724,8 +1359,11 @@ def create_intent(invoice: dict, amount: float, actor_id: int | None = None,
             detail=f"That is more than the {invoice.get('currency')} {outstanding} outstanding.",
         )
 
+    allocations = clean_allocations(invoice, allocations, amount)
     method = str(requested_method).upper() if requested_method else None
     offline = method in OFFLINE_GATEWAY_METHODS
+    use_razorpay = not offline and razorpay.is_configured()
+    charge = payment_quote(amount, currency, program, invoice.get("currency"), online=use_razorpay)
 
     intent_id = firestore_payment_intents.get_next_numeric_id()
     document = {
@@ -736,11 +1374,13 @@ def create_intent(invoice: dict, amount: float, actor_id: int | None = None,
         "amount": amount,
         "currency": invoice.get("currency") or config["currency"],
         "status": PaymentIntentStatus.CREATED.value,
-        "provider": None if offline else config["gateway_provider"],
+        "provider": None if offline else gateway_provider(program),
         "provider_reference": None,
         "checkout_url": None,
         "idempotency_key": uuid.uuid4().hex,
-        "instalment_label": instalment_label,
+        "instalment_label": None if allocations else instalment_label,
+        "allocations": allocations,
+        "charge": charge,
         "requested_method": method,
         "provider_payload": {},
         "initiated_by": actor_id,
@@ -750,7 +1390,17 @@ def create_intent(invoice: dict, amount: float, actor_id: int | None = None,
     document["id"] = intent_id
     document["reference"] = intent_reference(intent_id)
 
-    if offline:
+    if use_razorpay:
+        document["checkout"] = _razorpay_checkout(invoice, document, program)
+        document["provider_reference"] = document["checkout"]["order_id"]
+        firestore_payment_intents.add_document(str(intent_id), {
+            "provider_reference": document["provider_reference"],
+        })
+        document["detail"] = (
+            "Razorpay test mode: no real money moves." if document["checkout"]["test_mode"]
+            else None
+        )
+    elif offline:
         document["detail"] = (
             f"Quote {document['reference']} when you pay. The office records the payment "
             "against this invoice and it updates here as soon as they do."
@@ -814,22 +1464,225 @@ def settle_intent(intent: dict, status: str, provider_reference: str | None = No
             )
         else:
             invoice = require_invoice(intent["invoice_id"])
-            record_payment(
-                invoice,
-                type("GatewayPayment", (), {
+
+            def gateway_payment(allocations):
+                return type("GatewayPayment", (), {
                     "amount": intent["amount"],
                     "paid_at": None,
                     "method": PaymentMethod.ONLINE,
                     "reference": reference,
                     "instalment_label": intent.get("instalment_label"),
-                    "note": f"Gateway payment via {intent.get('provider') or 'online'}",
-                })(),
-                actor_id=intent.get("initiated_by"),
-            )
+                    "allocations": allocations,
+                    "quote": intent.get("charge"),
+                    "note": f"Paid online via {(intent.get('provider') or 'the gateway').title()}",
+                })()
+
+            try:
+                record_payment(invoice, gateway_payment(intent.get("allocations")),
+                               actor_id=intent.get("initiated_by"))
+            except HTTPException:
+                if not intent.get("allocations"):
+                    raise
+                # The fees chosen were paid some other way while the payer was on the
+                # gateway. The money is real, so it settles oldest-first instead.
+                logger.warning("Intent %s: chosen fees no longer open; settling oldest-first.",
+                               intent["id"])
+                record_payment(invoice, gateway_payment(None), actor_id=intent.get("initiated_by"))
         logger.info("Intent %s succeeded; credited invoice %s.",
                     intent["id"], intent["invoice_id"])
 
     return settled
+
+
+def _razorpay_checkout(invoice: dict, intent: dict, program: str) -> dict:
+    """
+    Opens a Razorpay order for the intent and returns what the browser's Checkout needs.
+
+    Orders rather than Payment Links: the payer is already on our page, and Checkout opens
+    over it and comes back with a signature this server can check.
+    """
+    student = firestore_users.get_document(str(invoice.get("student_id"))) or {}
+    try:
+        charge = intent.get("charge") or {}
+        order = razorpay.create_order(
+            amount=charge.get("total", intent["amount"]),
+            currency=charge.get("currency", intent["currency"]),
+            receipt=intent_reference(intent["id"]),
+            notes={
+                "invoice": intent.get("invoice_number"),
+                "student": student.get("full_name"),
+                "admission_number": student.get("admission_number"),
+                "program": program,
+            },
+        )
+    except razorpay.RazorpayError as exc:
+        firestore_payment_intents.add_document(str(intent["id"]), {
+            "status": PaymentIntentStatus.FAILED.value,
+            "failure_reason": str(exc),
+            "completed_at": _now(),
+        })
+        charged_in = (intent.get("charge") or {}).get("currency") or intent["currency"]
+        if charged_in != "INR":
+            # Razorpay takes other currencies only once it has switched on international
+            # payments for the account; until then every AED order is refused.
+            raise HTTPException(
+                status_code=400,
+                detail=f"Online payment in {charged_in} is not available yet. Pay in INR, or pay "
+                       f"in {charged_in} at the school office.",
+            ) from exc
+        raise HTTPException(
+            status_code=502,
+            detail="Online payment could not be started just now. Please try again in a "
+                   "minute, or pay at the school office.",
+        ) from exc
+
+    return {
+        "provider": "razorpay",
+        "key_id": razorpay.key_id(),
+        "order_id": order["id"],
+        "amount_minor": int(order.get("amount") or 0),
+        "currency": order.get("currency") or intent["currency"],
+        "description": f"Fees {intent.get('invoice_number') or ''}".strip(),
+        "prefill": {
+            "name": student.get("guardian_name") or student.get("full_name"),
+            "email": student.get("guardian_email") or student.get("email"),
+            "contact": student.get("guardian_phone") or student.get("phone"),
+        },
+        "test_mode": razorpay.is_test_mode(),
+    }
+
+
+def confirm_razorpay(intent: dict, order_id: str, payment_id: str, signature: str) -> dict:
+    """
+    Credits a Razorpay payment once its signature checks out.
+
+    The browser hands back three values after Checkout; only the signature, made with the
+    school's secret key, proves Razorpay sent them. The payment is then read back from
+    Razorpay and captured if the account does not capture automatically, so the receipt is
+    only printed for money the school will actually receive. Repeat calls are harmless:
+    `settle_intent` ignores an intent that is already settled.
+    """
+    if (intent.get("provider") or "").lower() != "razorpay" or \
+            str(intent.get("provider_reference") or "") != str(order_id or ""):
+        raise HTTPException(status_code=400, detail="This payment does not belong to this request.")
+    if not razorpay.verify_payment_signature(order_id, payment_id, signature):
+        raise HTTPException(
+            status_code=400,
+            detail="The payment could not be confirmed. If money left your account, contact "
+                   "the school office with the payment ID.",
+        )
+    if intent.get("status") in TERMINAL_INTENT_STATES:
+        return {**intent, "reference": intent_reference(intent["id"])}
+
+    try:
+        payment = razorpay.fetch_payment(payment_id)
+        if payment.get("status") == "authorized":
+            charge = intent.get("charge") or {}
+            payment = razorpay.capture_payment(
+                payment_id, charge.get("total", intent["amount"]),
+                charge.get("currency", intent["currency"]),
+            )
+    except razorpay.RazorpayError as exc:
+        logger.error("Razorpay payment %s for intent %s could not be read: %s",
+                     payment_id, intent["id"], exc)
+        raise HTTPException(
+            status_code=502,
+            detail="Your payment went through but could not be confirmed yet. Refresh the page "
+                   "in a minute; if it still shows unpaid, contact the school office.",
+        ) from exc
+
+    if payment.get("status") != "captured":
+        return settle_intent(
+            intent, PaymentIntentStatus.FAILED.value, payment_id,
+            {"order_id": order_id, "payment_id": payment_id, "status": payment.get("status")},
+            failure_reason=payment.get("error_description") or f"Payment {payment.get('status')}",
+        )
+    return settle_intent(
+        intent, PaymentIntentStatus.SUCCEEDED.value, payment_id,
+        {"order_id": order_id, "payment_id": payment_id, "method": payment.get("method")},
+    )
+
+
+def payer_breakdown(student: dict, academic_year_id=None, program: str = Program.LMS.value,
+                    currency: str | None = None) -> dict:
+    """
+    What a student or parent is shown: the bill the office issued, never a live estimate.
+
+    Before the office issues the year's bill there is nothing to show, so this is a 404 with
+    a plain sentence. Afterwards the figures come from the issued bill itself, so the
+    concessions and extra items the office added appear exactly as issued. Another currency
+    can still be picked for display; the figures are converted at today's rate.
+    """
+    if academic_year_id is None:
+        year = admission_service.current_year(program)
+        academic_year_id = year["id"] if year else None
+    invoice = (
+        firestore_fee_invoices.get_document(invoice_id_for(student["id"], academic_year_id))
+        if academic_year_id is not None else None
+    )
+    if not invoice or invoice.get("status") in (
+        None, InvoiceStatus.DRAFT.value, InvoiceStatus.CANCELLED.value,
+    ):
+        raise HTTPException(status_code=404, detail="The school has not issued a fee bill for this year yet.")
+
+    view = present_invoice({**invoice, "id": invoice.get("id") or invoice_id_for(student["id"], academic_year_id)}, program)
+    options, recommended, rate = [], None, 1.0
+    try:
+        live = finance.compute_breakdown(student, academic_year_id, program, currency=currency)
+        options = live.get("currency_options") or []
+        recommended = live.get("recommended_currency")
+        if currency and currency.upper() != (view["currency"] or "").upper():
+            rate = float(live.get("exchange_rate") or 1.0) / float(view["exchange_rate"] or 1.0)
+            view["currency"] = live["currency"]
+            view["currency_symbol"] = live.get("currency_symbol")
+            view["exchange_rate"] = live.get("exchange_rate")
+    except HTTPException:
+        pass
+
+    def conv(value):
+        return money(money(value) * rate)
+
+    lines = [
+        {**l, **{k: conv(l.get(k)) for k in ("amount", "net_amount", "discount_amount", "tax_amount")
+                  if l.get(k) is not None}}
+        for l in view["line_items"]
+    ]
+    instalments = [
+        {**i,
+         "amount": conv(i.get("amount")),
+         "amount_paid": conv(i.get("amount_paid")),
+         "outstanding": conv(i.get("outstanding")) if i.get("outstanding") is not None else None,
+         "components": [{**c, "amount": conv(c.get("amount"))} for c in i.get("components") or []]}
+        for i in view["instalments"]
+    ]
+    return {
+        "student_id": view["student_id"],
+        "student_name": view["student_name"],
+        "academic_year_id": view["academic_year_id"],
+        "currency": view["currency"],
+        "currency_symbol": view.get("currency_symbol"),
+        "base_currency": view.get("base_currency"),
+        "exchange_rate": float(view.get("exchange_rate") or 1.0),
+        "available_currencies": view["available_currencies"],
+        "recommended_currency": recommended,
+        "currency_options": options,
+        "structure_id": view.get("structure_id"),
+        "structure_name": f"Fee bill {view.get('invoice_number')}" if view.get("invoice_number") else None,
+        "instalment_plan_id": view.get("instalment_plan_id"),
+        "line_items": lines,
+        "discounts": [{**d, "amount": conv(d.get("amount"))} for d in view["discounts"]],
+        "instalments": instalments,
+        "subtotal": conv(view["subtotal"]),
+        "discount_total": conv(view["discount_total"]),
+        "taxable_base": conv(view["taxable_base"]),
+        "tax_total": conv(view["tax_total"]),
+        "tax_label": view["tax_label"],
+        "charge_total": conv(view["charge_total"]),
+        "convenience_total": conv(view["convenience_total"]),
+        "total_amount": conv(view["total_amount"]),
+        "gateway_enabled": view["gateway_enabled"],
+        "gateway_provider": view["gateway_provider"],
+    }
 
 
 def intents_for_invoice(invoice_id) -> list[dict]:

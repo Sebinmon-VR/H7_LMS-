@@ -1019,6 +1019,7 @@ class ProgramSettingsUpdate(BaseModel):
     web_app_url: str | None = Field(None, max_length=500)
     mobile_app_url: str | None = Field(None, max_length=1000)
     admission_portal_url: str | None = Field(None, max_length=500)
+    fee_alert_emails: str | None = Field(None, max_length=1000)
 
 
 class TimezoneUpdate(BaseModel):

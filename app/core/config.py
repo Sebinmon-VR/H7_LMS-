@@ -403,6 +403,9 @@ class Settings(BaseSettings):
     # An office inbox told of every new request, so nobody has to keep the admin page open.
     # Blank sends nothing; the request is still recorded and visible in the admin panel.
     ADMISSION_REQUEST_NOTIFY_EMAIL: str = ""
+    # Who the office alert goes to when a fee payment is received: comma-separated. The
+    # School Settings screen overrides it ("Payment alert emails").
+    FEE_PAYMENT_NOTIFY_EMAILS: str = ""
     # How the school is named in emails to families. Never PROJECT_NAME: that is the API's own
     # name ("LMS Backend API") and it once reached a parent's inbox as the name of the school.
     # School Settings overrides every value in this block (`settings_store.school_profile`);

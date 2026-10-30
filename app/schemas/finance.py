@@ -399,6 +399,10 @@ class InstalmentOut(BaseModel):
     days_overdue: int = 0
     late_fee_amount: float | None = None
     waived_reason: str | None = None
+    # Taken off this line by the office when the bill was issued.
+    concession_amount: float | None = None
+    # An item added by the office (books, uniform) rather than from the fee structure.
+    is_extra: bool = False
 
 
 class UnmatchedStructure(BaseModel):
@@ -530,6 +534,8 @@ class FeeInvoiceOut(BaseModel):
     line_items: list[BreakdownLine] = Field(default_factory=list)
     discounts: list[AppliedDiscount] = Field(default_factory=list)
     instalments: list[InstalmentOut] = Field(default_factory=list)
+    # Fee lines held back when the bill was issued, by label; they can be billed later.
+    left_off: list[str] = Field(default_factory=list)
     payments: list[dict[str, Any]] = Field(default_factory=list)
 
     subtotal: float = 0.0
@@ -556,6 +562,73 @@ class FeeInvoiceOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class PaymentAllocation(BaseModel):
+    """One ticked fee line and how much of the payment goes to it."""
+    label: str = Field(..., min_length=1, max_length=120)
+    amount: float = Field(..., gt=0)
+
+
+class LineConcession(BaseModel):
+    """A concession on one fee line, given when the bill is issued."""
+    label: str = Field(..., min_length=1, max_length=120)
+    amount: float = Field(..., ge=0)
+
+
+class ExtraItem(BaseModel):
+    """A fee outside the fee structure: books, uniform, a trip."""
+    name: str = Field(..., min_length=1, max_length=120)
+    amount: float = Field(..., gt=0)
+    due_date: date | None = None
+
+
+class InvoiceIssue(BaseModel):
+    """`POST /invoices/{id}/issue` - optional concessions and extra items, applied as it is issued."""
+    concessions: list[LineConcession] = Field(default_factory=list)
+    concession_reason: str | None = Field(None, max_length=200)
+    extra_items: list[ExtraItem] = Field(default_factory=list)
+    # Fee lines the office unticked: left off this bill entirely.
+    exclude: list[str] = Field(default_factory=list)
+
+
+class IssueLeftOff(BaseModel):
+    """`POST /invoices/{id}/issue-more` - bill fees left off at issue, with any concession now."""
+    labels: list[str] = Field(..., min_length=1)
+    concessions: list[LineConcession] = Field(default_factory=list)
+    concession_reason: str | None = Field(None, max_length=200)
+
+
+class ExtraItemsAdd(BaseModel):
+    items: list[ExtraItem] = Field(..., min_length=1)
+
+
+class PaymentQuote(BaseModel):
+    """What is collected to settle an amount of the bill, in the currency the payer chose."""
+    base_currency: str
+    base_amount: float
+    currency: str
+    symbol: str | None = None
+    exchange_rate: float
+    fee_amount: float
+    tax_label: str | None = None
+    tax_percent: float = 0.0
+    tax_amount: float = 0.0
+    convenience_amount: float = 0.0
+    # Online only: the payment gateway's fee, passed on to the payer.
+    gateway_fee_label: str | None = None
+    gateway_fee_percent: float = 0.0
+    gateway_fee: float = 0.0
+    total: float
+    rate_status: str | None = None
+    rate_fetched_at: datetime | str | None = None
+
+
+class RazorpayConfirm(BaseModel):
+    """What Razorpay Checkout hands the browser after a payment."""
+    razorpay_order_id: str = Field(..., max_length=64)
+    razorpay_payment_id: str = Field(..., max_length=64)
+    razorpay_signature: str = Field(..., max_length=256)
+
+
 class PaymentRecord(BaseModel):
     amount: float = Field(..., gt=0)
     method: PaymentMethod = PaymentMethod.CASH
@@ -565,6 +638,13 @@ class PaymentRecord(BaseModel):
     paid_at: datetime | None = Field(None, description="Defaults to now.")
     instalment_label: str | None = Field(
         None, description="Apply to one instalment; omit to settle oldest-first."
+    )
+    allocations: list[PaymentAllocation] | None = Field(
+        None, description="The fees ticked and how much goes to each; overrides instalment_label.",
+    )
+    currency: str | None = Field(
+        None, max_length=3,
+        description="Paid in this currency (e.g. AED). `amount` stays in the bill's currency.",
     )
     note: str | None = Field(None, max_length=1000)
 
@@ -634,6 +714,9 @@ class WaiveInstalmentRequest(BaseModel):
 class PaymentIntentCreate(BaseModel):
     amount: float = Field(..., gt=0)
     instalment_label: str | None = None
+    allocations: list[PaymentAllocation] | None = None
+    # Pay in this currency (e.g. AED); `amount` stays in the bill's currency.
+    currency: str | None = Field(None, max_length=3)
     # What the payer chose on the checkout page. A hint to the gateway adapter for the
     # online methods; for BANK_TRANSFER and OFFICE it is the record that a reference was
     # handed out for an offline payment the office should expect.
@@ -654,7 +737,13 @@ class PaymentIntentOut(BaseModel):
     checkout_url: str | None = None
     idempotency_key: str | None = None
     instalment_label: str | None = None
+    allocations: list[PaymentAllocation] | None = None
     requested_method: str | None = None
+    # Razorpay Checkout's options, when the payment goes through Razorpay: key_id, order_id,
+    # amount_minor, currency, description, prefill, test_mode. Never a secret.
+    checkout: dict[str, Any] | None = None
+    # What is actually charged: currency, rate, fee, tax and total. See `PaymentQuote`.
+    charge: dict[str, Any] | None = None
     # Which biller the invoice belongs to - LMS or TUITION - so a callback credits the right
     # collection. Frozen on the intent rather than re-derived from the invoice id's shape.
     program: str | None = None

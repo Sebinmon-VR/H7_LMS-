@@ -380,23 +380,28 @@ def _allocate_payments(invoice: dict, heads: dict[int, dict]) -> list[list[dict]
         return allocations
 
     by_label = {line["label"]: line for line in schedule}
-    targeted, general = [], []
+    # (payment index, amount) still to spread oldest-first, in the invoice's order.
+    general: list[tuple[int, float]] = []
     for index, payment in enumerate(payments):
-        (targeted if payment.get("instalment_label") else general).append(index)
+        # The fees the office ticked, the one instalment it named, or neither.
+        pieces = (
+            [(a.get("label"), money(a.get("amount"))) for a in payment["allocations"]]
+            if payment.get("allocations")
+            else [(payment.get("instalment_label"), money(payment.get("amount")))]
+        )
+        leftover = 0.0
+        for label, amount in pieces:
+            line = by_label.get(label) if label else None
+            if line is None:
+                # No label, or one that no longer matches: the invoice treats it as general money.
+                leftover = money(leftover + amount)
+                continue
+            line["paid"] = money(line["paid"] + amount)
+            allocations[index].extend(split(line["label"], amount, line["components"]))
+        if leftover > 0:
+            general.append((index, leftover))
 
-    for index in targeted:
-        payment = payments[index]
-        line = by_label.get(payment.get("instalment_label"))
-        if line is None:
-            # The label no longer matches a line: the invoice treats it as general money.
-            general.append(index)
-            continue
-        amount = money(payment.get("amount"))
-        line["paid"] = money(line["paid"] + amount)
-        allocations[index] = split(line["label"], amount, line["components"])
-
-    for index in general:
-        pool = money(payments[index].get("amount"))
+    for index, pool in general:
         for line in schedule:
             if pool <= 0:
                 break
@@ -432,6 +437,130 @@ def _merge_heads(allocation: list[dict]) -> list[dict]:
         })
         entry["amount"] = money(entry["amount"] + part["amount"])
     return sorted(merged.values(), key=lambda h: (not h["is_admission_charge"], -h["amount"]))
+
+
+_logo_cache: dict[str, str | None] = {}
+
+
+def _logo_data(url: str | None) -> str | None:
+    """
+    The school logo as a data: URI, so a printed receipt always carries it.
+
+    A logo the browser fetches from another site may not have loaded when the print dialog
+    opens, and then the receipt prints without it. Fetched once per address and kept; a
+    logo that cannot be fetched is simply left off.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return None
+    if url not in _logo_cache:
+        import base64
+
+        import httpx
+
+        try:
+            response = httpx.get(url, timeout=8.0, follow_redirects=True)
+            kind = response.headers.get("content-type", "").split(";")[0].strip()
+            if response.status_code == 200 and kind.startswith("image/") and len(response.content) < 512_000:
+                _logo_cache[url] = f"data:{kind};base64,{base64.b64encode(response.content).decode()}"
+            else:
+                _logo_cache[url] = None
+        except httpx.HTTPError:
+            return None
+    return _logo_cache[url]
+
+
+def _letterhead() -> dict:
+    """The school as it heads a receipt, from School Settings - so every reader sees the same."""
+    from app.services.tuition.settings_store import school_profile
+
+    profile = school_profile()
+    return {
+        "name": profile.get("school_name"),
+        "address": profile.get("school_address"),
+        "phone": profile.get("school_contact_phone"),
+        "email": profile.get("school_contact_email"),
+        "website": profile.get("school_website_url"),
+        "logo_url": profile.get("school_logo_url"),
+        "logo_data": _logo_data(profile.get("school_logo_url")),
+    }
+
+
+def payment_receipt(invoice: dict, index: int) -> dict:
+    """
+    The printable receipt for one payment on an invoice, first or reprint.
+
+    What it settled comes from replaying the invoice's own allocation (`_allocate_payments`),
+    so the receipt says exactly what the collections report says about the same payment.
+    `balance_after` is the invoice total less every payment up to and including this one,
+    which is what the payer was told at the counter - a reprint months later still shows it,
+    with today's balance alongside in `balance_now`.
+    """
+    payments = list(invoice.get("payments") or [])
+    if index < 0 or index >= len(payments):
+        raise HTTPException(status_code=404, detail="No such payment on this invoice.")
+    payment = payments[index]
+
+    allocation = _allocate_payments(invoice, _head_index())
+    parts = allocation[index] if index < len(allocation) else []
+    lines: dict = {}
+    for part in parts:
+        key = (part["instalment"], part["head"])
+        entry = lines.setdefault(key, {
+            "instalment": part["instalment"], "head": part["head"],
+            "is_admission_charge": part["is_admission_charge"], "amount": 0.0,
+        })
+        entry["amount"] = money(entry["amount"] + part["amount"])
+
+    total = money(invoice.get("total_amount"))
+    paid_through = money(sum(money(p.get("amount")) for p in payments[: index + 1]))
+    student_id = int(invoice.get("student_id") or 0)
+    student = firestore_users.get_document(str(student_id)) or {}
+    enrolled_class, _ = admission_service._class_of_student(student_id)
+    class_doc = firestore_classes.get_document(str(enrolled_class)) if enrolled_class else None
+    year = admission_service.firestore_academic_years.get_document(
+        str(invoice.get("academic_year_id"))
+    ) or {}
+    clerk = (
+        firestore_users.get_document(str(payment["recorded_by"])) or {}
+        if payment.get("recorded_by") else {}
+    )
+
+    return {
+        "invoice_id": invoice.get("id"),
+        "payment_index": index,
+        "receipt_number": payment.get("receipt_number"),
+        "paid_at": payment.get("paid_at"),
+        "amount": money(payment.get("amount")),
+        "currency": invoice.get("currency"),
+        "method": payment.get("method"),
+        "reference": payment.get("reference"),
+        "note": payment.get("note"),
+        # Paid in another currency: what was handed over, at what rate, and its tax.
+        "paid_currency": payment.get("paid_currency"),
+        "paid_amount": payment.get("paid_amount"),
+        "paid_fee_amount": payment.get("paid_fee_amount"),
+        "paid_tax_label": payment.get("paid_tax_label"),
+        "paid_tax_percent": payment.get("paid_tax_percent"),
+        "paid_tax_amount": payment.get("paid_tax_amount"),
+        "paid_gateway_fee": payment.get("paid_gateway_fee"),
+        "paid_gateway_fee_label": payment.get("paid_gateway_fee_label"),
+        "exchange_rate": payment.get("exchange_rate"),
+        "school": _letterhead(),
+        "lines": list(lines.values()),
+        "invoice_number": invoice.get("invoice_number"),
+        "invoice_total": total,
+        "balance_after": money(max(total - paid_through, 0.0)),
+        "balance_now": money(max(total - money(invoice.get("amount_paid")), 0.0)),
+        "academic_year_name": year.get("name"),
+        "student_id": student_id,
+        "student_name": student.get("full_name"),
+        "admission_number": student.get("admission_number"),
+        "roll_number": student.get("roll_number"),
+        "class_name": (class_doc or {}).get("name"),
+        "guardian_name": student.get("guardian_name"),
+        "guardian_phone": student.get("guardian_phone"),
+        "recorded_by_name": clerk.get("full_name"),
+    }
 
 
 def collections_report(from_date: date, to_date: date, academic_year_id=None,
@@ -524,6 +653,7 @@ def collections_report(from_date: date, to_date: date, academic_year_id=None,
                 ),
                 "invoice_id": invoice.get("id"),
                 "invoice_number": invoice.get("invoice_number"),
+                "receipt_number": payment.get("receipt_number"),
                 "source": "INVOICE",
                 "receipt_id": None,
                 "academic_year_id": invoice.get("academic_year_id"),
@@ -581,6 +711,7 @@ def collections_report(from_date: date, to_date: date, academic_year_id=None,
             "admission_fee_amount": amount if is_admission else 0.0,
             "invoice_id": None,
             "invoice_number": None,
+            "receipt_number": None,
             "source": receipt.get("source") or "OPENING_BALANCE",
             "receipt_id": receipt.get("id"),
             "academic_year_id": receipt.get("academic_year_id"),

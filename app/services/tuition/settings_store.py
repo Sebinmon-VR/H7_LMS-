@@ -375,6 +375,8 @@ _PROFILE_DEFAULTS = {
     "web_app_url": lambda: env_settings.resolved_app_url,
     "mobile_app_url": lambda: env_settings.MOBILE_APP_URL,
     "admission_portal_url": lambda: env_settings.ADMISSION_PORTAL_URL,
+    # Office addresses alerted when a fee payment is received, comma-separated.
+    "fee_alert_emails": lambda: env_settings.FEE_PAYMENT_NOTIFY_EMAILS,
 }
 _PROFILE_KEYS = frozenset(_PROFILE_DEFAULTS)
 

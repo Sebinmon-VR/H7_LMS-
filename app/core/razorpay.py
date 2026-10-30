@@ -1,5 +1,5 @@
 """
-Razorpay Payment Links: the admission fee's online payment, when the school has keys.
+Razorpay: Payment Links for the admission fee, Orders and Checkout for school fees.
 
 Three calls and a signature check, which is all the admission pipeline needs: make a link
 for an amount, read a link back to see whether it was paid, and trust a webhook only when
@@ -109,6 +109,51 @@ def cancel_payment_link(link_id: str) -> None:
         _call("POST", f"/payment_links/{link_id}/cancel")
     except RazorpayError as exc:
         logger.info("Payment link %s not cancelled: %s", link_id, exc)
+
+
+def key_id() -> str:
+    """The public key, which the browser's Checkout needs. Never the secret."""
+    return _auth()[0]
+
+
+def is_test_mode() -> bool:
+    """Test keys (rzp_test_...) move no real money: Razorpay's test cards and UPI ids work."""
+    return key_id().startswith("rzp_test_")
+
+
+def create_order(*, amount: float, currency: str, receipt: str, notes: dict | None = None) -> dict:
+    """
+    An order for school fees paid through Checkout on our own page.
+
+    Fees use Orders and Checkout rather than a link: the payer is already signed in on the
+    fees page, and Checkout returns a signed result this server verifies before crediting.
+    """
+    return _call("POST", "/orders", {
+        "amount": to_minor(amount, currency),
+        "currency": currency.upper(),
+        "receipt": receipt[:40],
+        "notes": {k: str(v)[:256] for k, v in (notes or {}).items() if v not in (None, "")},
+    })
+
+
+def verify_payment_signature(order_id: str, payment_id: str, signature: str | None) -> bool:
+    """Checkout's signature: HMAC-SHA256 of "order_id|payment_id" with the key secret."""
+    secret = _auth()[1]
+    if not secret or not signature or not order_id or not payment_id:
+        return False
+    expected = hmac.new(secret.encode(), f"{order_id}|{payment_id}".encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature.strip())
+
+
+def fetch_payment(payment_id: str) -> dict:
+    return _call("GET", f"/payments/{payment_id}")
+
+
+def capture_payment(payment_id: str, amount: float, currency: str) -> dict:
+    """For an account that does not capture automatically: claim an authorised payment."""
+    return _call("POST", f"/payments/{payment_id}/capture", {
+        "amount": to_minor(amount, currency), "currency": currency.upper(),
+    })
 
 
 def verify_webhook(body: bytes, signature: str | None) -> bool:

@@ -34,6 +34,11 @@ from app.schemas.finance import (
     FeeCollect, FeeReceiptCreate, FeeReceiptOut,
     PaymentIntentCreate, PaymentIntentOut, PaymentRecord,
     WaiveInstalmentRequest,
+    ExtraItemsAdd,
+    InvoiceIssue,
+    IssueLeftOff,
+    RazorpayConfirm,
+    PaymentQuote,
 )
 from app.schemas.user import UserOut
 from app.services import billing
@@ -505,18 +510,63 @@ def get_invoice(
 
 @admin_router.post("/invoices/{invoice_id}/issue", response_model=FeeInvoiceOut)
 def issue_invoice(
-    invoice_id: str, program: Program = Query(Program.LMS),
+    invoice_id: str, payload: Optional[InvoiceIssue] = None,
+    program: Program = Query(Program.LMS),
     admin: UserOut = Depends(require_admin),
 ):
     """
     [Admin Only] Issue an invoice: assign its number and freeze its figures.
 
-    After this the totals stop moving, whatever happens to the fee structure or the tax rate
-    afterwards. That is the point - a bill that changes after it was sent is not a bill.
+    Optionally with a concession on any fee line and extra items (books, uniform), applied
+    as it is issued. After this the totals stop moving, whatever happens to the fee
+    structure or the tax rate afterwards. Once issued, the bill shows on the student's and
+    parent's Fees page.
     """
     invoice = billing.require_invoice(invoice_id)
-    issued = billing.issue_invoice(invoice, admin.id, program.value)
+    issued = billing.issue_invoice(
+        invoice, admin.id, program.value,
+        concessions=payload.concessions if payload else None,
+        concession_reason=payload.concession_reason if payload else None,
+        extra_items=payload.extra_items if payload else None,
+        exclude=payload.exclude if payload else None,
+    )
     return FeeInvoiceOut(**billing.present_invoice(issued, program.value))
+
+
+@admin_router.post("/invoices/{invoice_id}/issue-more", response_model=FeeInvoiceOut)
+def issue_more(
+    invoice_id: str, payload: IssueLeftOff,
+    program: Program = Query(Program.LMS),
+    admin: UserOut = Depends(require_admin),
+):
+    """[Admin Only] Bill fees that were left off when the bill was issued (Term 1, Term 2...)."""
+    updated = billing.issue_left_off(
+        billing.require_invoice(invoice_id), payload.labels, admin.id,
+        payload.concessions, payload.concession_reason, program.value,
+    )
+    return FeeInvoiceOut(**billing.present_invoice(updated, program.value))
+
+
+@admin_router.post("/invoices/{invoice_id}/items", response_model=FeeInvoiceOut)
+def add_extra_items(
+    invoice_id: str, payload: ExtraItemsAdd,
+    program: Program = Query(Program.LMS),
+    admin: UserOut = Depends(require_admin),
+):
+    """[Admin Only] Add extra items (books, uniform) to an issued bill, each as its own line."""
+    updated = billing.add_extra_items(billing.require_invoice(invoice_id), payload.items, admin.id)
+    return FeeInvoiceOut(**billing.present_invoice(updated, program.value))
+
+
+@admin_router.delete("/invoices/{invoice_id}/items/{label}", response_model=FeeInvoiceOut)
+def remove_extra_item(
+    invoice_id: str, label: str,
+    program: Program = Query(Program.LMS),
+    _: UserOut = Depends(require_admin),
+):
+    """[Admin Only] Take an extra item off a bill, while nothing has been paid towards it."""
+    updated = billing.remove_extra_item(billing.require_invoice(invoice_id), label)
+    return FeeInvoiceOut(**billing.present_invoice(updated, program.value))
 
 
 @admin_router.post("/invoices/{invoice_id}/cancel", response_model=FeeInvoiceOut)
@@ -559,6 +609,21 @@ def record_payment(
     return FeeInvoiceOut(**billing.present_invoice(updated, program.value))
 
 
+@admin_router.get("/invoices/{invoice_id}/payments/{index}/receipt")
+def payment_receipt(
+    invoice_id: str, index: int,
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] The printable receipt for one payment, by its position in the invoice's
+    `payments` list - for the counter right after collecting, and for any reprint.
+
+    `lines` is what the payment settled, by instalment and fee head; `balance_after` is what
+    was still owed straight after it, `balance_now` what is owed today.
+    """
+    return reports.payment_receipt(billing.require_invoice(invoice_id), index)
+
+
 @admin_router.post("/students/{student_id}/collect", response_model=FeeInvoiceOut)
 def collect_fee(
     student_id: int, payload: FeeCollect,
@@ -568,11 +633,10 @@ def collect_fee(
     """
     [Admin Only] Collect a fee at the counter - one call from "student pays" to "recorded".
 
-    The year's invoice is built and issued if the student has not been billed yet, then the
-    payment is recorded on it exactly as `POST /invoices/{id}/payments` would. Name an
-    `instalment_label` (e.g. "Term 1") to apply the money to one instalment; omit it to
-    settle oldest-first. 400 when no fee structure applies to the student or the amount is
-    more than they owe.
+    The payment is recorded on the year's issued invoice exactly as
+    `POST /invoices/{id}/payments` would. Name an `instalment_label` (e.g. "Term 1") to apply
+    the money to one instalment; omit it to settle oldest-first. 400 when the bill has not
+    been issued yet or the amount is more than they owe.
     """
     updated = billing.collect_payment(student_id, payload, admin.id, program.value)
     return FeeInvoiceOut(**billing.present_invoice(updated, program.value))
@@ -634,9 +698,33 @@ def create_intent(
     """
     invoice = billing.require_invoice(invoice_id)
     intent = billing.create_intent(
-        invoice, payload.amount, admin.id, payload.instalment_label, program.value
+        invoice, payload.amount, admin.id, payload.instalment_label, program.value,
+        getattr(payload.method, "value", payload.method), payload.allocations, payload.currency,
     )
     return PaymentIntentOut(**intent)
+
+
+@admin_router.get("/quote", response_model=PaymentQuote)
+def counter_quote(
+    amount: float = Query(..., gt=0),
+    currency: str = Query(..., max_length=3),
+    online: bool = Query(False, description="Online (Razorpay): include the gateway fee."),
+    program: Program = Query(Program.LMS),
+    _: UserOut = Depends(require_admin),
+):
+    """[Admin Only] What to collect, in `currency`, to settle `amount` of a rupee bill: today's rate plus that currency's tax."""
+    return PaymentQuote(**billing.payment_quote(amount, currency, program.value, online=online))
+
+
+@admin_router.post("/intents/{intent_id}/razorpay", response_model=PaymentIntentOut)
+def confirm_razorpay_payment(
+    intent_id: int, payload: RazorpayConfirm, _: UserOut = Depends(require_admin),
+):
+    """[Admin Only] Credit a Razorpay payment taken at the counter, once its signature checks out."""
+    intent = billing.require_intent(intent_id)
+    return PaymentIntentOut(**billing.confirm_razorpay(
+        intent, payload.razorpay_order_id, payload.razorpay_payment_id, payload.razorpay_signature,
+    ))
 
 
 @admin_router.post("/intents/{intent_id}/callback", response_model=PaymentIntentOut)
@@ -856,7 +944,9 @@ def my_fees(
     student: UserOut = Depends(require_student),
 ):
     """
-    [Student] What I owe: fees, charges, tax, concessions and the instalment schedule.
+    [Student] My issued fee bill: fees, charges, tax, concessions and the schedule.
+
+    404 until the office issues the year's bill - no estimate is shown before then.
 
     **The payment page's data**, from the same function the bursar's preview and the invoice
     generator use.
@@ -869,9 +959,7 @@ def my_fees(
     """
     profile = require_document(firestore_users, student.id, "Student")
     return FeeBreakdownOut(
-        **finance.compute_breakdown(
-            profile, academic_year_id, program.value, currency=currency
-        )
+        **billing.payer_breakdown(profile, academic_year_id, program.value, currency=currency)
     )
 
 
@@ -879,10 +967,10 @@ def my_fees(
 def my_invoices(
     program: Program = Query(Program.LMS), student: UserOut = Depends(require_student)
 ):
-    """[Student] My invoices, newest year first."""
+    """[Student] My issued invoices, newest year first. Drafts stay with the office."""
     return [
         FeeInvoiceOut(**billing.present_invoice(i, program.value))
-        for i in billing.invoices_for_student(student.id)
+        for i in billing.issued_invoices_for_student(student.id)
     ]
 
 
@@ -921,9 +1009,40 @@ def start_my_payment(
     invoice = _invoice_of(invoice_id, student.id)
     intent = billing.create_intent(
         invoice, payload.amount, student.id, payload.instalment_label, program.value,
-        getattr(payload.method, "value", payload.method),
+        getattr(payload.method, "value", payload.method), payload.allocations, payload.currency,
     )
     return PaymentIntentOut(**intent)
+
+
+@student_router.get("/me/invoices/{invoice_id}/payments/{index}/receipt")
+def my_payment_receipt(invoice_id: str, index: int, student: UserOut = Depends(require_student)):
+    """[Student] The receipt for one of my payments, by its position in the bill's payments."""
+    return reports.payment_receipt(_invoice_of(invoice_id, student.id), index)
+
+
+@student_router.get("/me/quote", response_model=PaymentQuote)
+def my_quote(
+    amount: float = Query(..., gt=0),
+    currency: str = Query(..., max_length=3),
+    online: bool = Query(False, description="Online (Razorpay): include the gateway fee."),
+    program: Program = Query(Program.LMS),
+    _: UserOut = Depends(require_student),
+):
+    """[Student] What I would pay, in `currency`, for `amount` of my bill: today's rate plus that currency's tax."""
+    return PaymentQuote(**billing.payment_quote(amount, currency, program.value, online=online))
+
+
+@student_router.post("/me/intents/{intent_id}/razorpay", response_model=PaymentIntentOut)
+def confirm_my_razorpay_payment(
+    intent_id: int, payload: RazorpayConfirm, student: UserOut = Depends(require_student),
+):
+    """[Student] Finish a Razorpay payment: the result Checkout handed back, checked and credited."""
+    intent = billing.require_intent(intent_id)
+    if int(intent.get("student_id") or -1) != int(student.id):
+        raise HTTPException(status_code=404, detail=f"Payment intent {intent_id} not found")
+    return PaymentIntentOut(**billing.confirm_razorpay(
+        intent, payload.razorpay_order_id, payload.razorpay_payment_id, payload.razorpay_signature,
+    ))
 
 
 @student_router.get("/me/invoices/{invoice_id}/intents", response_model=List[PaymentIntentOut])
@@ -952,9 +1071,7 @@ def child_fees(
     family_service.assert_may_view(parent, student_id, "fees")
     profile = require_document(firestore_users, student_id, "Student")
     return FeeBreakdownOut(
-        **finance.compute_breakdown(
-            profile, academic_year_id, program.value, currency=currency
-        )
+        **billing.payer_breakdown(profile, academic_year_id, program.value, currency=currency)
     )
 
 
@@ -968,7 +1085,7 @@ def child_invoices(
     family_service.assert_may_view(parent, student_id, "fees")
     return [
         FeeInvoiceOut(**billing.present_invoice(i, program.value))
-        for i in billing.invoices_for_student(student_id)
+        for i in billing.issued_invoices_for_student(student_id)
     ]
 
 
@@ -987,9 +1104,25 @@ def start_child_payment(
     invoice = _invoice_of(invoice_id, student_id)
     intent = billing.create_intent(
         invoice, payload.amount, parent.id, payload.instalment_label, program.value,
-        getattr(payload.method, "value", payload.method),
+        getattr(payload.method, "value", payload.method), payload.allocations, payload.currency,
     )
     return PaymentIntentOut(**intent)
+
+
+@parent_router.post("/children/{student_id}/intents/{intent_id}/razorpay",
+                    response_model=PaymentIntentOut)
+def confirm_child_razorpay_payment(
+    student_id: int, intent_id: int, payload: RazorpayConfirm,
+    parent: UserOut = Depends(require_parent),
+):
+    """[Parent] Finish a Razorpay payment on a child's bill, checked and credited."""
+    family_service.assert_may_view(parent, student_id, "fees")
+    intent = billing.require_intent(intent_id)
+    if int(intent.get("student_id") or -1) != int(student_id):
+        raise HTTPException(status_code=404, detail=f"Payment intent {intent_id} not found")
+    return PaymentIntentOut(**billing.confirm_razorpay(
+        intent, payload.razorpay_order_id, payload.razorpay_payment_id, payload.razorpay_signature,
+    ))
 
 
 @parent_router.get("/children/{student_id}/invoices/{invoice_id}/intents",

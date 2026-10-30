@@ -225,7 +225,7 @@ def build_report(student_id, period: str = WEEKLY, start: date | None = None,
 
     if include_fees:
         from app.services import billing
-        invoices = billing.invoices_for_student(student_id)
+        invoices = billing.issued_invoices_for_student(student_id)
         if invoices:
             latest = billing.present_invoice(invoices[0])
             report["fees"] = {

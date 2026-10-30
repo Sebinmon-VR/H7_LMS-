@@ -748,6 +748,100 @@ def send_payment_received_email(to: str, contact_name: str, student_name: str, r
     )
 
 
+def send_fee_receipt_email(to: str, contact_name: str | None, receipt: dict,
+                           view_url: str | None = None, method_label: str | None = None) -> bool:
+    """
+    The receipt for one school fee payment, to the student and the family.
+
+    The rows follow the printed receipt: what was paid for, the fees, any tax or online
+    payment fee on top, the total, how it was paid and what is still due. A row that does not
+    apply (no tax, no gateway fee) is left out rather than shown as zero.
+    """
+    student = receipt.get("student_name") or "your child"
+    number = receipt.get("receipt_number") or ""
+    bill_currency = receipt.get("currency")
+    paid_currency = receipt.get("paid_currency") or bill_currency
+    foreign = paid_currency != bill_currency
+    paid_for = ", ".join(dict.fromkeys(
+        (line.get("instalment") or line.get("head") or "") for line in receipt.get("lines") or []
+    )) or "School fees"
+
+    fees = money_label(receipt.get("amount"), bill_currency)
+    if foreign and receipt.get("paid_fee_amount") is not None:
+        fees = f"{money_label(receipt.get('paid_fee_amount'), paid_currency)} ({fees})"
+    total = receipt.get("paid_amount") if receipt.get("paid_amount") is not None else receipt.get("amount")
+
+    rows = [
+        ("Receipt number", number),
+        ("Date", _nice_date(receipt.get("paid_at"))),
+        ("Student", student),
+        ("Paid for", paid_for),
+        ("Fees", fees),
+    ]
+    if receipt.get("paid_tax_amount"):
+        rows.append((f"{receipt.get('paid_tax_label') or 'Tax'} {receipt.get('paid_tax_percent') or 0:g}%",
+                     money_label(receipt.get("paid_tax_amount"), paid_currency)))
+    if receipt.get("paid_gateway_fee"):
+        rows.append((receipt.get("paid_gateway_fee_label") or "Online payment fee",
+                     money_label(receipt.get("paid_gateway_fee"), paid_currency)))
+    rows.append(("Total paid", money_label(total, paid_currency)))
+    paid_by = method_label or receipt.get("method") or ""
+    if receipt.get("reference"):
+        paid_by = f"{paid_by} · {receipt['reference']}" if paid_by else receipt["reference"]
+    rows.append(("Paid by", paid_by))
+    balance = receipt.get("balance_after") or 0
+    rows.append(("Balance due", money_label(balance, bill_currency) if balance > 0 else "Nil"))
+
+    return _send_letter(
+        to, f"Fee receipt {number} for {student}".strip(),
+        greeting=_greeting(contact_name),
+        paragraphs=[
+            f"Thank you. We have received your payment for {student}'s fees.",
+            "You can view, print or save the full receipt from the Fees page in the app.",
+        ],
+        rows=rows,
+        buttons=[("View receipt", view_url)] if view_url else None,
+        signature="Accounts Office",
+    )
+
+
+def send_fee_payment_alert_email(to: str, receipt: dict, counter_url: str | None = None,
+                                 method_label: str | None = None) -> bool:
+    """The office's alert that a fee payment has come in: who paid, how much, how, and what is left."""
+    student = receipt.get("student_name") or "A student"
+    number = receipt.get("receipt_number") or ""
+    bill_currency = receipt.get("currency")
+    paid_currency = receipt.get("paid_currency") or bill_currency
+    total = receipt.get("paid_amount") if receipt.get("paid_amount") is not None else receipt.get("amount")
+    paid_for = ", ".join(dict.fromkeys(
+        (line.get("instalment") or line.get("head") or "") for line in receipt.get("lines") or []
+    )) or "School fees"
+    paid_by = method_label or receipt.get("method") or ""
+    if receipt.get("reference"):
+        paid_by = f"{paid_by} · {receipt['reference']}" if paid_by else receipt["reference"]
+    balance = receipt.get("balance_after") or 0
+    rows = [
+        ("Student", student),
+        ("Admission number", receipt.get("admission_number") or ""),
+        ("Class", class_label(receipt.get("class_name")) or ""),
+        ("Receipt number", number),
+        ("Date", _nice_date(receipt.get("paid_at"))),
+        ("Paid for", paid_for),
+        ("Amount received", money_label(total, paid_currency)),
+        ("Credited to the fees", money_label(receipt.get("amount"), bill_currency)),
+        ("Paid by", paid_by),
+        ("Balance due", money_label(balance, bill_currency) if balance > 0 else "Nil"),
+    ]
+    return _send_letter(
+        to, f"Payment received: {money_label(total, paid_currency)} from {student} ({number})",
+        greeting="Hello,",
+        paragraphs=[f"A fee payment has been received for {student}. The receipt has been sent to the family."],
+        rows=[r for r in rows if r[1]],
+        buttons=[("Open in the fee counter", counter_url)] if counter_url else None,
+        signature="H7 LMS",
+    )
+
+
 def send_payment_issue_email(to: str, contact_name: str, student_name: str, reference: str,
                              portal_url: str, note: str | None = None) -> bool:
     """The proof did not check out. Kind wording: it is usually a typo in a transaction id."""
