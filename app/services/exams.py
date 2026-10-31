@@ -1082,10 +1082,42 @@ async def store_answer_sheet(
     return firestore_exam_submissions.get_document(str(submission["id"]))
 
 
+# How many points each kind of mark is made of; a pencil stroke has as many as it needs.
+_MARK_POINTS = {"circle": 2, "line": 2, "tick": 1, "cross": 1, "note": 1}
+# A page this busy is a stuck pen rather than marking, and it would bloat the script.
+_MAX_MARKS_PER_FILE = 400
+_MAX_POINTS_PER_FILE = 40000
+
+
+def _clean_sheet_marks(marks) -> list[dict]:
+    """
+    The teacher's marks on one file, ready to store: coordinates kept on the page and rounded,
+    and anything that cannot be drawn (a stroke of one point, an empty note) dropped.
+    """
+    if len(marks) > _MAX_MARKS_PER_FILE or sum(len(m.points) for m in marks) > _MAX_POINTS_PER_FILE:
+        raise HTTPException(
+            status_code=400,
+            detail="There are too many marks on one file to save. Remove some and try again.",
+        )
+    cleaned = []
+    for mark in marks:
+        points = [[round(min(max(float(x), 0.0), 1.0), 4), round(min(max(float(y), 0.0), 1.0), 4)]
+                  for x, y in mark.points]
+        needed = _MARK_POINTS.get(mark.kind)
+        if (needed and len(points) != needed) or (mark.kind == "pen" and len(points) < 2):
+            continue
+        text = (mark.text or "").strip() if mark.kind == "note" else None
+        if mark.kind == "note" and not text:
+            continue
+        cleaned.append({"kind": mark.kind, "points": points, "color": mark.color.lower(), "text": text})
+    return cleaned
+
+
 def save_marking_sheet(exam: dict, submission: dict, payload) -> dict:
     """
     Stores the teacher's marking of the answer sheets: where they drew the lines that split
-    each file into answers, and the score given to each part.
+    each file into answers, the score given to each part, and the circles, ticks, crosses,
+    pencil strokes and notes that show the student where they went wrong.
 
     Kept apart from the valuation so a teacher can mark half a script, leave, and come back;
     the total it adds up to is what is then recorded as the script's marks. Each part's score
@@ -1121,7 +1153,12 @@ def save_marking_sheet(exam: dict, submission: dict, payload) -> dict:
                 )
             total += float(part.marks or 0.0)
             segments.append(part.model_dump())
-        sheet[str(index)] = {"file_url": attachments[index].get("file_url"), "dividers": dividers, "segments": segments}
+        sheet[str(index)] = {
+            "file_url": attachments[index].get("file_url"),
+            "dividers": dividers,
+            "segments": segments,
+            "annotations": _clean_sheet_marks(marked.annotations),
+        }
 
     total = round(total, 2)
     max_marks = float(exam.get("max_marks") or 0.0)
@@ -1715,6 +1752,8 @@ def hydrate_submission_for_student(submission: dict, exam: dict) -> dict:
             {**s, "max_marks": s.get("max_marks", max_by_question.get(s.get("question_id")))}
             for s in (submission.get("question_scores") or [])
         ] if published else [],
+        # The marked answer sheet comes back with the marks, never before them.
+        "marking_sheet": (submission.get("marking_sheet") or {}) if published else {},
     }
 
 

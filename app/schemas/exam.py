@@ -13,7 +13,7 @@ with optional fields would leak the key the first time somebody forgot to blank 
 """
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -546,6 +546,9 @@ class StudentSubmissionOut(BaseModel):
     passed: bool | None = None
     evaluator_remarks: str | None = None
     question_scores: list[QuestionScoreOut] = Field(default_factory=list)
+    # The teacher's marking on the answer sheets - lines, part scores, circles, ticks, notes -
+    # keyed like the staff copy. Empty until results are published.
+    marking_sheet: dict = Field(default_factory=dict)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -558,14 +561,32 @@ class MarkingPart(BaseModel):
     comment: str | None = Field(None, max_length=500)
 
 
+class SheetMark(BaseModel):
+    """
+    One mark a teacher made on an answer sheet to show a mistake: a pencil stroke, a circle,
+    an underline, a tick, a cross or a short note.
+
+    `points` are (x, y) as fractions of the file's width and height, like the dividing lines,
+    so a mark stays on the word it was drawn on at any screen width. A pencil stroke has many
+    points, a circle and an underline two (the circle's opposite corners), and a tick, a cross
+    and a note one.
+    """
+    kind: Literal["pen", "circle", "line", "tick", "cross", "note"]
+    points: list[tuple[float, float]] = Field(default_factory=list, max_length=5000)
+    color: str = Field("#dc2626", pattern=r"^#[0-9a-fA-F]{6}$")
+    text: str | None = Field(None, max_length=300)
+
+
 class MarkedFile(BaseModel):
     """
     One uploaded file, split into answers. `dividers` are where the lines sit, as a fraction of
     the way down the file (0 is the top, 1 the bottom), so they land in the same place however
-    wide the screen is. There is always one more part than there are lines.
+    wide the screen is. There is always one more part than there are lines. `annotations` are
+    the teacher's marks on the file, which the student sees once results are published.
     """
     dividers: list[float] = Field(default_factory=list)
     segments: list[MarkingPart] = Field(default_factory=list)
+    annotations: list[SheetMark] = Field(default_factory=list)
 
 
 class MarkingSheetIn(BaseModel):
