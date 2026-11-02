@@ -24,7 +24,7 @@ the list" is how a fee gets forgotten.
 
 import csv
 import io
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from fastapi import HTTPException
 
@@ -705,6 +705,8 @@ def collections_report(from_date: date, to_date: date, academic_year_id=None,
                     sum(h["amount"] for h in split_heads if h["is_admission_charge"])
                 ),
                 "invoice_id": invoice.get("id"),
+                # Its place in the invoice's payments: what opens its receipt.
+                "payment_index": index,
                 "invoice_number": invoice.get("invoice_number"),
                 "bill_numbers": _bills_settled(allocation, bill_of) or [invoice.get("invoice_number")],
                 "receipt_number": payment.get("receipt_number"),
@@ -765,6 +767,7 @@ def collections_report(from_date: date, to_date: date, academic_year_id=None,
             }],
             "admission_fee_amount": amount if is_admission else 0.0,
             "invoice_id": None,
+            "payment_index": None,
             "invoice_number": None,
             "bill_numbers": [],
             "receipt_number": None,
@@ -845,26 +848,32 @@ def collections_report(from_date: date, to_date: date, academic_year_id=None,
     }
 
 
-# What a transaction's status column can say. Every payment received is RECEIVED; an online
-# payment that did not end in money is FAILED, still IN_PROGRESS, or ABANDONED once the
-# safety net has stopped asking Razorpay about it.
-RECEIVED, IN_PROGRESS, FAILED, ABANDONED, REFUNDED = (
-    "RECEIVED", "IN_PROGRESS", "FAILED", "ABANDONED", "REFUNDED",
+# What a transaction's status column can say. Every payment received is RECEIVED. An online
+# payment that did not end in money is FAILED (tried and declined), CANCELLED (the payer
+# closed Razorpay's window), still IN_PROGRESS, or ABANDONED: left open past the time a
+# Razorpay window stays up, with the page never reporting back.
+RECEIVED, IN_PROGRESS, FAILED, CANCELLED, ABANDONED, REFUNDED = (
+    "RECEIVED", "IN_PROGRESS", "FAILED", "CANCELLED", "ABANDONED", "REFUNDED",
 )
-TRANSACTION_STATUSES = (RECEIVED, IN_PROGRESS, FAILED, ABANDONED, REFUNDED)
+TRANSACTION_STATUSES = (RECEIVED, IN_PROGRESS, FAILED, CANCELLED, ABANDONED, REFUNDED)
+# How long an open attempt reads as in progress. The recovery check keeps asking Razorpay for
+# days regardless, so a payment that lands late still moves to RECEIVED.
+IN_PROGRESS_FOR = timedelta(minutes=30)
 
 
 def _attempt_status(intent: dict, now: datetime) -> str:
     state = intent.get("status")
-    if state in (PaymentIntentStatus.FAILED.value, PaymentIntentStatus.CANCELLED.value):
+    if state == PaymentIntentStatus.FAILED.value:
         return FAILED
+    if state == PaymentIntentStatus.CANCELLED.value:
+        return CANCELLED
     if state == PaymentIntentStatus.REFUNDED.value:
         return REFUNDED
     try:
         started = datetime.fromisoformat(str(intent.get("created_at")))
     except ValueError:
         return IN_PROGRESS
-    return ABANDONED if now - started > billing.RECOVERY_WINDOW else IN_PROGRESS
+    return ABANDONED if now - started > IN_PROGRESS_FOR else IN_PROGRESS
 
 
 def transactions_report(from_date: date, to_date: date, academic_year_id=None,
@@ -962,6 +971,7 @@ def transactions_report(from_date: date, to_date: date, academic_year_id=None,
                 "source": "INVOICE",
                 "receipt_id": None,
                 "invoice_id": intent.get("invoice_id"),
+                "payment_index": None,
                 "invoice_number": intent.get("invoice_number") or invoice.get("invoice_number"),
                 "bill_numbers": bills or [n for n in [invoice.get("invoice_number")] if n],
                 "receipt_number": None,

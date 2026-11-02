@@ -1541,7 +1541,8 @@ def settle_intent(intent: dict, status: str, provider_reference: str | None = No
     This is the part of a gateway integration that cannot be added afterwards - by the time
     duplicates are noticed, the double-credited invoices are already reconciled.
     """
-    if intent.get("status") in TERMINAL_INTENT_STATES:
+    if intent.get("status") in TERMINAL_INTENT_STATES and not (
+            status == PaymentIntentStatus.SUCCEEDED.value and reopenable(intent)):
         logger.info("Intent %s is already %s; ignoring a repeat callback.",
                     intent["id"], intent["status"])
         return intent
@@ -1764,7 +1765,7 @@ def recover_razorpay_intent(intent: dict) -> dict | None:
     the sweep share this one path. An authorised payment is captured first, as on the page.
     Returns None when the order has no successful payment yet.
     """
-    if intent.get("status") in TERMINAL_INTENT_STATES or \
+    if (intent.get("status") in TERMINAL_INTENT_STATES and not reopenable(intent)) or \
             (intent.get("provider") or "").lower() != "razorpay" or not intent.get("provider_reference"):
         return None
     order_id = str(intent["provider_reference"])
@@ -1790,13 +1791,52 @@ def recover_razorpay_intent(intent: dict) -> dict | None:
     )
 
 
+def reopenable(intent: dict) -> bool:
+    """
+    Closed by the payer without paying, yet still able to take money: a UPI request can be
+    approved in the app after Razorpay's window has closed. Such an attempt stays open to
+    the webhook and the recovery check, so money that arrives late is still credited.
+    """
+    return intent.get("status") in (PaymentIntentStatus.CANCELLED.value, PaymentIntentStatus.FAILED.value) \
+        and bool((intent.get("provider_payload") or {}).get("closed_by_payer"))
+
+
+def close_razorpay_intent(intent: dict, failure_reason: str | None = None) -> dict:
+    """
+    The payer closed Razorpay's window without finishing: the attempt is CANCELLED, or FAILED
+    with Razorpay's own reason when a payment was tried and declined. Razorpay is asked
+    first, so a payment that went through after all is credited instead of cancelled.
+    """
+    if (intent.get("provider") or "").lower() != "razorpay":
+        raise HTTPException(status_code=400, detail="This payment was not started online.")
+    if intent.get("status") in TERMINAL_INTENT_STATES:
+        return {**intent, "reference": intent_reference(intent["id"])}
+    try:
+        credited = recover_razorpay_intent(intent)
+        if credited:
+            return credited
+    except razorpay.RazorpayError as exc:
+        logger.warning("Intent %s closed without asking Razorpay: %s", intent["id"], exc)
+    reason = (failure_reason or "").strip()[:300]
+    return settle_intent(
+        intent,
+        PaymentIntentStatus.FAILED.value if reason else PaymentIntentStatus.CANCELLED.value,
+        None,
+        {**(intent.get("provider_payload") or {}), "order_id": intent.get("provider_reference"),
+         "closed_by_payer": True},
+        failure_reason=reason or "Closed before paying.",
+    )
+
+
 def _open_razorpay_intents() -> list[dict]:
     found = []
     for status in (PaymentIntentStatus.CREATED.value, PaymentIntentStatus.REQUIRES_ACTION.value,
-                   PaymentIntentStatus.PROCESSING.value):
+                   PaymentIntentStatus.PROCESSING.value, PaymentIntentStatus.CANCELLED.value,
+                   PaymentIntentStatus.FAILED.value):
         found.extend(firestore_payment_intents.query_documents("status", "==", status))
     return [i for i in found if (i.get("provider") or "").lower() == "razorpay"
-            and i.get("provider_reference")]
+            and i.get("provider_reference")
+            and (i.get("status") not in TERMINAL_INTENT_STATES or reopenable(i))]
 
 
 def recover_razorpay_payments() -> dict:
@@ -1842,7 +1882,7 @@ def apply_razorpay_event(event: dict) -> dict:
     if not order_id:
         return {"ok": True, "ignored": "no order"}
     intents = [i for i in firestore_payment_intents.query_documents("provider_reference", "==", order_id)
-               if i.get("status") not in TERMINAL_INTENT_STATES]
+               if i.get("status") not in TERMINAL_INTENT_STATES or reopenable(i)]
     if not intents:
         # An admission payment link makes its own order; that one is handled by its event.
         return {"ok": True, "ignored": "no open fee payment for this order"}

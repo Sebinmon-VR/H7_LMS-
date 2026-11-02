@@ -661,6 +661,11 @@ class PaymentQuote(BaseModel):
     rate_fetched_at: datetime | str | None = None
 
 
+class IntentClose(BaseModel):
+    """The payer closed Razorpay's window: with Razorpay's reason when a payment was declined."""
+    failure_reason: str | None = Field(None, max_length=300)
+
+
 class RazorpayConfirm(BaseModel):
     """What Razorpay Checkout hands the browser after a payment."""
     razorpay_order_id: str = Field(..., max_length=64)

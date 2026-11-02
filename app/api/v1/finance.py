@@ -40,6 +40,7 @@ from app.schemas.finance import (
     ExtraItemsAdd,
     InvoiceIssue,
     IssueLeftOff,
+    IntentClose,
     RazorpayConfirm,
     PaymentQuote,
 )
@@ -745,6 +746,19 @@ def confirm_razorpay_payment(
     ))
 
 
+@admin_router.post("/intents/{intent_id}/close", response_model=PaymentIntentOut)
+def close_razorpay_payment(
+    intent_id: int, payload: IntentClose, _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Razorpay's window was closed at the counter without paying: the attempt is
+    cancelled (or failed, with Razorpay's reason). A payment that went through after all is
+    credited instead.
+    """
+    intent = billing.require_intent(intent_id)
+    return PaymentIntentOut(**billing.close_razorpay_intent(intent, payload.failure_reason))
+
+
 @admin_router.post("/intents/{intent_id}/callback", response_model=PaymentIntentOut)
 def gateway_callback(
     intent_id: int, payload: GatewayCallback, _: UserOut = Depends(require_admin),
@@ -1139,6 +1153,17 @@ def confirm_my_razorpay_payment(
     ))
 
 
+@student_router.post("/me/intents/{intent_id}/close", response_model=PaymentIntentOut)
+def close_my_razorpay_payment(
+    intent_id: int, payload: IntentClose, student: UserOut = Depends(require_student),
+):
+    """[Student] I closed Razorpay's window without paying (or my payment was declined)."""
+    intent = billing.require_intent(intent_id)
+    if int(intent.get("student_id") or -1) != int(student.id):
+        raise HTTPException(status_code=404, detail=f"Payment intent {intent_id} not found")
+    return PaymentIntentOut(**billing.close_razorpay_intent(intent, payload.failure_reason))
+
+
 @student_router.get("/me/invoices/{invoice_id}/intents", response_model=List[PaymentIntentOut])
 def my_payment_attempts(invoice_id: str, student: UserOut = Depends(require_student)):
     """[Student] Every payment I have started on this invoice, newest first, failures included."""
@@ -1217,6 +1242,20 @@ def confirm_child_razorpay_payment(
     return PaymentIntentOut(**billing.confirm_razorpay(
         intent, payload.razorpay_order_id, payload.razorpay_payment_id, payload.razorpay_signature,
     ))
+
+
+@parent_router.post("/children/{student_id}/intents/{intent_id}/close",
+                    response_model=PaymentIntentOut)
+def close_child_razorpay_payment(
+    student_id: int, intent_id: int, payload: IntentClose,
+    parent: UserOut = Depends(require_parent),
+):
+    """[Parent] Razorpay's window was closed without paying (or the payment was declined)."""
+    family_service.assert_may_view(parent, student_id, "fees")
+    intent = billing.require_intent(intent_id)
+    if int(intent.get("student_id") or -1) != int(student_id):
+        raise HTTPException(status_code=404, detail=f"Payment intent {intent_id} not found")
+    return PaymentIntentOut(**billing.close_razorpay_intent(intent, payload.failure_reason))
 
 
 @parent_router.get("/children/{student_id}/invoices/{invoice_id}/intents",
