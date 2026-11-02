@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, Upl
 from app.api.v1.dependencies import require_admin
 from app.core import acs
 from app.core import mailer
+from app.core import razorpay
 from app.core.concurrency import run_parallel
 from app.core.config import settings
 from app.core.enums import (
@@ -1730,7 +1731,7 @@ def get_integration_status(
     [Admin Only] Health and configuration of the Azure integrations.
 
     This is the endpoint to open when uploads land on local disk, a class cannot be joined,
-    or email does not arrive. Each section reports `ok` (when probed) plus a `detail` naming
+    email does not arrive, or online payment stops (Razorpay's test keys change often). Each section reports `ok` (when probed) plus a `detail` naming
     the exact misconfiguration. No secrets are returned.
     """
     storage = storage_service.check_access() if probe else storage_service.describe()
@@ -1754,6 +1755,7 @@ def get_integration_status(
             ),
         },
         "email": {**mailer.describe(), "ok": mailer.is_configured()},
+        "payments": razorpay.check_access() if probe else razorpay.describe(),
         "probed": probe,
     }
 

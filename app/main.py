@@ -44,6 +44,7 @@ from app.api.v1.finance import (
     admin_router as finance_admin_router,
     parent_router as parent_fees_router,
     student_router as student_fees_router,
+    webhook_router as payments_webhook_router,
 )
 from app.api.v1.support import (
     admin_router as support_admin_router,
@@ -358,6 +359,7 @@ app.include_router(notices_router, prefix=settings.API_V1_STR)
 app.include_router(finance_admin_router, prefix=settings.API_V1_STR)
 app.include_router(student_fees_router, prefix=settings.API_V1_STR)
 app.include_router(parent_fees_router, prefix=settings.API_V1_STR)
+app.include_router(payments_webhook_router, prefix=settings.API_V1_STR)
 app.include_router(live_classes_router, prefix=settings.API_V1_STR)
 app.include_router(extra_classes_router, prefix=settings.API_V1_STR)
 app.include_router(calendar_router, prefix=settings.API_V1_STR)

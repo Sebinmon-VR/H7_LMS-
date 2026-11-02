@@ -1,12 +1,13 @@
 """
 Fee administration, billing, and the payment page.
 
-Three routers:
+Four routers:
 
   * `/admin/finance/...` - the bursar's screens: heads, structures, instalment plans,
     discount rules, the charges-and-tax settings, and invoicing.
   * `/fees/...`          - a student's own fees.
   * `/parent/fees/...`   - the same, for a linked parent who is permitted to see them.
+  * `/payments/...`      - Razorpay's webhook. No login: its signature is the credential.
 
 The last two are thin wrappers over `finance.compute_breakdown` and
 `billing.present_invoice`, deliberately. The figure a parent sees and the figure the bursar
@@ -17,7 +18,8 @@ the one who notices.
 from datetime import date
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from starlette.concurrency import run_in_threadpool
 
 from app.api.v1.dependencies import (
     require_admin, require_roles, require_student,
@@ -46,6 +48,7 @@ from app.services import families as family_service
 from app.services import finance
 from app.services import finance_reports as reports
 from app.services import receipts as receipt_service
+from app.services import razorpay_webhook
 from app.services.tuition.settings_store import (
     currency_settings, finance_settings, save_currency_settings, save_settings,
 )
@@ -53,8 +56,20 @@ from app.services.tuition.settings_store import (
 admin_router = APIRouter(prefix="/admin/finance", tags=["Finance (Admin)"])
 student_router = APIRouter(prefix="/fees", tags=["Fees (Student)"])
 parent_router = APIRouter(prefix="/parent/fees", tags=["Fees (Parent)"])
+webhook_router = APIRouter(prefix="/payments", tags=["Payments"])
 
 require_parent = require_roles([UserRole.PARENT, UserRole.ADMIN])
+
+
+@webhook_router.post("/razorpay/webhook", include_in_schema=False)
+async def razorpay_webhook_event(request: Request):
+    """
+    Every Razorpay event, verified by RAZORPAY_WEBHOOK_SECRET: a fee paid whose page never
+    reported back is credited here, and an admission payment link confirms itself.
+    """
+    body = await request.body()
+    return await run_in_threadpool(
+        razorpay_webhook.handle, body, request.headers.get("x-razorpay-signature"))
 
 
 # ---------------------------------------------------------------------------------------
@@ -884,9 +899,32 @@ def fee_collections_report(
     )
 
 
+@admin_router.get("/reports/transactions")
+def fee_transactions_report(
+    from_date: date = Query(..., description="First day of the period."),
+    to_date: date = Query(..., description="Last day of the period."),
+    academic_year_id: Optional[int] = Query(None, description="Any year when omitted."),
+    class_id: Optional[int] = Query(None),
+    method: Optional[str] = Query(None, description="CASH | BANK_TRANSFER | CHEQUE | CARD | UPI | ONLINE | ADJUSTMENT | OTHER"),
+    status_filter: Optional[str] = Query(
+        None, alias="status", description="RECEIVED | IN_PROGRESS | FAILED | ABANDONED | REFUNDED",
+    ),
+    program: Program = Query(Program.LMS),
+    _: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Every transaction in the period: each payment received with the fees it
+    credited, the tax and payment charges paid on top and what Razorpay kept, and each online
+    payment that failed, is still open or was abandoned. Totals per currency paid in.
+    """
+    return reports.transactions_report(
+        from_date, to_date, academic_year_id, program.value, class_id, method, status_filter,
+    )
+
+
 @admin_router.get("/reports/export")
 def fee_reports_export(
-    view: str = Query("students", description="students | dues | collections"),
+    view: str = Query("students", description="students | dues | collections | transactions"),
     academic_year_id: Optional[int] = Query(None),
     class_id: Optional[int] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
@@ -899,7 +937,7 @@ def fee_reports_export(
     _: UserOut = Depends(require_admin),
 ):
     """
-    [Admin Only] The same three reports as CSV, with the same filters.
+    [Admin Only] The same four reports as CSV, with the same filters.
 
     UTF-8 with a BOM so Excel on Windows renders names correctly rather than mangling them.
     """
@@ -912,6 +950,14 @@ def fee_reports_export(
         )
         body = reports.collections_csv(report)
         name = f"fee-collections-{from_date}-to-{to_date}.csv"
+    elif choice == "transactions":
+        if not from_date or not to_date:
+            raise HTTPException(status_code=400, detail="from_date and to_date are required.")
+        report = reports.transactions_report(
+            from_date, to_date, academic_year_id, program.value, class_id, method, status_filter,
+        )
+        body = reports.transactions_csv(report)
+        name = f"fee-transactions-{from_date}-to-{to_date}.csv"
     elif choice == "dues":
         report = reports.dues_report(academic_year_id, program.value, class_id, as_of)
         body = reports.roll_csv(report)
@@ -921,7 +967,8 @@ def fee_reports_export(
         body = reports.roll_csv(report)
         name = f"fee-students-{report['as_of']}.csv"
     else:
-        raise HTTPException(status_code=400, detail="view must be one of: students, dues, collections.")
+        raise HTTPException(status_code=400,
+                            detail="view must be one of: students, dues, collections, transactions.")
 
     return Response(
         content="\ufeff" + body,

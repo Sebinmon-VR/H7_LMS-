@@ -1,7 +1,7 @@
 """
 School fee reports: who owes what, who has paid, and what came in.
 
-Three views over the same records, because three different people ask:
+Four views over the same records, because different people ask:
 
   * the **student roll** - every student in the year with where their bill stands, billed
     or not. The office's working list.
@@ -12,6 +12,9 @@ Three views over the same records, because three different people ask:
     gets reconciled against the cash book and the bank. Opening-balance receipts - fees
     paid before this system existed, entered afterwards - are listed alongside, flagged by
     `source`, because the cash book is not complete without them.
+  * the **transactions** - the same payments with what the payer handed over beside the
+    fees (tax, payment charges, another currency) and what Razorpay kept, plus every online
+    payment that did not end in money. What is read against the Razorpay dashboard.
 
 Nothing here is stored. Each report is computed from the invoices and the roster at the
 moment it is asked for, so it cannot disagree with the invoice screen - and a student who
@@ -25,10 +28,12 @@ from datetime import date, datetime
 
 from fastapi import HTTPException
 
-from app.core.enums import InstalmentStatus, InvoiceStatus, Program
+from app.core.enums import (
+    InstalmentStatus, InvoiceStatus, PaymentIntentStatus, PaymentMethod, Program,
+)
 from app.core.firebase import (
     firestore_classes, firestore_fee_heads, firestore_fee_invoices, firestore_fee_receipts,
-    firestore_users,
+    firestore_payment_intents, firestore_users,
 )
 from app.services import admissions as admission_service
 from app.services import billing, finance
@@ -563,6 +568,34 @@ def payment_receipt(invoice: dict, index: int) -> dict:
     }
 
 
+def _charges(payment: dict, amount: float, currency: str) -> dict:
+    """
+    What the payer handed over for a payment beside the fees it credited: the currency paid
+    in, tax added on top, and the payment charges (the gateway's fee and any convenience
+    charge), as frozen on the payment when it was taken. One with none of these was paid
+    exactly as billed.
+    """
+    if not payment.get("paid_currency"):
+        return {
+            "paid_currency": currency, "paid_amount": amount, "paid_fee_amount": amount,
+            "tax_label": None, "tax_percent": None, "tax_amount": 0.0,
+            "charges_amount": 0.0, "charges_label": None, "exchange_rate": 1.0,
+        }
+    convenience = money(payment.get("paid_convenience_amount"))
+    return {
+        "paid_currency": payment["paid_currency"],
+        "paid_amount": money(payment.get("paid_amount")),
+        "paid_fee_amount": money(payment.get("paid_fee_amount")),
+        "tax_label": payment.get("paid_tax_label"),
+        "tax_percent": payment.get("paid_tax_percent"),
+        "tax_amount": money(payment.get("paid_tax_amount")),
+        "charges_amount": money(money(payment.get("paid_gateway_fee")) + convenience),
+        "charges_label": payment.get("paid_gateway_fee_label")
+        or ("Convenience charge" if convenience else None),
+        "exchange_rate": payment.get("exchange_rate"),
+    }
+
+
 def collections_report(from_date: date, to_date: date, academic_year_id=None,
                        program: str = Program.LMS.value, class_id=None,
                        method: str | None = None, head_id=None) -> dict:
@@ -664,6 +697,7 @@ def collections_report(from_date: date, to_date: date, academic_year_id=None,
                 "class_name": class_name,
                 "recorded_by": payment.get("recorded_by"),
                 "recorded_by_name": clerk.get("full_name"),
+                **_charges(payment, money(payment.get("amount")), invoice.get("currency") or currency),
             })
 
     # Money with no invoice on this system: fees paid before it existed, entered afterwards
@@ -722,6 +756,7 @@ def collections_report(from_date: date, to_date: date, academic_year_id=None,
             "class_name": class_name_of(enrolled_class),
             "recorded_by": receipt.get("recorded_by"),
             "recorded_by_name": clerk.get("full_name"),
+            **_charges({}, amount, receipt.get("currency") or currency),
         })
 
     rows.sort(key=lambda r: str(r["paid_at"]), reverse=True)
@@ -783,6 +818,198 @@ def collections_report(from_date: date, to_date: date, academic_year_id=None,
             "by_method": by_method,
             "by_day": sorted(by_day.values(), key=lambda d: d["date"]),
             "by_class": sorted(by_class.values(), key=lambda c: -c["total"]),
+        },
+        "rows": rows,
+    }
+
+
+# What a transaction's status column can say. Every payment received is RECEIVED; an online
+# payment that did not end in money is FAILED, still IN_PROGRESS, or ABANDONED once the
+# safety net has stopped asking Razorpay about it.
+RECEIVED, IN_PROGRESS, FAILED, ABANDONED, REFUNDED = (
+    "RECEIVED", "IN_PROGRESS", "FAILED", "ABANDONED", "REFUNDED",
+)
+TRANSACTION_STATUSES = (RECEIVED, IN_PROGRESS, FAILED, ABANDONED, REFUNDED)
+
+
+def _attempt_status(intent: dict, now: datetime) -> str:
+    state = intent.get("status")
+    if state in (PaymentIntentStatus.FAILED.value, PaymentIntentStatus.CANCELLED.value):
+        return FAILED
+    if state == PaymentIntentStatus.REFUNDED.value:
+        return REFUNDED
+    try:
+        started = datetime.fromisoformat(str(intent.get("created_at")))
+    except ValueError:
+        return IN_PROGRESS
+    return ABANDONED if now - started > billing.RECOVERY_WINDOW else IN_PROGRESS
+
+
+def transactions_report(from_date: date, to_date: date, academic_year_id=None,
+                        program: str = Program.LMS.value, class_id=None,
+                        method: str | None = None, status: str | None = None) -> dict:
+    """
+    Every transaction in a period, newest first: each payment received - at the counter,
+    online, or entered from before this system - with the fees it credited and the charges
+    paid on top, and each online payment that did not end in money.
+
+    The received rows are the collections report's own, so the two never disagree about
+    what came in. An online one is joined to its gateway attempt by the payment id, which
+    adds the order, how it was paid (UPI, card), what Razorpay kept, and whether the safety
+    net credited it rather than the payer's page. Totals are kept per currency paid in:
+    rupees and dirhams are never added together.
+    """
+    if to_date < from_date:
+        raise HTTPException(status_code=400, detail="to_date cannot be earlier than from_date.")
+    program = str(program).upper()
+    wanted_method = method.strip().upper() if method else None
+    wanted_status = status.strip().upper() if status else None
+    if wanted_status and wanted_status not in TRANSACTION_STATUSES:
+        raise HTTPException(status_code=400,
+                            detail=f"status must be one of: {', '.join(TRANSACTION_STATUSES)}.")
+    received = collections_report(from_date, to_date, academic_year_id, program, class_id, method)
+
+    attempts = [i for i in firestore_payment_intents.list_all()
+                if str(i.get("program") or Program.LMS.value).upper() == program and i.get("provider")]
+    by_payment = {}
+    for intent in attempts:
+        if intent.get("status") == PaymentIntentStatus.SUCCEEDED.value:
+            paid = (intent.get("provider_payload") or {}).get("payment_id") or intent.get("provider_reference")
+            if paid:
+                by_payment[str(paid)] = intent
+
+    rows = []
+    for row in received["rows"]:
+        online = row["method"] == PaymentMethod.ONLINE.value
+        intent = by_payment.get(str(row.get("reference") or "")) if online else None
+        payload = (intent or {}).get("provider_payload") or {}
+        kept = payload.get("razorpay_fee")
+        rows.append({
+            **{k: v for k, v in row.items() if k not in ("heads", "instalments_settled")},
+            "status": RECEIVED,
+            "channel": "PAST" if row["source"] != "INVOICE" else ("ONLINE" if online else "COUNTER"),
+            "against": ", ".join(h["name"] for h in row["heads"]) or row.get("instalment_label"),
+            "provider": (intent or {}).get("provider"),
+            "order_id": payload.get("order_id"),
+            "paid_by": payload.get("method"),
+            "razorpay_fee": kept,
+            "razorpay_tax": payload.get("razorpay_tax"),
+            "net_amount": money(row["paid_amount"] - kept) if kept is not None else None,
+            "recovered": bool(payload.get("recovered")),
+            "failure_reason": None,
+        })
+
+    if wanted_method in (None, PaymentMethod.ONLINE.value):
+        now = datetime.utcnow()
+        invoices: dict[str, dict] = {}
+        people: dict[int, dict] = {}
+        for intent in attempts:
+            if intent.get("status") == PaymentIntentStatus.SUCCEEDED.value:
+                continue
+            started = _as_date(intent.get("created_at"))
+            if started is None or started < from_date or started > to_date:
+                continue
+            key = str(intent.get("invoice_id"))
+            if key not in invoices:
+                invoices[key] = firestore_fee_invoices.get_document(key) or {}
+            invoice = invoices[key]
+            if academic_year_id is not None and str(invoice.get("academic_year_id")) != str(academic_year_id):
+                continue
+            student_id = int(intent.get("student_id") or invoice.get("student_id") or 0)
+            enrolled_class, _ = admission_service._class_of_student(student_id)
+            if class_id is not None and enrolled_class != int(class_id):
+                continue
+            if student_id not in people:
+                people[student_id] = firestore_users.get_document(str(student_id)) or {}
+            student = people[student_id]
+            charge = intent.get("charge") or {}
+            bill_currency = intent.get("currency") or received["currency"]
+            labels = [a.get("label") for a in intent.get("allocations") or [] if a.get("label")]
+            rows.append({
+                "paid_at": intent.get("created_at"),
+                "paid_on": started.isoformat(),
+                "amount": money(intent.get("amount")),
+                "currency": bill_currency,
+                "method": PaymentMethod.ONLINE.value,
+                "reference": intent.get("provider_reference"),
+                "note": None,
+                "instalment_label": intent.get("instalment_label"),
+                "admission_fee_amount": 0.0,
+                "source": "INVOICE",
+                "receipt_id": None,
+                "invoice_id": intent.get("invoice_id"),
+                "invoice_number": intent.get("invoice_number") or invoice.get("invoice_number"),
+                "receipt_number": None,
+                "academic_year_id": invoice.get("academic_year_id"),
+                "student_id": student_id,
+                "student_name": student.get("full_name"),
+                "admission_number": student.get("admission_number"),
+                "class_id": enrolled_class,
+                "class_name": (firestore_classes.get_document(str(enrolled_class)) or {}).get("name")
+                if enrolled_class is not None else None,
+                "recorded_by": intent.get("initiated_by"),
+                "recorded_by_name": None,
+                "paid_currency": charge.get("currency") or bill_currency,
+                "paid_amount": money(charge.get("total", intent.get("amount"))),
+                "paid_fee_amount": money(charge.get("fee_amount", intent.get("amount"))),
+                "tax_label": charge.get("tax_label"),
+                "tax_percent": charge.get("tax_percent"),
+                "tax_amount": money(charge.get("tax_amount")),
+                "charges_amount": money(money(charge.get("gateway_fee")) + money(charge.get("convenience_amount"))),
+                "charges_label": charge.get("gateway_fee_label"),
+                "exchange_rate": charge.get("exchange_rate"),
+                "status": _attempt_status(intent, now),
+                "channel": "ONLINE",
+                "against": ", ".join(labels) or intent.get("instalment_label"),
+                "provider": intent.get("provider"),
+                "order_id": intent.get("provider_reference"),
+                "paid_by": None,
+                "razorpay_fee": None,
+                "razorpay_tax": None,
+                "net_amount": None,
+                "recovered": False,
+                "failure_reason": intent.get("failure_reason"),
+            })
+
+    if wanted_status:
+        rows = [r for r in rows if r["status"] == wanted_status]
+    rows.sort(key=lambda r: str(r["paid_at"]), reverse=True)
+
+    counts = {s: 0 for s in TRANSACTION_STATUSES}
+    by_currency: dict[str, dict] = {}
+    for row in rows:
+        counts[row["status"]] += 1
+        if row["status"] != RECEIVED:
+            continue
+        bucket = by_currency.setdefault(row["paid_currency"], {
+            "currency": row["paid_currency"], "count": 0, "fees": 0.0, "tax": 0.0,
+            "charges": 0.0, "total": 0.0, "razorpay_fee": 0.0, "razorpay_fee_unknown": 0,
+        })
+        bucket["count"] += 1
+        bucket["fees"] = money(bucket["fees"] + row["paid_fee_amount"])
+        bucket["tax"] = money(bucket["tax"] + row["tax_amount"])
+        bucket["charges"] = money(bucket["charges"] + row["charges_amount"])
+        bucket["total"] = money(bucket["total"] + row["paid_amount"])
+        if row["razorpay_fee"] is not None:
+            bucket["razorpay_fee"] = money(bucket["razorpay_fee"] + row["razorpay_fee"])
+        elif row["channel"] == "ONLINE":
+            # Paid before Razorpay's own fee was recorded on settlement: shown, not guessed.
+            bucket["razorpay_fee_unknown"] += 1
+    for bucket in by_currency.values():
+        bucket["net"] = money(bucket["total"] - bucket["razorpay_fee"])
+
+    return {
+        "from_date": from_date.isoformat(),
+        "to_date": to_date.isoformat(),
+        "academic_year_id": int(academic_year_id) if academic_year_id is not None else None,
+        "class_id": int(class_id) if class_id is not None else None,
+        "method": wanted_method,
+        "status": wanted_status,
+        "currency": received["currency"],
+        "summary": {
+            "counts": counts,
+            "credited": money(sum(r["amount"] for r in rows if r["status"] == RECEIVED)),
+            "by_currency": sorted(by_currency.values(), key=lambda b: -b["total"]),
         },
         "rows": rows,
     }
@@ -867,3 +1094,28 @@ def collections_csv(report: dict) -> str:
             r["recorded_by_name"] or r["recorded_by"], r["note"], r.get("source"),
         ]])
     return _write(rows, COLLECTIONS_HEADER + head_names + COLLECTIONS_TAIL)
+
+
+TRANSACTIONS_HEADER = [
+    "Date", "Status", "Channel", "Method", "Paid By", "Student ID", "Student",
+    "Admission Number", "Class", "Invoice Number", "Receipt Number", "Against", "Reference",
+    "Order", "Bill Currency", "Credited To Bill", "Paid In", "Fees", "Tax", "Tax Amount",
+    "Payment Charges", "Charges Amount", "Total Paid", "Razorpay Fee", "Razorpay GST",
+    "Net To Bank", "Credited By Safety Net", "Failure Reason", "Recorded By", "Note",
+]
+
+
+def transactions_csv(report: dict) -> str:
+    rows = []
+    for r in report["rows"]:
+        tax = f"{r['tax_label']} {r['tax_percent']:g}%" if r.get("tax_label") and r.get("tax_percent") else r.get("tax_label")
+        rows.append([_cell(v) for v in [
+            r["paid_at"], r["status"], r["channel"], r["method"], r["paid_by"], r["student_id"],
+            r["student_name"], r["admission_number"], r["class_name"], r["invoice_number"],
+            r["receipt_number"], r["against"], r["reference"], r["order_id"], r["currency"],
+            r["amount"], r["paid_currency"], r["paid_fee_amount"], tax, r["tax_amount"],
+            r["charges_label"], r["charges_amount"], r["paid_amount"], r["razorpay_fee"],
+            r["razorpay_tax"], r["net_amount"], r["recovered"] if r["channel"] == "ONLINE" else None,
+            r["failure_reason"], r["recorded_by_name"] or r["recorded_by"], r["note"],
+        ]])
+    return _write(rows, TRANSACTIONS_HEADER)

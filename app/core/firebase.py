@@ -1206,6 +1206,10 @@ firestore_fee_receipts = _service("fee_receipts")
 # Gateway payment attempts, most of which fail or are abandoned. Never cached, and kept out
 # of the invoice's own payments list so a failed attempt never reaches a receipt.
 firestore_payment_intents = _service("payment_intents")
+# One document per intent credited, created atomically before the money is recorded. The
+# payer's page, Razorpay's webhook and the recovery sweep can all report the same payment at
+# once; whichever creates this document credits it, and the others stand down.
+firestore_payment_claims = _service("payment_claims")
 
 # ---------------------------------------------------------------------------------------
 # Approval workflows and coursework

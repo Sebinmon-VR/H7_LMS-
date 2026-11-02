@@ -13,6 +13,7 @@ from datetime import date
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
+from starlette.concurrency import run_in_threadpool
 
 from app.api.v1.dependencies import require_admin
 from app.core.enums import AdmissionRequestStatus, Program
@@ -26,6 +27,7 @@ from app.schemas.admission import (
 from app.schemas.user import UserOut
 from app.services import admission_pipeline as pipeline
 from app.services import admission_requests as service
+from app.services import razorpay_webhook as razorpay_webhook_service
 
 # The path prefix the public-CORS handling in `app.main` keys on. Anything under it answers
 # to any origin; nothing under it requires or reads a token.
@@ -160,9 +162,13 @@ def check_admission_payment(token: str):
 
 @public_router.post("/payments/razorpay/webhook", include_in_schema=False)
 async def razorpay_webhook(request: Request):
-    """Razorpay's `payment_link.paid`, verified by RAZORPAY_WEBHOOK_SECRET."""
+    """
+    The first address given to Razorpay, kept so a webhook already set up there still works.
+    New set-ups use /payments/razorpay/webhook; both take every event.
+    """
     body = await request.body()
-    return pipeline.handle_razorpay_webhook(body, request.headers.get("x-razorpay-signature"))
+    return await run_in_threadpool(
+        razorpay_webhook_service.handle, body, request.headers.get("x-razorpay-signature"))
 
 
 # ---------------------------------------------------------------------------------------

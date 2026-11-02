@@ -489,6 +489,18 @@ def sweep(reference: datetime | None = None) -> dict:
         log_backend_failure(logger, "Exam auto-publish failed", exc)
         result["errors"].append(f"exam_auto_publish: {exc}")
 
+    # Online fee payments the payer's page never reported back (tab closed, signal lost) are
+    # read back from Razorpay and credited. Claimed per payment, so every worker may run it.
+    try:
+        from app.services import billing
+
+        recovery = billing.recover_razorpay_payments()
+        result["payments_recovered"] = recovery["recovered"]
+        result["errors"].extend(f"payments: {error}" for error in recovery["errors"])
+    except Exception as exc:  # pragma: no cover
+        log_backend_failure(logger, "Payment recovery failed", exc)
+        result["errors"].append(f"payments: {exc}")
+
     return result
 
 

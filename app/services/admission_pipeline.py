@@ -888,19 +888,9 @@ def _apply_gateway_link(request: dict, link: dict) -> tuple[dict, bool]:
     return merged, True
 
 
-def handle_razorpay_webhook(body: bytes, signature: str | None) -> dict:
-    """The `payment_link.paid` event, trusted only with a valid signature."""
-    import json
-
-    if not razorpay.verify_webhook(body, signature):
-        raise HTTPException(status_code=400, detail="Invalid signature")
-    try:
-        event = json.loads(body.decode("utf-8"))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid body") from exc
-    if event.get("event") != "payment_link.paid":
-        return {"ok": True, "ignored": event.get("event")}
-    link = ((event.get("payload") or {}).get("payment_link") or {}).get("entity") or {}
+def apply_payment_link_paid(event: dict) -> dict:
+    """The `payment_link.paid` event. Its signature is checked in `razorpay_webhook`."""
+    link =((event.get("payload") or {}).get("payment_link") or {}).get("entity") or {}
     request_id = (link.get("notes") or {}).get("request_id")
     if not request_id:
         return {"ok": True, "ignored": "no request id"}

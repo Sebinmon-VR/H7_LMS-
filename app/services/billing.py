@@ -35,7 +35,8 @@ from app.core.enums import (
     PaymentMethod, Program, TERMINAL_INTENT_STATES,
 )
 from app.core.firebase import (
-    firestore_fee_invoices, firestore_payment_intents, firestore_users, require_document,
+    firestore_fee_invoices, firestore_payment_claims, firestore_payment_intents, firestore_users,
+    require_document,
 )
 from app.services import admissions as admission_service
 from app.services import finance
@@ -1364,6 +1365,14 @@ def create_intent(invoice: dict, amount: float, actor_id: int | None = None,
     offline = method in OFFLINE_GATEWAY_METHODS
     use_razorpay = not offline and razorpay.is_configured()
     charge = payment_quote(amount, currency, program, invoice.get("currency"), online=use_razorpay)
+    if use_razorpay:
+        charged_in = charge.get("currency") or invoice.get("currency") or config["currency"]
+        if razorpay.to_minor(charge.get("total", amount), charged_in) < razorpay.MIN_ORDER_MINOR:
+            raise HTTPException(
+                status_code=400,
+                detail=f"An online payment must be at least {charged_in} "
+                       f"{razorpay.from_minor(razorpay.MIN_ORDER_MINOR, charged_in):.2f}.",
+            )
 
     intent_id = firestore_payment_intents.get_next_numeric_id()
     document = {
@@ -1434,6 +1443,16 @@ def settle_intent(intent: dict, status: str, provider_reference: str | None = No
         logger.info("Intent %s is already %s; ignoring a repeat callback.",
                     intent["id"], intent["status"])
         return intent
+
+    # The check above reads a copy, so two reports of one payment arriving together (the
+    # payer's page and Razorpay's webhook, seconds apart) would both pass it. The claim is
+    # atomic: one of them credits the bill, the other returns what is being recorded.
+    if status == PaymentIntentStatus.SUCCEEDED.value and not firestore_payment_claims.create_document(
+            f"intent:{intent['id']}", {"at": _now(), "provider_reference": provider_reference}):
+        logger.info("Intent %s is already being credited; standing down.", intent["id"])
+        current = firestore_payment_intents.get_document(str(intent["id"])) or intent
+        return {**intent, **current, "id": intent["id"], "status": status,
+                "reference": intent_reference(intent["id"])}
 
     updates = {
         "status": status,
@@ -1521,6 +1540,15 @@ def _razorpay_checkout(invoice: dict, intent: dict, program: str) -> dict:
             "failure_reason": str(exc),
             "completed_at": _now(),
         })
+        if isinstance(exc, razorpay.RazorpayKeysRejected):
+            # 503, not Razorpay's 401: the app reads a 401 as the payer's own session ending
+            # and would sign them out in the middle of paying.
+            logger.error("Online payment is down: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Online payment is not available just now. Please try again later, or "
+                       "pay at the school office.",
+            ) from exc
         charged_in = (intent.get("charge") or {}).get("currency") or intent["currency"]
         if charged_in != "INR":
             # Razorpay takes other currencies only once it has switched on international
@@ -1562,8 +1590,11 @@ def confirm_razorpay(intent: dict, order_id: str, payment_id: str, signature: st
     only printed for money the school will actually receive. Repeat calls are harmless:
     `settle_intent` ignores an intent that is already settled.
     """
-    if (intent.get("provider") or "").lower() != "razorpay" or \
-            str(intent.get("provider_reference") or "") != str(order_id or ""):
+    # Once settled, `provider_reference` holds the payment id and the order id moves to the
+    # payload. Razorpay's webhook usually settles first, so both have to count as this order.
+    orders = {str(v) for v in (intent.get("provider_reference"),
+                               (intent.get("provider_payload") or {}).get("order_id")) if v}
+    if (intent.get("provider") or "").lower() != "razorpay" or str(order_id or "") not in orders:
         raise HTTPException(status_code=400, detail="This payment does not belong to this request.")
     if not razorpay.verify_payment_signature(order_id, payment_id, signature):
         raise HTTPException(
@@ -1599,8 +1630,128 @@ def confirm_razorpay(intent: dict, order_id: str, payment_id: str, signature: st
         )
     return settle_intent(
         intent, PaymentIntentStatus.SUCCEEDED.value, payment_id,
-        {"order_id": order_id, "payment_id": payment_id, "method": payment.get("method")},
+        {"order_id": order_id, "payment_id": payment_id, "method": payment.get("method"),
+         **_razorpay_deduction(payment)},
     )
+
+
+def _razorpay_deduction(payment: dict) -> dict:
+    """What Razorpay keeps from a captured payment: its fee, GST included, and that GST."""
+    if payment.get("fee") is None:
+        return {}
+    currency = payment.get("currency") or "INR"
+    return {
+        "razorpay_fee": razorpay.from_minor(payment["fee"], currency),
+        "razorpay_tax": razorpay.from_minor(payment.get("tax") or 0, currency),
+    }
+
+
+# How long after starting a payment the sweep starts asking Razorpay about it (the payer's own
+# page reports back within seconds), and how long it keeps asking. A bank can authorise a
+# payment late, but after three days an open order is an abandoned checkout.
+RECOVERY_GRACE = timedelta(minutes=2)
+RECOVERY_WINDOW = timedelta(days=3)
+
+
+def recover_razorpay_intent(intent: dict) -> dict | None:
+    """
+    Credits an intent whose Razorpay order was paid although the payer's page never said so:
+    the tab was closed, the phone lost signal, or the app was killed straight after paying.
+
+    Razorpay is asked directly rather than trusted from a webhook body, so the webhook and
+    the sweep share this one path. An authorised payment is captured first, as on the page.
+    Returns None when the order has no successful payment yet.
+    """
+    if intent.get("status") in TERMINAL_INTENT_STATES or \
+            (intent.get("provider") or "").lower() != "razorpay" or not intent.get("provider_reference"):
+        return None
+    order_id = str(intent["provider_reference"])
+    attempts = razorpay.fetch_order_payments(order_id)
+    payment = next((p for p in attempts if p.get("status") == "captured"), None)
+    if payment is None:
+        authorised = next((p for p in attempts if p.get("status") == "authorized"), None)
+        if authorised is None:
+            return None
+        charge = intent.get("charge") or {}
+        payment = razorpay.capture_payment(
+            authorised["id"], charge.get("total", intent["amount"]),
+            charge.get("currency", intent["currency"]),
+        )
+        if payment.get("status") != "captured":
+            return None
+    logger.info("Intent %s: crediting Razorpay payment %s from Razorpay's own record.",
+                intent["id"], payment["id"])
+    return settle_intent(
+        intent, PaymentIntentStatus.SUCCEEDED.value, payment["id"],
+        {"order_id": order_id, "payment_id": payment["id"], "method": payment.get("method"),
+         "recovered": True, **_razorpay_deduction(payment)},
+    )
+
+
+def _open_razorpay_intents() -> list[dict]:
+    found = []
+    for status in (PaymentIntentStatus.CREATED.value, PaymentIntentStatus.REQUIRES_ACTION.value,
+                   PaymentIntentStatus.PROCESSING.value):
+        found.extend(firestore_payment_intents.query_documents("status", "==", status))
+    return [i for i in found if (i.get("provider") or "").lower() == "razorpay"
+            and i.get("provider_reference")]
+
+
+def recover_razorpay_payments() -> dict:
+    """
+    One pass of the safety net: asks Razorpay about every recent online payment that is
+    still open and credits those that were paid. Safe at any frequency and on every worker,
+    because crediting is claimed per intent.
+    """
+    result = {"checked": 0, "recovered": 0, "errors": []}
+    if not razorpay.is_configured():
+        return result
+    now = datetime.utcnow()
+    for intent in _open_razorpay_intents():
+        try:
+            started = datetime.fromisoformat(str(intent.get("created_at")))
+        except ValueError:
+            continue
+        if not (RECOVERY_GRACE <= now - started <= RECOVERY_WINDOW):
+            continue
+        result["checked"] += 1
+        try:
+            if recover_razorpay_intent(intent):
+                result["recovered"] += 1
+        except razorpay.RazorpayKeysRejected as exc:
+            # Every other intent would fail the same way; one log line is enough.
+            result["errors"].append(str(exc))
+            break
+        except (razorpay.RazorpayError, HTTPException) as exc:
+            result["errors"].append(f"intent {intent['id']}: {exc}")
+    if result["recovered"] or result["errors"]:
+        logger.info("Razorpay recovery: %s", result)
+    return result
+
+
+def apply_razorpay_event(event: dict) -> dict:
+    """
+    Razorpay's `order.paid`, `payment.captured` and `payment.authorized` for fee orders. The
+    signature was checked by the caller; the order is still read back from Razorpay.
+    """
+    payload = event.get("payload") or {}
+    order_id = ((payload.get("order") or {}).get("entity") or {}).get("id") \
+        or ((payload.get("payment") or {}).get("entity") or {}).get("order_id")
+    if not order_id:
+        return {"ok": True, "ignored": "no order"}
+    intents = [i for i in firestore_payment_intents.query_documents("provider_reference", "==", order_id)
+               if i.get("status") not in TERMINAL_INTENT_STATES]
+    if not intents:
+        # An admission payment link makes its own order; that one is handled by its event.
+        return {"ok": True, "ignored": "no open fee payment for this order"}
+    for intent in intents:
+        try:
+            recover_razorpay_intent(intent)
+        except razorpay.RazorpayError as exc:
+            # A 5xx makes Razorpay deliver the event again later; the sweep is the backstop.
+            logger.error("Razorpay webhook for order %s could not be applied: %s", order_id, exc)
+            raise HTTPException(status_code=503, detail="Try again later") from exc
+    return {"ok": True}
 
 
 def payer_breakdown(student: dict, academic_year_id=None, program: str = Program.LMS.value,
