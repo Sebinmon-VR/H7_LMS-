@@ -403,6 +403,27 @@ class InstalmentOut(BaseModel):
     concession_amount: float | None = None
     # An item added by the office (books, uniform) rather than from the fee structure.
     is_extra: bool = False
+    # The bill this line went out on (see FeeBillOut). None until the account is issued.
+    bill_number: str | None = None
+
+
+class FeeBillOut(BaseModel):
+    """
+    One bill on a student's yearly account: what the office billed in one go - the first
+    issue, fees held back until later (LATER), or extra items (EXTRA) - with its own number,
+    so it can be printed and paid on its own. The account's dues are the sum of its bills.
+    """
+    number: str
+    kind: str = "ISSUE"
+    issued_at: datetime | None = None
+    labels: list[str] = Field(default_factory=list)
+    amount: float = 0.0
+    amount_paid: float = 0.0
+    balance: float = 0.0
+    # ISSUED (nothing paid yet), PARTIALLY_PAID, PAID, or CANCELLED once all its lines were removed.
+    status: str
+    due_date: date | None = None
+    is_overdue: bool = False
 
 
 class UnmatchedStructure(BaseModel):
@@ -534,6 +555,7 @@ class FeeInvoiceOut(BaseModel):
     line_items: list[BreakdownLine] = Field(default_factory=list)
     discounts: list[AppliedDiscount] = Field(default_factory=list)
     instalments: list[InstalmentOut] = Field(default_factory=list)
+    bills: list[FeeBillOut] = Field(default_factory=list)
     # Fee lines held back when the bill was issued, by label; they can be billed later.
     left_off: list[str] = Field(default_factory=list)
     payments: list[dict[str, Any]] = Field(default_factory=list)
@@ -599,6 +621,23 @@ class IssueLeftOff(BaseModel):
 
 class ExtraItemsAdd(BaseModel):
     items: list[ExtraItem] = Field(..., min_length=1)
+
+
+class BulkBillingRequest(BaseModel):
+    """
+    `POST /admin/finance/bulk-billing` - bill many students at once, or with `dry_run`
+    preview who would be billed what. Each student gets a numbered bill of their own.
+    """
+    academic_year_id: int
+    student_ids: list[int] = Field(..., min_length=1, max_length=3000)
+    # ISSUE: their fees for the year. LATER: fees held back. EXTRA: the same extra item for all.
+    action: str = Field(..., pattern="^(ISSUE|LATER|EXTRA)$")
+    # ISSUE: the fees to put on the bill (none = every fee). LATER: the held-back fees to bill.
+    labels: list[str] = Field(default_factory=list)
+    extra_items: list[ExtraItem] = Field(default_factory=list)
+    # Email each student and linked parent their new bill.
+    email: bool = False
+    dry_run: bool = True
 
 
 class PaymentQuote(BaseModel):

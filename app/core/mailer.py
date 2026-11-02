@@ -805,6 +805,37 @@ def send_fee_receipt_email(to: str, contact_name: str | None, receipt: dict,
     )
 
 
+def send_fee_bill_email(to: str, contact_name: str | None, bill: dict,
+                        view_url: str | None = None) -> bool:
+    """
+    A new fee bill, to the student and the family: its number, what it is for, the amount and
+    when it is due, with a link to pay it online.
+    """
+    student = bill.get("student_name") or "your child"
+    number = bill.get("number") or ""
+    rows = [
+        ("Bill number", number),
+        ("Date", _nice_date(bill.get("issued_at"))),
+        ("Student", student),
+        ("For", ", ".join(bill.get("labels") or []) or "School fees"),
+        ("Amount", money_label(bill.get("amount"), bill.get("currency"))),
+    ]
+    if bill.get("due_date"):
+        rows.append(("Pay by", _nice_date(bill["due_date"])))
+    return _send_letter(
+        to, f"Fee bill {number} for {student}".strip(),
+        greeting=_greeting(contact_name),
+        paragraphs=[
+            f"A new fee bill has been issued for {student}.",
+            "You can pay it online from the Fees page in the app, or at the school office. "
+            "Please quote the bill number when you pay.",
+        ],
+        rows=rows,
+        buttons=[("View and pay", view_url)] if view_url else None,
+        signature="Accounts Office",
+    )
+
+
 def send_fee_payment_alert_email(to: str, receipt: dict, counter_url: str | None = None,
                                  method_label: str | None = None) -> bool:
     """The office's alert that a fee payment has come in: who paid, how much, how, and what is left."""

@@ -490,6 +490,21 @@ def _letterhead() -> dict:
     }
 
 
+def _bill_index(invoice: dict) -> dict:
+    """Each fee line's bill number, by label."""
+    return {i.get("label"): billing.bill_number_of(invoice, i) for i in invoice.get("instalments") or []}
+
+
+def _bills_settled(parts: list[dict], bill_of: dict) -> list[str]:
+    """The bills a payment's allocation touched, in the order it touched them."""
+    numbers: list[str] = []
+    for part in parts:
+        number = bill_of.get(part.get("instalment"))
+        if number and number not in numbers:
+            numbers.append(number)
+    return numbers
+
+
 def payment_receipt(invoice: dict, index: int) -> dict:
     """
     The printable receipt for one payment on an invoice, first or reprint.
@@ -507,12 +522,14 @@ def payment_receipt(invoice: dict, index: int) -> dict:
 
     allocation = _allocate_payments(invoice, _head_index())
     parts = allocation[index] if index < len(allocation) else []
+    bill_of = _bill_index(invoice)
     lines: dict = {}
     for part in parts:
         key = (part["instalment"], part["head"])
         entry = lines.setdefault(key, {
             "instalment": part["instalment"], "head": part["head"],
             "is_admission_charge": part["is_admission_charge"], "amount": 0.0,
+            "bill_number": bill_of.get(part["instalment"]),
         })
         entry["amount"] = money(entry["amount"] + part["amount"])
 
@@ -553,6 +570,8 @@ def payment_receipt(invoice: dict, index: int) -> dict:
         "school": _letterhead(),
         "lines": list(lines.values()),
         "invoice_number": invoice.get("invoice_number"),
+        # The bills this payment settled; a receipt for one bill names just that bill.
+        "bill_numbers": _bills_settled(parts, bill_of) or [invoice.get("invoice_number")],
         "invoice_total": total,
         "balance_after": money(max(total - paid_through, 0.0)),
         "balance_now": money(max(total - money(invoice.get("amount_paid")), 0.0)),
@@ -654,6 +673,7 @@ def collections_report(from_date: date, to_date: date, academic_year_id=None,
         class_name = class_name_of(enrolled_class)
 
         allocations = _allocate_payments(invoice, heads)
+        bill_of = _bill_index(invoice)
         for index, payment in enumerate(invoice.get("payments") or []):
             paid_on = _as_date(payment.get("paid_at"))
             if paid_on is None or paid_on < from_date or paid_on > to_date:
@@ -686,6 +706,7 @@ def collections_report(from_date: date, to_date: date, academic_year_id=None,
                 ),
                 "invoice_id": invoice.get("id"),
                 "invoice_number": invoice.get("invoice_number"),
+                "bill_numbers": _bills_settled(allocation, bill_of) or [invoice.get("invoice_number")],
                 "receipt_number": payment.get("receipt_number"),
                 "source": "INVOICE",
                 "receipt_id": None,
@@ -745,6 +766,7 @@ def collections_report(from_date: date, to_date: date, academic_year_id=None,
             "admission_fee_amount": amount if is_admission else 0.0,
             "invoice_id": None,
             "invoice_number": None,
+            "bill_numbers": [],
             "receipt_number": None,
             "source": receipt.get("source") or "OPENING_BALANCE",
             "receipt_id": receipt.get("id"),
@@ -925,6 +947,8 @@ def transactions_report(from_date: date, to_date: date, academic_year_id=None,
             charge = intent.get("charge") or {}
             bill_currency = intent.get("currency") or received["currency"]
             labels = [a.get("label") for a in intent.get("allocations") or [] if a.get("label")]
+            bill_of = _bill_index(invoice)
+            bills = list(dict.fromkeys(bill_of[l] for l in labels if bill_of.get(l)))
             rows.append({
                 "paid_at": intent.get("created_at"),
                 "paid_on": started.isoformat(),
@@ -939,6 +963,7 @@ def transactions_report(from_date: date, to_date: date, academic_year_id=None,
                 "receipt_id": None,
                 "invoice_id": intent.get("invoice_id"),
                 "invoice_number": intent.get("invoice_number") or invoice.get("invoice_number"),
+                "bill_numbers": bills or [n for n in [invoice.get("invoice_number")] if n],
                 "receipt_number": None,
                 "academic_year_id": invoice.get("academic_year_id"),
                 "student_id": student_id,
@@ -1065,7 +1090,7 @@ def roll_csv(report: dict) -> str:
 
 COLLECTIONS_HEADER = [
     "Paid At", "Date", "Student ID", "Student", "Admission Number", "Class", "Invoice Number",
-    "Against", "Method", "Reference", "Currency", "Amount",
+    "Bills", "Against", "Method", "Reference", "Currency", "Amount",
 ]
 COLLECTIONS_TAIL = ["Recorded By", "Note", "Source"]
 
@@ -1088,7 +1113,7 @@ def collections_csv(report: dict) -> str:
         against = r["instalment_label"] or ", ".join(r.get("instalments_settled") or [])
         rows.append([_cell(v) for v in [
             r["paid_at"], r["paid_on"], r["student_id"], r["student_name"], r["admission_number"],
-            r["class_name"], r["invoice_number"], against, r["method"],
+            r["class_name"], r["invoice_number"], " ".join(r.get("bill_numbers") or []), against, r["method"],
             r["reference"], r["currency"], r["amount"],
             *[portions.get(name, 0.0) for name in head_names],
             r["recorded_by_name"] or r["recorded_by"], r["note"], r.get("source"),
@@ -1098,7 +1123,7 @@ def collections_csv(report: dict) -> str:
 
 TRANSACTIONS_HEADER = [
     "Date", "Status", "Channel", "Method", "Paid By", "Student ID", "Student",
-    "Admission Number", "Class", "Invoice Number", "Receipt Number", "Against", "Reference",
+    "Admission Number", "Class", "Invoice Number", "Bills", "Receipt Number", "Against", "Reference",
     "Order", "Bill Currency", "Credited To Bill", "Paid In", "Fees", "Tax", "Tax Amount",
     "Payment Charges", "Charges Amount", "Total Paid", "Razorpay Fee", "Razorpay GST",
     "Net To Bank", "Credited By Safety Net", "Failure Reason", "Recorded By", "Note",
@@ -1112,7 +1137,7 @@ def transactions_csv(report: dict) -> str:
         rows.append([_cell(v) for v in [
             r["paid_at"], r["status"], r["channel"], r["method"], r["paid_by"], r["student_id"],
             r["student_name"], r["admission_number"], r["class_name"], r["invoice_number"],
-            r["receipt_number"], r["against"], r["reference"], r["order_id"], r["currency"],
+            " ".join(r.get("bill_numbers") or []), r["receipt_number"], r["against"], r["reference"], r["order_id"], r["currency"],
             r["amount"], r["paid_currency"], r["paid_fee_amount"], tax, r["tax_amount"],
             r["charges_label"], r["charges_amount"], r["paid_amount"], r["razorpay_fee"],
             r["razorpay_tax"], r["net_amount"], r["recovered"] if r["channel"] == "ONLINE" else None,

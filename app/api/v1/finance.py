@@ -36,6 +36,7 @@ from app.schemas.finance import (
     FeeCollect, FeeReceiptCreate, FeeReceiptOut,
     PaymentIntentCreate, PaymentIntentOut, PaymentRecord,
     WaiveInstalmentRequest,
+    BulkBillingRequest,
     ExtraItemsAdd,
     InvoiceIssue,
     IssueLeftOff,
@@ -43,7 +44,9 @@ from app.schemas.finance import (
     PaymentQuote,
 )
 from app.schemas.user import UserOut
+from app.core.jobs import JobStatus, job_registry
 from app.services import billing
+from app.services import bulk_billing
 from app.services import families as family_service
 from app.services import finance
 from app.services import finance_reports as reports
@@ -765,6 +768,50 @@ def gateway_callback(
         payload.failure_reason,
     )
     return PaymentIntentOut(**settled)
+
+
+@admin_router.post("/bulk-billing", status_code=status.HTTP_202_ACCEPTED)
+def start_bulk_billing(
+    payload: BulkBillingRequest,
+    program: Program = Query(Program.LMS),
+    current_user: UserOut = Depends(require_admin),
+):
+    """
+    [Admin Only] Bill many students at once - their fees for the year (ISSUE), fees held back
+    (LATER) or the same extra item (EXTRA) - each as a numbered bill of their own. With
+    `dry_run` (the default) nobody is billed: the result says what each student would be
+    billed and who would be skipped and why.
+
+    Runs in the background; poll `GET /admin/finance/bulk-billing/{job_id}` for progress and,
+    once it has finished, the result.
+    """
+    items = [i.model_dump() for i in payload.extra_items]
+    action, labels, items = bulk_billing.checked(payload.action, payload.labels, items, payload.dry_run)
+    job = job_registry.submit(
+        name="bulk_billing_preview" if payload.dry_run else "bulk_billing",
+        func=lambda progress: bulk_billing.run(
+            payload.student_ids, payload.academic_year_id, action, labels, items,
+            email=payload.email, dry_run=payload.dry_run, actor_id=current_user.id,
+            program=program.value, progress=progress,
+        ),
+        requested_by=current_user.id,
+        # Two people billing different classes at once are two runs, never one.
+        dedupe=False,
+    )
+    return job.to_dict()
+
+
+@admin_router.get("/bulk-billing/{job_id}")
+def bulk_billing_status(job_id: str, _: UserOut = Depends(require_admin)):
+    """[Admin Only] How far a bulk billing run (or preview) has got, and its result once done."""
+    job = job_registry.get(job_id)
+    if job is None or not job.name.startswith("bulk_billing"):
+        raise HTTPException(
+            status_code=404,
+            detail="This bulk billing run is no longer available. The server may have restarted; "
+                   "check the bills register before running it again.",
+        )
+    return {**job.to_dict(), "result": job.result if job.status == JobStatus.SUCCEEDED else None}
 
 
 @admin_router.get("/invoices/{invoice_id}/intents", response_model=List[PaymentIntentOut])

@@ -124,12 +124,92 @@ def _next_invoice_number(config: dict) -> str:
 
     highest = 0
     for invoice in firestore_fee_invoices.list_all():
-        number = str(invoice.get("invoice_number") or "")
-        if number.startswith(stem):
-            tail = number[len(stem):]
-            if tail.isdigit():
-                highest = max(highest, int(tail))
+        # Bills issued later on an account share the series, so they count too.
+        numbers = [invoice.get("invoice_number")] + [b.get("number") for b in invoice.get("bills") or []]
+        for number in (str(n or "") for n in numbers):
+            if number.startswith(stem):
+                tail = number[len(stem):]
+                if tail.isdigit():
+                    highest = max(highest, int(tail))
     return f"{stem}{highest + 1:04d}"
+
+
+# Held from choosing a bill number until the bill carrying it is written, as `_receipt_lock`
+# is for receipts: two clerks billing at once must not both take the next number.
+_bill_lock = threading.Lock()
+
+
+def bill_number_of(invoice: dict, line: dict) -> str | None:
+    """The bill a fee line went out on. Lines billed before bills were numbered: the invoice's."""
+    return line.get("bill_number") or invoice.get("invoice_number")
+
+
+def _open_bill(invoice: dict, labels: list[str], kind: str, number: str, actor_id) -> dict:
+    """
+    Puts fee lines on a bill of their own.
+
+    A student has one account per year (this invoice), which is what dues, arrears and the
+    reports read. Each time the office bills something - the first issue, fees held back
+    until later, books - those lines go out as a bill with its own number, which can be
+    printed and paid on its own. The account and its bills never disagree, because a bill
+    is only a label on the account's lines.
+    """
+    wanted = set(labels)
+    return {
+        **invoice,
+        "instalments": [
+            {**i, "bill_number": number} if i.get("label") in wanted else i
+            for i in invoice.get("instalments") or []
+        ],
+        "bills": list(invoice.get("bills") or []) + [{
+            "number": number, "kind": kind, "labels": list(labels),
+            "issued_at": _now(), "issued_by": actor_id,
+        }],
+    }
+
+
+def bills_view(invoice: dict, instalments: list[dict]) -> list[dict]:
+    """
+    The account's bills, oldest first, each with what it came to, what has been paid against
+    it and what is left. `instalments` are the presented lines, so overdue is current.
+    """
+    if invoice.get("status") not in FROZEN_STATUSES:
+        return []
+    recorded = list(invoice.get("bills") or [])
+    numbers = [b.get("number") for b in recorded]
+    if invoice.get("invoice_number") and invoice["invoice_number"] not in numbers:
+        recorded.insert(0, {"number": invoice["invoice_number"], "kind": "ISSUE",
+                            "issued_at": invoice.get("issued_at")})
+    views = []
+    for bill in recorded:
+        lines = [i for i in instalments if bill_number_of(invoice, i) == bill.get("number")]
+        live = [i for i in lines if i.get("status") != InstalmentStatus.WAIVED.value]
+        amount = money(sum(money(i.get("amount")) for i in live))
+        paid = money(sum(money(i.get("amount_paid")) for i in live))
+        balance = money(max(amount - paid, 0.0))
+        if not lines:
+            status = InvoiceStatus.CANCELLED.value
+        elif balance <= 0.009:
+            status = InvoiceStatus.PAID.value
+        elif paid > 0:
+            status = InvoiceStatus.PARTIALLY_PAID.value
+        else:
+            status = InvoiceStatus.ISSUED.value
+        open_dues = sorted(str(i.get("due_date")) for i in live if i.get("due_date") and
+                           money(i.get("amount")) - money(i.get("amount_paid")) > 0.009)
+        views.append({
+            "number": bill.get("number"),
+            "kind": bill.get("kind") or "ISSUE",
+            "issued_at": bill.get("issued_at"),
+            "labels": [i.get("label") for i in lines],
+            "amount": amount,
+            "amount_paid": paid,
+            "balance": balance,
+            "status": status,
+            "due_date": open_dues[0] if open_dues else None,
+            "is_overdue": any(i.get("is_overdue") for i in live if money(i.get("amount")) - money(i.get("amount_paid")) > 0.009),
+        })
+    return views
 
 
 RECEIPT_PREFIX = "RCT"
@@ -463,24 +543,31 @@ def issue_invoice(invoice: dict, actor_id: int | None = None,
     _apply_payments_to_instalments(invoice)
 
     config = finance_settings(program)
-    updates = {
-        "status": InvoiceStatus.ISSUED.value,
-        "invoice_number": invoice.get("invoice_number") or _next_invoice_number(config),
-        "issued_at": _now(),
-        "updated_at": _now(),
-        "issued_by": actor_id,
-        "instalments": invoice.get("instalments") or [],
-        "line_items": invoice.get("line_items") or [],
-        "subtotal": money(invoice.get("subtotal")),
-        "left_off": invoice.get("left_off") or [],
-        "discounts": invoice.get("discounts") or [],
-        "discount_total": money(invoice.get("discount_total")),
-        "extra_total": money(invoice.get("extra_total")),
-        "total_amount": money(invoice.get("total_amount")),
-        "concession_reason": invoice.get("concession_reason"),
-    }
-    updates["status"] = _settle_status({**invoice, **updates})
-    firestore_fee_invoices.add_document(str(invoice["id"]), updates)
+    with _bill_lock:
+        number = invoice.get("invoice_number") or _next_invoice_number(config)
+        # The first bill on the account carries the account's own number.
+        invoice = _open_bill({**invoice, "bills": []},
+                             [i.get("label") for i in invoice.get("instalments") or []],
+                             "ISSUE", number, actor_id)
+        updates = {
+            "status": InvoiceStatus.ISSUED.value,
+            "invoice_number": number,
+            "issued_at": _now(),
+            "updated_at": _now(),
+            "issued_by": actor_id,
+            "instalments": invoice.get("instalments") or [],
+            "bills": invoice["bills"],
+            "line_items": invoice.get("line_items") or [],
+            "subtotal": money(invoice.get("subtotal")),
+            "left_off": invoice.get("left_off") or [],
+            "discounts": invoice.get("discounts") or [],
+            "discount_total": money(invoice.get("discount_total")),
+            "extra_total": money(invoice.get("extra_total")),
+            "total_amount": money(invoice.get("total_amount")),
+            "concession_reason": invoice.get("concession_reason"),
+        }
+        updates["status"] = _settle_status({**invoice, **updates})
+        firestore_fee_invoices.add_document(str(invoice["id"]), updates)
     logger.info("Issued invoice %s for student %s.",
                 updates["invoice_number"], invoice.get("student_id"))
     return {**invoice, **updates}
@@ -831,13 +918,17 @@ def issue_left_off(invoice: dict, labels, actor_id: int | None = None, concessio
     _apply_payments_to_instalments(updated)
     updated["status"] = _settle_status(updated)
     updated["updated_at"] = _now()
-    firestore_fee_invoices.add_document(str(invoice["id"]), {
-        key: updated.get(key) for key in (
-            "instalments", "line_items", "subtotal", "total_amount", "left_off", "discounts",
-            "discount_total", "status", "updated_at",
-        )
-    })
-    logger.info("Billed %s more on invoice %s: %s.", added, invoice["id"], ", ".join(wanted))
+    with _bill_lock:
+        number = _next_invoice_number(finance_settings(program))
+        updated = _open_bill(updated, wanted, "LATER", number, actor_id)
+        firestore_fee_invoices.add_document(str(invoice["id"]), {
+            key: updated.get(key) for key in (
+                "instalments", "bills", "line_items", "subtotal", "total_amount", "left_off",
+                "discounts", "discount_total", "status", "updated_at",
+            )
+        })
+    logger.info("Billed %s more on invoice %s as bill %s: %s.",
+                added, invoice["id"], number, ", ".join(wanted))
     return updated
 
 
@@ -849,17 +940,25 @@ def add_extra_items(invoice: dict, items, actor_id: int | None = None) -> dict:
             detail="Issue the bill first. Extra items on a bill that is not issued yet are "
                    "added when you issue it.",
         )
+    before = {i.get("label") for i in invoice.get("instalments") or []}
     updated = _add_extra_lines(invoice, items, actor_id)
+    added = [i.get("label") for i in updated.get("instalments") or [] if i.get("label") not in before]
     _apply_payments_to_instalments(updated)
     updated["status"] = _settle_status(updated)
     updated["updated_at"] = _now()
-    firestore_fee_invoices.add_document(str(invoice["id"]), {
-        "instalments": updated["instalments"],
-        "extra_total": money(updated.get("extra_total")),
-        "total_amount": money(updated.get("total_amount")),
-        "status": updated["status"],
-        "updated_at": updated["updated_at"],
-    })
+    program = str(invoice.get("program") or Program.LMS.value).upper()
+    with _bill_lock:
+        if added:
+            updated = _open_bill(updated, added, "EXTRA",
+                                 _next_invoice_number(finance_settings(program)), actor_id)
+        firestore_fee_invoices.add_document(str(invoice["id"]), {
+            "instalments": updated["instalments"],
+            "bills": updated.get("bills") or [],
+            "extra_total": money(updated.get("extra_total")),
+            "total_amount": money(updated.get("total_amount")),
+            "status": updated["status"],
+            "updated_at": updated["updated_at"],
+        })
     return updated
 
 
@@ -1237,7 +1336,10 @@ def present_invoice(invoice: dict, program: str = Program.LMS.value,
 
         "line_items": invoice.get("line_items") or [],
         "discounts": invoice.get("discounts") or [],
-        "instalments": instalments,
+        "instalments": [{**i, "bill_number": bill_number_of(invoice, i)} for i in instalments]
+        if invoice.get("status") in FROZEN_STATUSES else instalments,
+        # Each time the office billed something, as a numbered bill of its own.
+        "bills": bills_view(invoice, instalments),
         # Fee lines held back when the bill was issued; they can be billed later.
         "left_off": invoice.get("left_off") or [],
         "payments": invoice.get("payments") or [],
