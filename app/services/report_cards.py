@@ -1,6 +1,9 @@
 """
 Report cards: a student's exams in one class, consolidated onto one document.
 
+"Exams" means both the ones held in the LMS and the ones held on paper, whose marks the class
+teacher types into a register (`app.services.paper_marks`).
+
 Issued by the class teacher of that class, or by an admin. Two decisions shape everything
 here:
 
@@ -30,6 +33,7 @@ from app.core.firebase import (
     firestore_report_cards, firestore_student_enrollments, firestore_subjects,
     firestore_users, prefetch_references, _resolve_document,
 )
+from app.services import paper_marks
 from app.services.exams import grade_for, now_utc, sorted_bands, to_utc
 
 logger = logging.getLogger("report_card_service")
@@ -272,6 +276,11 @@ def generate(payload, actor) -> dict:
             "class_id", "==", payload.class_id
         ),
         "exams": lambda: firestore_exams.query_documents("class_id", "==", payload.class_id),
+        # Exams held on paper: a card naming specific LMS exams leaves them out.
+        "paper": (
+            (lambda: paper_marks.exams_for_cards(payload.class_id))
+            if not payload.exam_ids else (lambda: ([], {}))
+        ),
         "attendance": (
             (lambda: _attendance_percentages(payload.class_id))
             if payload.include_attendance else (lambda: {})
@@ -280,6 +289,7 @@ def generate(payload, actor) -> dict:
 
     enrollments = loaded.get("enrollments") or []
     all_exams = loaded.get("exams") or []
+    paper_exams, paper_scripts = loaded.get("paper") or ([], {})
     attendance = loaded.get("attendance") or {}
 
     student_ids = [e["student_id"] for e in enrollments if e.get("student_id") is not None]
@@ -323,13 +333,15 @@ def generate(payload, actor) -> dict:
             )
 
     exams = [e for e in exams if _in_range(e, payload.from_date, payload.to_date)]
-    if not exams:
+    paper_exams = [e for e in paper_exams if _in_range(e, payload.from_date, payload.to_date)]
+    if not exams and not paper_exams:
         raise HTTPException(
             status_code=400,
             detail=(
                 "No exams match this report card's filters, so every card would be empty. "
                 + (warnings[0] if warnings else
-                   "Check the date range, and whether the exams' results have been published.")
+                   "Check the dates, whether the exams' results have been published, and that "
+                   "marks for exams held on paper have been entered.")
             ),
         )
 
@@ -346,6 +358,14 @@ def generate(payload, actor) -> dict:
         }
         for exam in exams
     }
+    for exam in paper_exams:
+        submissions_by_exam[exam["id"]] = paper_scripts.get(exam["id"], {})
+
+    # In the order they were written, so each subject reads as the term went.
+    exams = sorted(
+        exams + paper_exams,
+        key=lambda e: to_utc(e.get("ends_at")) or to_utc(e.get("starts_at")) or now_utc(),
+    )
 
     students = firestore_users.get_documents(student_ids)
     subject_ids = {e.get("subject_id") for e in exams if e.get("subject_id") is not None}

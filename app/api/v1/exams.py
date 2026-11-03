@@ -4,7 +4,8 @@ The exam module's HTTP surface.
 Three routers, split by who is talking rather than by resource:
 
 * `router` (`/exams`)            - setting, valuing, and releasing exams. Teachers and admins.
-* `report_router` (`/report-cards`) - consolidated results. Class teachers and admins.
+* `report_router` (`/report-cards`) - consolidated results, and the register of marks for
+  exams held on paper that they count. Class teachers and admins.
 * `student_router` (`/students`) - sitting an exam and reading your own result.
 
 Exams live in their own module rather than being bolted onto the teacher and student routers
@@ -37,10 +38,12 @@ from app.schemas.exam import (
     SubmitIn, TimeConcessionGrant,
 )
 from app.schemas.report_card import (
+    PaperMarkSheetSave, PaperMarkSheetSaved, PaperMarksRegister,
     ReportCardBatch, ReportCardGenerate, ReportCardOut, ReportCardUpdate,
 )
 from app.schemas.user import UserOut
 from app.services import exams as exam_service
+from app.services import paper_marks as paper_marks_service
 from app.services import report_cards as report_card_service
 from app.services import timetable as timetable_service
 from app.services.permissions import is_class_teacher_of, visible_records
@@ -548,6 +551,43 @@ def list_report_cards(
     cards.sort(key=lambda c: c.get("generated_at") or "", reverse=True)
     report_card_service.prefetch_cards(cards)
     return [ReportCardOut(**report_card_service.hydrate_report_card(c)) for c in cards]
+
+
+# Declared before `/{card_id}`, which would otherwise take "paper-marks" for a card id.
+
+@report_router.get("/paper-marks", response_model=PaperMarksRegister)
+def get_paper_marks(class_id: int = Query(...), current_user: UserOut = Depends(require_teacher)):
+    """
+    [Class Teacher / Admin] The marks register for exams held on paper, for one class.
+
+    The class's students and subjects, and every sheet of marks kept for it.
+    """
+    _assert_card_authority(class_id, current_user)
+    return PaperMarksRegister(**paper_marks_service.register(class_id))
+
+
+@report_router.put("/paper-marks", response_model=PaperMarkSheetSaved)
+def save_paper_marks(sheet_in: PaperMarkSheetSave, current_user: UserOut = Depends(require_teacher)):
+    """
+    [Class Teacher / Admin] Save one exam's marks, held on paper, for a class.
+
+    A blank mark (null) clears the student's mark for that subject, and the report card then
+    lists the paper as not sat. The marks count on the next report card issued.
+    """
+    _assert_card_authority(sheet_in.class_id, current_user)
+    return PaperMarkSheetSaved(**paper_marks_service.save_sheet(sheet_in, current_user))
+
+
+@report_router.delete("/paper-marks", status_code=status.HTTP_204_NO_CONTENT)
+def delete_paper_marks(
+    class_id: int = Query(...),
+    exam_name: str = Query(..., min_length=1),
+    current_user: UserOut = Depends(require_teacher),
+):
+    """[Class Teacher / Admin] Delete one exam's sheet of paper marks. Issued cards keep theirs."""
+    _assert_card_authority(class_id, current_user)
+    paper_marks_service.delete_sheet(class_id, exam_name)
+    return None
 
 
 @report_router.get("/{card_id}", response_model=ReportCardOut)

@@ -6,11 +6,11 @@ by the class teacher (or an admin) and is a *snapshot*: the numbers on it are th
 they stood when it was generated. See `app.services.report_cards` for why.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.schemas.academic import ClassRoomOut
+from app.schemas.academic import ClassRoomOut, SubjectOut
 from app.schemas.exam import GradeBand
 from app.schemas.user import UserOut
 
@@ -147,3 +147,87 @@ class ReportCardBatch(BaseModel):
     published: bool
     cards: list[ReportCardOut] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------------------
+# Marks for exams held on paper
+#
+# A term exam the school sets and invigilates in the hall never passes through the LMS, so
+# there is no exam record for a report card to read. The class teacher types the marks into
+# a register instead - one sheet per exam, a column per subject - and the cards count them.
+# See `app.services.paper_marks`.
+# ---------------------------------------------------------------------------------------
+
+class PaperMark(BaseModel):
+    student_id: int
+    # None clears the student's mark: absent, or not entered yet. Never stored as a zero.
+    marks_obtained: float | None = Field(None, ge=0)
+
+
+class PaperSubjectMarks(BaseModel):
+    subject_id: int
+    max_marks: float = Field(..., gt=0)
+    marks: list[PaperMark] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_marks(self) -> "PaperSubjectMarks":
+        for entry in self.marks:
+            if entry.marks_obtained is not None and entry.marks_obtained > self.max_marks:
+                raise ValueError(f"A mark of {entry.marks_obtained:g} is more than the {self.max_marks:g} it is out of.")
+        return self
+
+
+class PaperMarkSheetSave(BaseModel):
+    """
+    Saves one exam's marks for a class.
+
+    `previous_exam_name` is the sheet being edited, so a renamed sheet moves its marks rather
+    than starting a second one. Leave it empty for a new sheet. `subjects` are the subjects the
+    exam had: one the sheet had before that is left out is removed, marks and all.
+    """
+    class_id: int
+    exam_name: str = Field(..., min_length=1, max_length=120)
+    previous_exam_name: str | None = None
+    conducted_on: date
+    subjects: list[PaperSubjectMarks] = Field(..., min_length=1)
+
+
+class PaperSheetSubject(BaseModel):
+    subject_id: int
+    max_marks: float | None = None
+    # Student id (as a string) -> marks. Only students with a mark appear.
+    marks: dict[str, float] = Field(default_factory=dict)
+
+
+class PaperMarkSheet(BaseModel):
+    exam_name: str
+    conducted_on: date | None = None
+    subjects: list[PaperSheetSubject] = Field(default_factory=list)
+    entered_by: list[str] = Field(default_factory=list)
+    updated_at: datetime | None = None
+
+
+class PaperRegisterStudent(BaseModel):
+    id: int
+    full_name: str
+    roll_number: str | None = None
+    admission_number: str | None = None
+
+
+class PaperMarksRegister(BaseModel):
+    """Everything the register screen needs for one class, in one call."""
+    class_id: int
+    class_room: ClassRoomOut | None = None
+    students: list[PaperRegisterStudent] = Field(default_factory=list)
+    # The subjects taught in the class (and any a sheet already has), then the rest of the
+    # school's, for an exam in a subject nobody is mapped to teach in this class.
+    subjects: list[SubjectOut] = Field(default_factory=list)
+    other_subjects: list[SubjectOut] = Field(default_factory=list)
+    sheets: list[PaperMarkSheet] = Field(default_factory=list)
+
+
+class PaperMarkSheetSaved(BaseModel):
+    sheet: PaperMarkSheet
+    saved: int
+    cleared: int
+    unchanged: int
