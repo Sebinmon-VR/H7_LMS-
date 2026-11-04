@@ -1419,25 +1419,96 @@ All update models are partial: omitted fields are left unchanged, and an entirel
 
 ## Startup and Local Development
 
-1. Install dependencies with the same interpreter that will run the app:
+New to the project? The frontend repo's
+[HANDOVER.md](https://github.com/Sebinmon-VR/h7_lms_frontend/blob/main/HANDOVER.md) explains
+how the backend, web app and mobile app fit together, and which accounts and secrets you need.
 
-   ```bash
-   python -m pip install -r requirements.txt
-   ```
+### Prerequisites
 
-2. Install Microsoft's ODBC Driver 18 for SQL Server, and have an Azure SQL database to point at (`DB_*` settings). The Storage and Communication Services connection strings are optional locally: without them uploads land in `LOCAL_STORAGE_DIR` and live classes report themselves unconfigured.
+- **Python 3.13 or 3.14** (CI and App Service use 3.14).
+- **Microsoft ODBC Driver 18 for SQL Server**:
+  - Windows: install "ODBC Driver 18 for SQL Server" from Microsoft's download page.
+  - macOS: `brew tap microsoft/mssql-release https://github.com/Microsoft/homebrew-mssql-release && HOMEBREW_ACCEPT_EULA=Y brew install msodbcsql18`
+  - Debian/Ubuntu: see the install block in `startup.sh`.
+- **SQL credentials and a firewall rule.** There is no local database option; the app
+  always uses Azure SQL. Ask the Azure owner for a SQL login, and have your public IP added
+  under the SQL server's **Networking → Firewall rules**. Without that the app starts, but
+  every request fails with a login-timeout ODBC error.
 
-3. Copy `.env.example` to `.env` and fill in your values.
+### Set up
 
-4. Start the server:
+```bash
+git clone https://github.com/Sebinmon-VR/H7_LMS-.git
+cd H7_LMS-
+python -m venv .venv
+# Windows:  .venv\Scripts\activate        macOS/Linux:  source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
+```
 
-   ```bash
-   python -m uvicorn app.main:app --reload --port 8000
-   ```
+Fill in `.env`. For development, **use your own schema and switch off everything that reaches
+real people.** Production lives in schema `h7lms`; a laptop running against it is a second
+production server whose schedulers email every student a duplicate class reminder.
 
-5. Visit the docs:
-   - Swagger UI: `http://127.0.0.1:8000/docs`
-   - ReDoc: `http://127.0.0.1:8000/redoc`
+```ini
+DATABASE_BACKEND=azuresql
+DB_SERVER=<server>.database.windows.net
+DB_NAME=<database>
+DB_USER=<your sql login>
+DB_PASSWORD=<password>
+DB_SCHEMA=h7lms_dev_<yourname>      # created on first start, with its tables
+
+SECRET_KEY=<any long random string>  # python -c "import secrets; print(secrets.token_urlsafe(48))"
+BOOTSTRAP_ADMIN_EMAIL=admin@example.com
+BOOTSTRAP_ADMIN_PASSWORD=<pick one>  # your first login
+SEED_DEMO_DATA=True                  # optional: a sample class and subject
+
+ENABLE_CLASS_REMINDERS=False
+ENABLE_EMAIL_NOTIFICATIONS=False
+ENABLE_AUTO_RECORDING=False
+STORAGE_PROVIDER="LOCAL"             # uploads go to ./uploads
+# ACS_CONNECTION_STRING=             # leave empty unless you are working on live classes
+# RAZORPAY_KEY_ID / _SECRET          # test-mode keys only, if you are working on payments
+```
+
+If the SQL login cannot create a schema, ask the server admin to run
+`CREATE SCHEMA h7lms_dev_<yourname>` and grant your login rights on it.
+
+### Run
+
+```bash
+python -m uvicorn app.main:app --reload --port 8000
+```
+
+- Health: `http://127.0.0.1:8000/` and `http://127.0.0.1:8000/health/database` (says
+  which backend and schema answer)
+- Swagger UI: `http://127.0.0.1:8000/docs`, ReDoc: `http://127.0.0.1:8000/redoc`
+- Sign in through `POST /api/v1/auth/login` (or the web app) with the bootstrap admin.
+
+Then run the web app against it: in `h7_lms_frontend/.env` set `VITE_API_BASE=` (empty) and
+`VITE_BACKEND_ORIGIN=http://127.0.0.1:8000`, and run `npm run dev`.
+
+For the mobile app on a phone or emulator, start uvicorn with `--host 0.0.0.0` so the
+device can reach it (see the app's README for which address to use).
+
+### Things that will bite
+
+- **`verify_lms.py` creates and deletes real records.** Only ever run it against your dev
+  schema.
+- **The `scripts/reset_*.py` scripts wipe data** in whichever schema `.env` names. Read a
+  script before running it, and check `DB_SCHEMA` first.
+- **Run one process only.** Schedulers, the reference cache and background jobs live in
+  process memory, which is also why `startup.sh` runs a single gunicorn worker. Raising
+  `GUNICORN_WORKERS` duplicates every reminder email.
+- **Pushing to `main` deploys straight to production** (App Service `h7-lms-bknd`, via
+  `.github/workflows/main_h7-lms-bknd.yml`). There is no staging slot. Production settings
+  are App Service application settings; `.env` never reaches the server (see
+  [Settings in a hosted deployment](#settings-in-a-hosted-deployment)).
+- **New settings need adding in two places:** `app/core/config.py` (with a default) and
+  the App Service application settings. Add them to `.env.example` too, so the next
+  person knows they exist.
+- Old keys such as `GCP_*`, `GOOGLE_*`, `FIREBASE_CREDENTIALS_PATH` and
+  `STORAGE_PROVIDER="DRIVE"` belong to the pre-Azure setup. Don't copy them into a new `.env`.
 
 ---
 

@@ -341,7 +341,7 @@ def generate(payload, actor) -> dict:
                 "No exams match this report card's filters, so every card would be empty. "
                 + (warnings[0] if warnings else
                    "Check the dates, whether the exams' results have been published, and that "
-                   "marks for exams held on paper have been entered.")
+                   "the marks for offline exams have been entered.")
             ),
         )
 
