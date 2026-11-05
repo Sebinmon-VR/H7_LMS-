@@ -646,6 +646,10 @@ def create_category(payload, actor_id: int | None = None) -> dict:
 
 def update_category(category: dict, payload, actor_id: int | None = None) -> dict:
     updates = payload.model_dump(exclude_unset=True, exclude_none=True)
+    # The one field that may be set to nothing: an explicit null makes a year-scoped category
+    # standing again. Every other null still means "leave it alone".
+    if "academic_year_id" in payload.model_fields_set and payload.academic_year_id is None:
+        updates["academic_year_id"] = None
 
     if "code" in updates:
         _assert_code_free(updates["code"], exclude_id=category["id"])
