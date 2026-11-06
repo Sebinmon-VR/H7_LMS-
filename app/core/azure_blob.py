@@ -142,6 +142,18 @@ def download(blob_name: str) -> tuple[bytes, str | None]:
     return data, content_type
 
 
+def exists(blob_name: str) -> bool | None:
+    """
+    Whether the blob is in the container: True, False, or None when storage could not be
+    asked (not configured, unreachable). Callers treat None as "assume it is there".
+    """
+    try:
+        return bool(_container().get_blob_client(blob_name).exists())
+    except Exception:
+        logger.warning("Could not check whether blob '%s' exists.", blob_name, exc_info=True)
+        return None
+
+
 def size_of(blob_name: str) -> int | None:
     try:
         return int(_container().get_blob_client(blob_name).get_blob_properties().size)

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.core import firebase
@@ -295,6 +295,18 @@ uploads_path.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=settings.LOCAL_STORAGE_DIR), name="uploads")
 
 
+_MISSING_FILE_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>File not found</title>
+<style>body{margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center;
+font-family:system-ui,sans-serif;background:#f8f8fa;color:#1f2330}
+main{max-width:26rem;padding:2rem;text-align:center}h1{font-size:1.1rem;font-weight:600;margin:0 0 .5rem}
+p{margin:0;color:#6b7080;font-size:.9rem;line-height:1.5}</style></head>
+<body><main><h1>This file is no longer in storage</h1>
+<p>The entry still exists in the LMS, but the file behind it has been removed or was never saved.
+Ask the school office to upload it again.</p></main></body></html>"""
+
+
 @app.get("/files/{blob_path:path}", include_in_schema=False)
 def open_stored_file(blob_path: str, download: bool = False):
     """
@@ -314,6 +326,11 @@ def open_stored_file(blob_path: str, download: bool = False):
         # Class recordings and admission documents: opened through the LMS, which signs a
         # link for whoever may see them.
         return JSONResponse(status_code=403, content={"detail": "Open this file from the LMS."})
+    # A record whose file is gone would otherwise be signed and handed to Azure, which answers
+    # with a bare XML "BlobNotFound" page. Say it plainly instead; the LMS preview also reads
+    # this 404 to show the file as missing.
+    if azure_blob.exists(blob_path) is False:
+        return HTMLResponse(status_code=404, content=_MISSING_FILE_PAGE)
     try:
         return RedirectResponse(azure_blob.read_url(blob_path, download=download), status_code=307)
     except azure_blob.BlobStorageError as exc:
