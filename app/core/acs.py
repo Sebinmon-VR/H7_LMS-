@@ -35,6 +35,9 @@ KIND_EXAM = "exam"
 KINDS = (KIND_CLASS, KIND_MEETING, KIND_TUITION, KIND_EXAM)
 
 ROLE_PRESENTER = "Presenter"
+# May share their screen as well as camera and microphone, without the presenter's say over
+# the room. What a student is in a class: they present work, but cannot remove anybody.
+ROLE_COLLABORATOR = "Collaborator"
 ROLE_ATTENDEE = "Attendee"
 
 PROVIDER = "AZURE_ACS"
@@ -247,7 +250,10 @@ def add_participant(room_id: str, acs_user_id: str, role: str) -> None:
     """Puts an identity on a room's list with a role, or updates its role."""
     from azure.communication.rooms import CommunicationUserIdentifier, ParticipantRole, RoomParticipant
 
-    wanted = ParticipantRole.PRESENTER if role == ROLE_PRESENTER else ParticipantRole.ATTENDEE
+    wanted = {
+        ROLE_PRESENTER: ParticipantRole.PRESENTER,
+        ROLE_COLLABORATOR: ParticipantRole.COLLABORATOR,
+    }.get(role, ParticipantRole.ATTENDEE)
     try:
         _client("rooms").add_or_update_participants(
             room_id=room_id,

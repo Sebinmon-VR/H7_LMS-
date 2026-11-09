@@ -350,17 +350,31 @@ def resolve(kind: str, entity_id: str, user) -> CallTarget:
 # The three calls the page makes
 # ---------------------------------------------------------------------------------------
 
+def _role_for(target: CallTarget) -> str:
+    """
+    Teachers and the office present. Students may share their screen too - to show their
+    work to the class - except in an exam room, where a student shares only camera and
+    microphone.
+    """
+    if target.is_host:
+        return acs.ROLE_PRESENTER
+    if target.kind == acs.KIND_EXAM:
+        return acs.ROLE_ATTENDEE
+    return acs.ROLE_COLLABORATOR
+
+
 def open_session(kind: str, entity_id: str, user) -> dict:
     """Clears this person for the call, puts them on the room's list and hands out a token."""
     _require_enabled()
     target = resolve(kind, entity_id, user)
 
     profile = firestore_users.get_document(str(user.id)) or {"id": user.id}
+    role = _role_for(target)
     try:
         acs_user_id = acs.identity_for(profile)
-        acs.add_participant(
-            target.room_id, acs_user_id, acs.ROLE_PRESENTER if target.is_host else acs.ROLE_ATTENDEE
-        )
+        # Re-sent on every join, so a student already on a room's list from before gets the
+        # role as it stands now.
+        acs.add_participant(target.room_id, acs_user_id, role)
         token = acs.issue_token(acs_user_id)
     except acs.AcsError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -376,7 +390,7 @@ def open_session(kind: str, entity_id: str, user) -> dict:
         "token": token["token"],
         "expires_on": token["expires_on"],
         "display_name": user.full_name or user.email,
-        "role": acs.ROLE_PRESENTER if target.is_host else acs.ROLE_ATTENDEE,
+        "role": role,
         "is_host": target.is_host,
         "records": target.records,
         "recording_active": bool(recordings.active_for(entity_key)),
