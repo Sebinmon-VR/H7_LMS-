@@ -73,6 +73,7 @@ INDEXED_FIELDS: dict[str, list[str]] = {
     "tuition_invoices": ["student_id"],
     "admission_requests": ["status", "program", "academic_year_id", "class_id"],
     "class_room_events": ["class_id", "user_id"],
+    "call_quality_events": ["class_id", "day"],
     "class_room_attendance": ["class_id", "date"],
     "user_presence": ["user_id"],
     "parent_links": ["parent_id", "student_id"],

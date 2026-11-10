@@ -5,16 +5,17 @@ brings finished recordings home. See app/services/calls.py for the rules.
 
 import hmac
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
-from app.api.v1.dependencies import require_any_authenticated
+from app.api.v1.dependencies import require_admin, require_any_authenticated
 from app.core import acs
 from app.core.config import settings
 from app.schemas.user import UserOut
+from app.services import call_quality
 from app.services import calls as call_service
 from app.services import recordings
 
@@ -49,6 +50,19 @@ class CallConnectedIn(BaseModel):
     # The call's server id, read by the page once the call connects. Lets a recording be
     # started against exactly this call and matched to its file afterwards.
     server_call_id: str | None = None
+
+
+class CallLeftIn(BaseModel):
+    # Why the call ended, as ACS gave it to the page: 0 is hanging up, 4xx/5xx a failure.
+    code: int | None = None
+    sub_code: int | None = None
+
+
+class CallIssueIn(BaseModel):
+    # One of ACS's diagnostic names (networkReceiveQuality, microphoneNotFunctioning, ...)
+    # and what it was raised to: "Poor", "Bad" or "yes".
+    name: str
+    value: str = ""
 
 
 class RecordingActionIn(BaseModel):
@@ -86,9 +100,30 @@ def call_connected(kind: CallKind, entity_id: str, payload: CallConnectedIn,
 
 
 @router.post("/{kind}/{entity_id}/left")
-def call_left(kind: CallKind, entity_id: str, user: UserOut = Depends(require_any_authenticated)):
-    """I have left the call. Logged as the leave; stops any recording I started."""
-    return call_service.left(kind, entity_id, user)
+def call_left(kind: CallKind, entity_id: str, payload: CallLeftIn | None = None,
+              user: UserOut = Depends(require_any_authenticated)):
+    """
+    I have left the call. Logged as the leave; stops any recording I started. The body,
+    when there is one, says why the call ended - a closing tab sends none.
+    """
+    result = call_service.left(kind, entity_id, user)
+    if payload is not None:
+        call_quality.record_end(kind, entity_id, user, payload.code, payload.sub_code)
+    return result
+
+
+@router.post("/{kind}/{entity_id}/issue")
+def call_issue(kind: CallKind, entity_id: str, payload: CallIssueIn,
+               user: UserOut = Depends(require_any_authenticated)):
+    """A problem on my side of the call: my network, microphone, camera or speaker."""
+    return call_quality.record_issue(kind, entity_id, user, payload.name, payload.value)
+
+
+@router.get("/quality/{class_id}")
+def call_quality_for_class(class_id: int, day: date | None = Query(None),
+                           _: UserOut = Depends(require_admin)):
+    """[Admin] Who had trouble in this class's calls on a day (today by default), worst first."""
+    return call_quality.summary(class_id, day)
 
 
 @router.post("/{kind}/{entity_id}/recording")

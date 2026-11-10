@@ -1156,6 +1156,10 @@ firestore_admission_categories = _service("admission_categories", cacheable=True
 # What happened in a class's live room: who joined, who started and ended a period, when the
 # room was made. Written on every join, so never cached; read by the admin's live board.
 firestore_class_room_events = _service("class_room_events")
+# How calls went: why each ended and the network or device warnings ACS raised on each
+# person's side. Kept apart from the room log so it never crowds a join out of what
+# attendance reads. See services/call_quality.py.
+firestore_call_quality_events = _service("call_quality_events")
 # One row per user: when the LMS last heard from them. See services/presence.py.
 firestore_user_presence = _service("user_presence")
 # Who was in a class's room each day: one row per participant, with their join and leave
