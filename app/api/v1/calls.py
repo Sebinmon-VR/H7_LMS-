@@ -8,8 +8,8 @@ import logging
 from datetime import date, datetime
 from typing import Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field
 
 from app.api.v1.dependencies import require_admin, require_any_authenticated
 from app.core import acs
@@ -44,6 +44,13 @@ class CallSessionOut(BaseModel):
     records: bool = False
     recording_active: bool = False
     ends_at: datetime | None = None
+
+
+class CallOpenIn(BaseModel):
+    # The browser's own random id for itself, kept in its storage. Each device joins as its
+    # own identity, so a teacher on two devices shows the class two cameras.
+    device: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9-]+$")
+    device_kind: Literal["phone", "tablet", "computer"] | None = None
 
 
 class CallConnectedIn(BaseModel):
@@ -81,7 +88,8 @@ def calls_config(_: UserOut = Depends(require_any_authenticated)):
 
 
 @router.post("/{kind}/{entity_id}/session", response_model=CallSessionOut)
-def open_call(kind: CallKind, entity_id: str, user: UserOut = Depends(require_any_authenticated)):
+def open_call(kind: CallKind, entity_id: str, payload: CallOpenIn | None = Body(None),
+              user: UserOut = Depends(require_any_authenticated)):
     """
     Let me into this class's call.
 
@@ -89,7 +97,10 @@ def open_call(kind: CallKind, entity_id: str, user: UserOut = Depends(require_an
     buttons), 503 when live classes are not configured. On success the page joins the ACS
     room with the returned token; it expires at `expires_on`, and asking again renews it.
     """
-    return CallSessionOut(**call_service.open_session(kind, entity_id, user))
+    payload = payload or CallOpenIn()
+    return CallSessionOut(**call_service.open_session(
+        kind, entity_id, user, device=payload.device, device_kind=payload.device_kind,
+    ))
 
 
 @router.post("/{kind}/{entity_id}/connected")

@@ -363,15 +363,35 @@ def _role_for(target: CallTarget) -> str:
     return acs.ROLE_COLLABORATOR
 
 
-def open_session(kind: str, entity_id: str, user) -> dict:
-    """Clears this person for the call, puts them on the room's list and hands out a token."""
+DEVICE_LABEL = {"phone": "phone", "tablet": "tablet"}
+
+
+def _display_name(user, target: CallTarget, device_kind: str | None) -> str:
+    """
+    The name on this device's tile. A teacher's phone or tablet says so - "Anitha (phone)" -
+    because a teacher who joins from two devices then shows as two tiles, and the class should
+    know which is which. Students and laptops keep the plain name.
+    """
+    name = user.full_name or user.email
+    label = DEVICE_LABEL.get(device_kind or "")
+    return f"{name} ({label})" if label and target.is_host else name
+
+
+def open_session(kind: str, entity_id: str, user, device: str | None = None,
+                 device_kind: str | None = None) -> dict:
+    """
+    Clears this person for the call, puts them on the room's list and hands out a token.
+
+    `device` is the browser's own id for itself: each device joins as its own identity, so a
+    teacher on a laptop and a phone at once shows the class both cameras (see acs.identity_for).
+    """
     _require_enabled()
     target = resolve(kind, entity_id, user)
 
     profile = firestore_users.get_document(str(user.id)) or {"id": user.id}
     role = _role_for(target)
     try:
-        acs_user_id = acs.identity_for(profile)
+        acs_user_id = acs.identity_for(profile, device)
         # Re-sent on every join, so a student already on a room's list from before gets the
         # role as it stands now.
         acs.add_participant(target.room_id, acs_user_id, role)
@@ -389,7 +409,7 @@ def open_session(kind: str, entity_id: str, user) -> dict:
         "acs_user_id": acs_user_id,
         "token": token["token"],
         "expires_on": token["expires_on"],
-        "display_name": user.full_name or user.email,
+        "display_name": _display_name(user, target, device_kind),
         "role": role,
         "is_host": target.is_host,
         "records": target.records,

@@ -3,9 +3,13 @@ Azure Communication Services: the live-class video that replaced Google Meet.
 
 What the LMS asks of ACS is small, and all of it is here:
 
-* **Identities.** Every LMS user who joins a call gets one ACS identity, created on first
-  need and remembered on their profile (`acs_user_id`). It is an opaque id, not an email, so
-  it does not matter what address - personal Gmail or school - somebody signs in with.
+* **Identities.** Every device an LMS user joins a call from gets its own ACS identity,
+  created on first need and remembered on their profile (`acs_devices`; `acs_user_id` is the
+  one identity of a page too old to name its device). One identity per device, not per
+  person, because ACS shows a person once however many devices they join from: a teacher on
+  a laptop and a phone at once (face on one, the exercise book under the phone camera on the
+  other) would show students only one of the two. It is an opaque id, not an email, so it
+  does not matter what address - personal Gmail or school - somebody signs in with.
 * **Rooms.** An ACS room is an access-controlled call: only identities added to it may
   enter, each with a role. A standing class room, a scheduled session and a tuition class
   each own one. The LMS decides *when* somebody may join (the timetable rules in
@@ -158,9 +162,28 @@ def _utc(value) -> datetime:
 # Identities and tokens
 # ---------------------------------------------------------------------------------------
 
-def identity_for(user: dict) -> str:
+# How many devices' identities a profile remembers. A teacher's laptop, phone and tablet,
+# a home computer and a spare; past this the device unused longest is forgotten, and gets a
+# fresh identity if it ever comes back.
+MAX_DEVICES = 6
+
+
+def _create_identity() -> str:
+    try:
+        created = _client("identity").create_user()
+    except AcsError:
+        raise
+    except Exception as exc:
+        raise AcsError(f"Could not create a calling identity: {exc}") from exc
+    return created.properties["id"]
+
+
+def identity_for(user: dict, device: str | None = None) -> str:
     """
-    The ACS identity of an LMS user, created and saved on first need.
+    The ACS identity of an LMS user on one device, created and saved on first need.
+
+    `device` is the random id the browser keeps for itself. Without one (a page from before
+    devices were told apart) the person's single profile-wide identity is used.
 
     Stored with the resource it belongs to: an id minted on one Communication resource is
     refused by another, so moving the school to a new resource quietly re-issues them.
@@ -168,20 +191,27 @@ def identity_for(user: dict) -> str:
     from app.core.firebase import firestore_users
 
     host = resource_host()
-    existing = user.get("acs_user_id")
-    if existing and user.get("acs_resource") == host:
-        return existing
+    if not device:
+        existing = user.get("acs_user_id")
+        if existing and user.get("acs_resource") == host:
+            return existing
+        acs_user_id = _create_identity()
+        firestore_users.add_document(str(user["id"]), {"acs_user_id": acs_user_id, "acs_resource": host})
+        user["acs_user_id"], user["acs_resource"] = acs_user_id, host
+        return acs_user_id
 
-    try:
-        created = _client("identity").create_user()
-    except AcsError:
-        raise
-    except Exception as exc:
-        raise AcsError(f"Could not create a calling identity: {exc}") from exc
+    devices = dict(user.get("acs_devices") or {})
+    known = devices.get(device) or {}
+    if known.get("id") and known.get("resource") == host:
+        return known["id"]
 
-    acs_user_id = created.properties["id"]
-    firestore_users.add_document(str(user["id"]), {"acs_user_id": acs_user_id, "acs_resource": host})
-    user["acs_user_id"], user["acs_resource"] = acs_user_id, host
+    acs_user_id = _create_identity()
+    devices[device] = {"id": acs_user_id, "resource": host, "at": datetime.now(timezone.utc).isoformat()}
+    if len(devices) > MAX_DEVICES:
+        keep = sorted(devices.items(), key=lambda kv: str((kv[1] or {}).get("at") or ""), reverse=True)[:MAX_DEVICES]
+        devices = dict(keep)
+    firestore_users.add_document(str(user["id"]), {"acs_devices": devices})
+    user["acs_devices"] = devices
     return acs_user_id
 
 
