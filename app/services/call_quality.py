@@ -30,8 +30,11 @@ EVENT_ENDED = "callEnded"
 
 # The warnings the page may send: ACS's own diagnostic names. Anything else is refused,
 # so the table holds only what the office's view knows how to read.
+# audioReceiveQuality is the page's own measure, not an ACS warning: the sound arriving had
+# packets lost or patched over ("Poor" or "Bad"), which is what a class hears as choppy voices.
 NETWORK_ISSUES = frozenset({
     "networkReconnect", "networkReceiveQuality", "networkSendQuality", "noNetwork", "networkRelaysNotReachable",
+    "audioReceiveQuality",
 })
 DEVICE_ISSUES = frozenset({
     "noSpeakerDevicesEnumerated", "noMicrophoneDevicesEnumerated", "microphoneNotFunctioning",
