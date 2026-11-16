@@ -198,6 +198,11 @@ class ClassRoomAccessOut(BaseModel):
     # LMS room this is the in-app call page, /call/class/<id>.
     room_link: str | None = None
 
+    # Today's period two subjects share (Arabic and Malayalam at once), still to come or on:
+    # {starts_at, ends_at, period_label, is_current, rooms: [{subject_name, teacher_name,
+    # meeting_id, link, mine}]}. Each subject has its own room for it; see class_rooms.
+    split_period: Any | None = None
+
 
 class JoinRoomOut(BaseModel):
     class_id: int
@@ -587,6 +592,7 @@ class HomeworkOut(BaseModel):
     days_until_due: int | None = None
     # Present on a teacher's view.
     submission_count: int | None = None
+    graded_count: int | None = None
     expected_count: int | None = None
     # Present on a student's view.
     my_status: HomeworkStatus | None = None

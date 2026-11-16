@@ -387,6 +387,9 @@ def present(assignment: dict, viewer=None, on: date | None = None) -> dict:
     elif role is not None:
         handed_in = [s for s in submissions_for(assignment["id"]) if s.get("submitted_at")]
         view["submission_count"] = len(handed_in)
+        # Marked so far, so a teacher's list can say what is still waiting to be marked
+        # without fetching every piece's submissions.
+        view["graded_count"] = sum(1 for s in handed_in if s.get("status") == HomeworkStatus.GRADED.value)
         view["expected_count"] = len(students_in_class(assignment["class_id"]))
 
     return view

@@ -33,7 +33,7 @@ Tuition is untouched: its one-to-one sessions keep their own links (`tuition_ses
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -565,6 +565,190 @@ def ensure_rooms_for_today(reference: datetime | None = None,
     return result
 
 
+# ---------------------------------------------------------------------------------------
+# Shared periods: two subjects at once, the class split between them
+# ---------------------------------------------------------------------------------------
+
+# The subjects whose shared periods split the class, each set taught to separate groups of
+# students at the same time. Grade 7's second language: a student takes Arabic or Malayalam.
+# MUSIC / ART also share periods (with two teachers) but are not listed: the school has not
+# said they split the class. Add {"MUSIC", "ART & CRAFT"} here if they do.
+SPLIT_SUBJECT_GROUPS: list[set[str]] = [{"ARABIC", "MALAYALAM"}]
+
+
+def shared_slots(periods: list[dict]) -> list[list[dict]]:
+    """
+    Periods that two or more subjects share - the same start and end, different subjects -
+    each group in start order. Grade 7's Monday first period is one: Arabic with one teacher
+    and Malayalam with another, each for the students who take it.
+
+    One standing room cannot hold both lessons, so each subject in such a period gets a room
+    of its own (`ensure_split_sessions`) and the class room points the class to them. Only
+    when different teachers take the subjects: one teacher down for both teaches them
+    together, in the class room, as before.
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for period in periods:
+        groups.setdefault((period["starts_at"], period["ends_at"]), []).append(period)
+
+    def split(group: list[dict]) -> bool:
+        entries = [p.get("entry") or {} for p in group]
+        subjects = {e.get("subject_id") for e in entries}
+        teachers = {e.get("teacher_id") for e in entries if e.get("teacher_id") is not None}
+        names = {((e.get("subject") or {}).get("name") or "").strip().upper() for e in entries}
+        return (
+            len(subjects) > 1 and len(teachers) > 1
+            and any(names <= allowed for allowed in SPLIT_SUBJECT_GROUPS)
+        )
+
+    return [group for _, group in sorted(groups.items(), key=lambda kv: kv[0][0]) if split(group)]
+
+
+def _split_sessions(meetings: list[dict], day) -> dict[int, dict]:
+    """A class's shared-period sessions on one day, by the timetable entry each is for."""
+    return {
+        int(m["split_entry_id"]): m for m in meetings
+        if m.get("split_entry_id") is not None and m.get("split_date") == day.isoformat()
+    }
+
+
+def _create_split_session(class_room: dict, period: dict, config: dict) -> dict:
+    """One subject's own room for a shared period: a session of the class with its own link."""
+    from app.services.content import MEET_CREATED, RECORDING_ARMED, RECORDING_NOT_REQUESTED
+
+    entry = period["entry"]
+    meeting_id = firestore_meetings.get_next_numeric_id()
+    start = period["starts_at"].astimezone(timezone.utc).replace(tzinfo=None)
+    minutes = max(1, int((period["ends_at"] - period["starts_at"]).total_seconds() // 60))
+    subject = (entry.get("subject") or {}).get("name") or "Class"
+    class_name = class_room.get("name") or f"Class {class_room['id']}"
+    record = bool(settings.ENABLE_AUTO_RECORDING and class_room.get("room_auto_record") is not False)
+    # Open on the timetable like the class room, from the usual few minutes before: nobody
+    # has to press Start, and students are not left waiting for a button the teacher may not
+    # know is there.
+    opens = start - timedelta(minutes=int(config["join_open_minutes_before"]))
+    document = {
+        "class_id": int(class_room["id"]),
+        "subject_id": entry.get("subject_id"),
+        "teacher_id": entry.get("teacher_id"),
+        "title": f"{subject} · {class_name}",
+        "meeting_link": acs.call_link(acs.KIND_MEETING, meeting_id),
+        "recording_url": None,
+        "scheduled_time": start.isoformat(),
+        "status": live_classes.SCHEDULED,
+        "duration_minutes": minutes,
+        "meet_status": MEET_CREATED,
+        "meet_error": None,
+        "auto_record": record,
+        "recording_status": RECORDING_ARMED if record else RECORDING_NOT_REQUESTED,
+        "recording_error": None,
+        "uses_class_room": False,
+        "acs_room_id": None,
+        "started_at": opens.isoformat(),
+        "auto_started": True,
+        # What makes it a shared period's room: the timetable entry and the date it is for.
+        "split_entry_id": int(entry["id"]),
+        "split_date": period["starts_at"].date().isoformat(),
+        "created_at": _now(),
+    }
+    firestore_meetings.add_document(str(meeting_id), document)
+    return {**document, "id": meeting_id}
+
+
+def ensure_split_sessions(reference: datetime | None = None, class_ids: set[int] | None = None,
+                          dry_run: bool = False) -> dict:
+    """
+    Gives each subject of today's shared periods its own room, ahead of the period.
+
+    Run by the maintenance sweep next to `ensure_rooms_for_today`, with the same lead. A
+    shared period's sessions are made once per day (they are found again by their timetable
+    entry and date), so the pass is cheap after the first.
+    """
+    result = {"dry_run": dry_run, "created": [], "failed": []}
+    if not class_room_mode() or not acs.is_enabled():
+        return result
+
+    tz = timetable_service.school_timezone()
+    now = reference or datetime.now(tz)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    today = now.date()
+    lead = timedelta(minutes=ROOM_LEAD_MINUTES)
+    config = lms_settings()
+
+    by_class: dict[int, list[dict]] = {}
+    for entry in timetable_service.list_entries():
+        if entry.get("class_id") is not None:
+            by_class.setdefault(int(entry["class_id"]), []).append(entry)
+
+    for class_id, entries in by_class.items():
+        if class_ids is not None and class_id not in class_ids:
+            continue
+        periods = timetable_service.resolve_on_date(entries, today, reference=now)
+        due = [g for g in shared_slots(periods) if g[0]["starts_at"] - lead <= now <= g[0]["ends_at"]]
+        if not due:
+            continue
+        class_room = firestore_classes.get_document(str(class_id)) or {"id": class_id}
+        made = _split_sessions(firestore_meetings.query_documents("class_id", "==", class_id), today)
+        for group in due:
+            for period in group:
+                entry = period["entry"]
+                if int(entry["id"]) in made:
+                    continue
+                label = (
+                    f"{class_room.get('name') or class_id} {(entry.get('subject') or {}).get('name')} "
+                    f"{period['starts_at']:%H:%M}"
+                )
+                if dry_run:
+                    result["created"].append({"session": label})
+                    continue
+                try:
+                    session = _create_split_session(class_room, period, config)
+                    result["created"].append({"session": label, "meeting_id": session["id"]})
+                except Exception as exc:
+                    result["failed"].append({"session": label, "error": str(exc)})
+
+    if result["created"] and not dry_run:
+        logger.info("Shared-period rooms made: %s", ", ".join(c["session"] for c in result["created"]))
+    return result
+
+
+def split_period_for(periods: list[dict], meetings: list[dict], user_id: int, now: datetime,
+                     open_before: timedelta, grace: timedelta) -> dict | None:
+    """
+    Today's shared period still to come or under way, with each subject's own room - what a
+    join button shows in place of the class room's while it is on.
+    """
+    for group in shared_slots(periods):
+        first = group[0]
+        if now > first["ends_at"] + grace:
+            continue
+        sessions = _split_sessions(meetings, now.date())
+        rooms = []
+        for period in group:
+            entry = period["entry"]
+            session = sessions.get(int(entry["id"]))
+            rooms.append({
+                "subject_id": entry.get("subject_id"),
+                "subject_name": (entry.get("subject") or {}).get("name"),
+                "teacher_id": entry.get("teacher_id"),
+                "teacher_name": (entry.get("teacher") or {}).get("full_name"),
+                "meeting_id": int(session["id"]) if session else None,
+                "link": session.get("meeting_link") if session else None,
+                "mine": entry.get("teacher_id") is not None and int(entry["teacher_id"]) == user_id,
+            })
+        return {
+            "starts_at": first["starts_at"],
+            "ends_at": first["ends_at"],
+            "period_label": (first.get("entry") or {}).get("period_label"),
+            # On now, from the usual few minutes before to the grace after: the join buttons
+            # switch to the subjects' rooms for this stretch.
+            "is_current": first["starts_at"] - open_before <= now <= first["ends_at"] + grace,
+            "rooms": rooms,
+        }
+    return None
+
+
 def meeting_fields_for_room(class_room: dict) -> dict:
     """
     What a session stores when it uses the class's room instead of a link of its own.
@@ -818,6 +1002,9 @@ def access_for(class_room: dict, user, reference: datetime | None = None,
         "in_room": bool(mine and mine.get("action") in JOIN_EVENTS),
         # Handed over only when they may enter, the same rule the session join applies.
         "room_link": class_room.get("room_link") if (may_join and room_ready) else None,
+        # A period two subjects share today (still to come or on), with each subject's own
+        # room; while it is on, the join buttons offer those instead of the class room.
+        "split_period": split_period_for(periods, meetings, user_id, now, open_before, grace),
     }
 
 

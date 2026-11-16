@@ -431,6 +431,18 @@ def sweep(reference: datetime | None = None) -> dict:
         log_backend_failure(logger, "Class room sweep failed", exc)
         result["errors"].append(f"class_rooms: {exc}")
 
+    # A period two subjects share (Arabic and Malayalam at once) gets a room per subject.
+    try:
+        from app.services import class_rooms
+
+        split = class_rooms.ensure_split_sessions()
+        result["split_rooms_created"] = len(split["created"])
+        for failure in split["failed"]:
+            result["errors"].append(f"shared-period room {failure['session']}: {failure['error']}")
+    except Exception as exc:  # pragma: no cover - a sweep must never kill its thread
+        log_backend_failure(logger, "Shared-period room sweep failed", exc)
+        result["errors"].append(f"split rooms: {exc}")
+
     # Today's attendance rows, rebuilt from the room log every few minutes so the office's
     # attendance view is current without anybody pressing refresh.
     try:
