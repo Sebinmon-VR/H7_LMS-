@@ -70,6 +70,9 @@ class CallIssueIn(BaseModel):
     # and what it was raised to: "Poor", "Bad" or "yes".
     name: str
     value: str = ""
+    # The numbers behind it, where the page has them: for choppy sound, how much was patched
+    # over and lost, the jitter, how many videos were arriving, the device and its network.
+    detail: str | None = None
 
 
 class RecordingActionIn(BaseModel):
@@ -127,7 +130,7 @@ def call_left(kind: CallKind, entity_id: str, payload: CallLeftIn | None = None,
 def call_issue(kind: CallKind, entity_id: str, payload: CallIssueIn,
                user: UserOut = Depends(require_any_authenticated)):
     """A problem on my side of the call: my network, microphone, camera or speaker."""
-    return call_quality.record_issue(kind, entity_id, user, payload.name, payload.value)
+    return call_quality.record_issue(kind, entity_id, user, payload.name, payload.value, payload.detail)
 
 
 @router.get("/quality/{class_id}")

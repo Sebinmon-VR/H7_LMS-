@@ -85,13 +85,13 @@ def _record(kind: str, entity_id: str, user, name: str, value: str, detail: str 
         logger.warning("Call quality event %s for %s %s not recorded: %s", name, kind, entity_id, exc)
 
 
-def record_issue(kind: str, entity_id: str, user, name: str, value: str) -> dict:
-    """A warning ACS raised on this person's side of the call."""
+def record_issue(kind: str, entity_id: str, user, name: str, value: str, detail: str | None = None) -> dict:
+    """A warning ACS raised on this person's side of the call, with the page's numbers for it if any."""
     if name not in ISSUES:
         raise HTTPException(status_code=422, detail=f"Unknown call warning: {name}")
     if kind == acs.KIND_CLASS:
         class_rooms.assert_may_see(class_rooms.require_class(int(entity_id)), user)
-    _record(kind, entity_id, user, name, (value or "")[:20])
+    _record(kind, entity_id, user, name, (value or "")[:20], (detail or "")[:200] or None)
     return {"ok": True}
 
 
