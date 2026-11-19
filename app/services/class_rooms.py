@@ -205,7 +205,7 @@ def annotate_periods(periods: list[dict], events: list[dict], now: datetime,
 
       teacher_joined_at   when the teacher was first in the room during the period (the
                           period's start if they were already sitting in it)
-      teacher_left_at     when they next left, if they did
+      teacher_left_at     when they left and did not come back during the period, if they did
       waiting_minutes     how long the students sat without them: joined-at minus the
                           start, or the time so far for a running period nobody has come to
       teacher_status      UPCOMING, IN, LEFT, NOT_YET (running, nobody yet) or ABSENT
@@ -222,20 +222,26 @@ def annotate_periods(periods: list[dict], events: list[dict], now: datetime,
 
         if teacher_id is not None:
             moves = cache.setdefault(int(teacher_id), _movements(events, int(teacher_id), tz))
-            inside = False
-            for at, is_join in moves:
-                if at < start - open_before:
-                    inside = is_join          # state carried in from before the window
-                    continue
-                if at > end + grace:
-                    break
-                if is_join and joined_at is None:
-                    joined_at = max(at, start)
-                elif not is_join and joined_at is not None and left_at is None:
+            window = start - open_before
+            before = [is_join for at, is_join in moves if at < window]
+            during = [(at, is_join) for at, is_join in moves if window <= at <= end + grace]
+            # Already sitting in when the period's window opened (in early for assembly, say):
+            # they count from the start, even if they leave before the period is over. Unless
+            # the first thing they do in the window is join afresh: a leave can go unlogged
+            # (a closed laptop), so a fresh join says when they really came.
+            if before and before[-1] and not (during and during[0][1]):
+                joined_at = start
+            for at, is_join in during:
+                if is_join:
+                    if at >= end:
+                        continue              # back only once the period was over
+                    if joined_at is None:
+                        joined_at = max(at, start)
+                    left_at = None            # back in: a dropped call they rejoined is not leaving
+                elif at <= start:
+                    joined_at = None          # gone again before the period began
+                elif joined_at is not None and left_at is None:
                     left_at = at
-                inside = is_join
-            if joined_at is None and inside and moves and moves[0][0] < start - open_before:
-                joined_at = start             # already sitting in when the period began
 
         if now < start:
             status, waiting = "UPCOMING", None
